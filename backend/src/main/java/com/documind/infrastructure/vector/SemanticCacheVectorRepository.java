@@ -4,7 +4,6 @@ import com.documind.domain.model.CitationPayload;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import com.pgvector.PGvector;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.jdbc.core.simple.JdbcClient;
@@ -69,7 +68,7 @@ public class SemanticCacheVectorRepository {
         Objects.requireNonNull(queryText, "queryText must not be null");
         Objects.requireNonNull(responseContent, "responseContent must not be null");
 
-        String vectorLiteral = toVectorLiteral(queryEmbedding);
+        String vectorLiteral = PgVectorLiterals.toNonZeroFiniteVectorLiteral(queryEmbedding, "queryEmbedding");
         String citationsJson = serializeCitations(citations);
 
         return jdbcClient().sql("""
@@ -124,7 +123,7 @@ public class SemanticCacheVectorRepository {
         if (!Double.isFinite(minSimilarity)) {
             throw new IllegalArgumentException("minSimilarity must be finite");
         }
-        String vectorLiteral = toVectorLiteral(queryEmbedding);
+        String vectorLiteral = PgVectorLiterals.toNonZeroFiniteVectorLiteral(queryEmbedding, "queryEmbedding");
 
         Optional<SemanticCacheEntry> match = jdbcClient().sql("""
                 SELECT id,
@@ -180,7 +179,7 @@ public class SemanticCacheVectorRepository {
         if (limit < 1) {
             throw new IllegalArgumentException("limit must be >= 1");
         }
-        String vectorLiteral = toVectorLiteral(queryVector);
+        String vectorLiteral = PgVectorLiterals.toNonZeroFiniteVectorLiteral(queryVector, "queryVector");
 
         return jdbcClient().sql("""
                 EXPLAIN
@@ -210,13 +209,6 @@ public class SemanticCacheVectorRepository {
         if (scopeVersion < 1) {
             throw new IllegalArgumentException("scopeVersion must be >= 1");
         }
-    }
-
-    private static String toVectorLiteral(float[] vector) {
-        if (vector == null || vector.length == 0) {
-            throw new IllegalArgumentException("queryVector must not be null or empty");
-        }
-        return new PGvector(vector).toString();
     }
 
     private String serializeCitations(List<CitationPayload> citations) {

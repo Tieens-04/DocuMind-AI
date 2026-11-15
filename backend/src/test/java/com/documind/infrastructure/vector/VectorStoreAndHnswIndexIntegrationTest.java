@@ -22,6 +22,7 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.context.annotation.Import;
 import org.springframework.dao.DataIntegrityViolationException;
+import org.springframework.dao.InvalidDataAccessApiUsageException;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.transaction.support.TransactionTemplate;
 
@@ -343,5 +344,55 @@ class VectorStoreAndHnswIndexIntegrationTest {
             assertThat(String.join("\n", cachePlan))
                 .contains("Index Scan using idx_semantic_cache_embedding_hnsw");
         });
+    }
+
+    @Test
+    void rejectsZeroNormAndNonFiniteVectorsInPgVectorRepositories() {
+        float[] zeroVector = new float[PostgresTestcontainersConfig.EMBEDDING_DIMENSIONS];
+        float[] nanVector = new float[PostgresTestcontainersConfig.EMBEDDING_DIMENSIONS];
+        nanVector[0] = 1.0f;
+        nanVector[1] = Float.NaN;
+        float[] posInfVector = new float[PostgresTestcontainersConfig.EMBEDDING_DIMENSIONS];
+        posInfVector[0] = 1.0f;
+        posInfVector[1] = Float.POSITIVE_INFINITY;
+        float[] negInfVector = new float[PostgresTestcontainersConfig.EMBEDDING_DIMENSIONS];
+        negInfVector[0] = 1.0f;
+        negInfVector[1] = Float.NEGATIVE_INFINITY;
+
+        List<float[]> invalidVectors = List.of(zeroVector, nanVector, posInfVector, negInfVector);
+
+        assertThatThrownBy(() -> PgVectorLiterals.toNonZeroFiniteVectorLiteral(null, "queryVector"))
+            .isInstanceOf(IllegalArgumentException.class);
+        assertThatThrownBy(() -> PgVectorLiterals.toNonZeroFiniteVectorLiteral(new float[0], "queryVector"))
+            .isInstanceOf(IllegalArgumentException.class);
+
+        for (float[] invalidVector : invalidVectors) {
+            assertThatThrownBy(() -> PgVectorLiterals.toNonZeroFiniteVectorLiteral(invalidVector, "queryVector"))
+                .isInstanceOf(IllegalArgumentException.class);
+
+            // Spring @Repository PersistenceExceptionTranslationPostProcessor wraps IllegalArgumentException in InvalidDataAccessApiUsageException
+            assertThatThrownBy(() -> chunkVectorRepository.explainCosineSearch(invalidVector, 5))
+                .isInstanceOf(InvalidDataAccessApiUsageException.class)
+                .hasCauseInstanceOf(IllegalArgumentException.class);
+            assertThatThrownBy(() -> semanticCacheRepository.save(
+                "GLOBAL:ADMIN",
+                1L,
+                "a".repeat(64),
+                "invalid vector query",
+                invalidVector,
+                "unused",
+                List.of(),
+                "groq",
+                null
+            ))
+                .isInstanceOf(InvalidDataAccessApiUsageException.class)
+                .hasCauseInstanceOf(IllegalArgumentException.class);
+            assertThatThrownBy(() -> semanticCacheRepository.findBestMatch("GLOBAL:ADMIN", 1L, invalidVector, 0.94d))
+                .isInstanceOf(InvalidDataAccessApiUsageException.class)
+                .hasCauseInstanceOf(IllegalArgumentException.class);
+            assertThatThrownBy(() -> semanticCacheRepository.explainCosineSearch("GLOBAL:ADMIN", 1L, invalidVector, 1))
+                .isInstanceOf(InvalidDataAccessApiUsageException.class)
+                .hasCauseInstanceOf(IllegalArgumentException.class);
+        }
     }
 }

@@ -1,6 +1,5 @@
 package com.documind.infrastructure.vector;
 
-import com.pgvector.PGvector;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.jdbc.core.simple.JdbcClient;
@@ -71,13 +70,10 @@ public class DocumentChunkVectorRepository {
      * Runs PostgreSQL {@code EXPLAIN} on a cosine-distance top-K query against {@code document_chunks}.
      */
     public List<String> explainCosineSearch(float[] queryVector, int limit) {
-        if (queryVector == null || queryVector.length == 0) {
-            throw new IllegalArgumentException("queryVector must not be null or empty");
-        }
         if (limit < 1) {
             throw new IllegalArgumentException("limit must be >= 1");
         }
-        String vectorLiteral = new PGvector(queryVector).toString();
+        String vectorLiteral = PgVectorLiterals.toNonZeroFiniteVectorLiteral(queryVector, "queryVector");
         return jdbcClient().sql("""
                 EXPLAIN
                 SELECT id
