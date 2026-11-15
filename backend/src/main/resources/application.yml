@@ -73,3 +73,11 @@ management:
 springdoc:
   swagger-ui:
     path: /swagger-ui.html
+
+documind:
+  storage:
+    endpoint: ${MINIO_ENDPOINT:http://localhost:${MINIO_API_PORT:9000}}
+    access-key: ${MINIO_ROOT_USER:documind_minio}
+    secret-key: ${MINIO_ROOT_PASSWORD:documind_minio_secret}
+    bucket: ${MINIO_BUCKET:documind-documents}
+    region: ${MINIO_REGION:us-east-1}
