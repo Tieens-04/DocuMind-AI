@@ -8,6 +8,10 @@ import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.jdbc.core.simple.JdbcClient;
 import org.springframework.stereotype.Repository;
+import org.springframework.transaction.PlatformTransactionManager;
+import org.springframework.transaction.TransactionDefinition;
+import org.springframework.transaction.support.TransactionSynchronizationManager;
+import org.springframework.transaction.support.TransactionTemplate;
 
 import java.sql.Types;
 import java.time.OffsetDateTime;
@@ -28,27 +32,42 @@ public class SemanticCacheVectorRepository {
     };
 
     private final Supplier<JdbcClient> jdbcClientSupplier;
+    private final Supplier<PlatformTransactionManager> transactionManagerSupplier;
     private final ObjectMapper objectMapper;
 
     @Autowired
-    public SemanticCacheVectorRepository(ObjectProvider<JdbcClient> jdbcClientProvider, ObjectMapper objectMapper) {
+    public SemanticCacheVectorRepository(
+        ObjectProvider<JdbcClient> jdbcClientProvider,
+        ObjectProvider<PlatformTransactionManager> transactionManagerProvider,
+        ObjectMapper objectMapper
+    ) {
         this(
             () -> Objects.requireNonNull(jdbcClientProvider, "jdbcClientProvider must not be null").getObject(),
+            () -> transactionManagerProvider != null ? transactionManagerProvider.getIfAvailable() : null,
             objectMapper
         );
     }
 
     public SemanticCacheVectorRepository(JdbcClient jdbcClient, ObjectMapper objectMapper) {
-        this(() -> Objects.requireNonNull(jdbcClient, "jdbcClient must not be null"), objectMapper);
+        this(
+            () -> Objects.requireNonNull(jdbcClient, "jdbcClient must not be null"),
+            () -> null,
+            objectMapper
+        );
     }
 
-    private SemanticCacheVectorRepository(Supplier<JdbcClient> jdbcClientSupplier, ObjectMapper objectMapper) {
+    private SemanticCacheVectorRepository(
+        Supplier<JdbcClient> jdbcClientSupplier,
+        Supplier<PlatformTransactionManager> transactionManagerSupplier,
+        ObjectMapper objectMapper
+    ) {
         this.jdbcClientSupplier = jdbcClientSupplier;
+        this.transactionManagerSupplier = transactionManagerSupplier;
         this.objectMapper = Objects.requireNonNull(objectMapper, "objectMapper must not be null");
     }
 
     /**
-     * Persists a new RBAC-scoped semantic cache entry and returns its generated UUID.
+     * Persists or refreshes an RBAC-scoped semantic cache entry idempotently and returns its UUID.
      */
     public UUID save(
         String rbacScope,
@@ -94,6 +113,14 @@ public class SemanticCacheVectorRepository {
                     :modelProvider,
                     :expiresAt
                 )
+                ON CONFLICT (rbac_scope, scope_version, query_hash) DO UPDATE
+                SET query_text = EXCLUDED.query_text,
+                    query_embedding = EXCLUDED.query_embedding,
+                    response_content = EXCLUDED.response_content,
+                    citations = EXCLUDED.citations,
+                    model_provider = EXCLUDED.model_provider,
+                    expires_at = EXCLUDED.expires_at,
+                    created_at = CURRENT_TIMESTAMP
                 RETURNING id
                 """)
             .param("rbacScope", rbacScope)
@@ -111,7 +138,8 @@ public class SemanticCacheVectorRepository {
 
     /**
      * Finds the highest-similarity non-expired entry matching {@code rbacScope} and {@code scopeVersion},
-     * incrementing {@code hit_count} when a match meets {@code minSimilarity}.
+     * enabling {@code hnsw.iterative_scan = 'relaxed_order'} and incrementing {@code hit_count} safely
+     * even when invoked from a read-only caller transaction.
      */
     public Optional<SemanticCacheEntry> findBestMatch(
         String rbacScope,
@@ -125,7 +153,61 @@ public class SemanticCacheVectorRepository {
         }
         String vectorLiteral = PgVectorLiterals.toNonZeroFiniteVectorLiteral(queryEmbedding, "queryEmbedding");
 
-        Optional<SemanticCacheEntry> match = jdbcClient().sql("""
+        PlatformTransactionManager txManager = transactionManagerSupplier.get();
+        Optional<SemanticCacheEntry> match;
+        if (txManager != null) {
+            TransactionTemplate searchTx = new TransactionTemplate(txManager);
+            searchTx.setPropagationBehavior(TransactionDefinition.PROPAGATION_REQUIRED);
+            match = searchTx.execute(status -> {
+                jdbcClient().sql("SET LOCAL hnsw.iterative_scan = 'relaxed_order'").update();
+                return queryBestMatch(rbacScope, scopeVersion, vectorLiteral, minSimilarity);
+            });
+        } else {
+            match = queryBestMatch(rbacScope, scopeVersion, vectorLiteral, minSimilarity);
+        }
+
+        if (match != null && match.isPresent()) {
+            UUID matchedId = match.get().id();
+            incrementHitCount(matchedId, txManager);
+        }
+
+        return match != null ? match : Optional.empty();
+    }
+
+    /**
+     * Runs PostgreSQL {@code EXPLAIN} on an RBAC-scoped cosine-distance lookup against {@code semantic_cache}.
+     */
+    public List<String> explainCosineSearch(String rbacScope, long scopeVersion, float[] queryVector, int limit) {
+        validateScopeAndVersion(rbacScope, scopeVersion);
+        if (limit < 1) {
+            throw new IllegalArgumentException("limit must be >= 1");
+        }
+        String vectorLiteral = PgVectorLiterals.toNonZeroFiniteVectorLiteral(queryVector, "queryVector");
+
+        return jdbcClient().sql("""
+                EXPLAIN
+                SELECT id
+                FROM semantic_cache
+                WHERE rbac_scope = :scope
+                  AND scope_version = :version
+                ORDER BY query_embedding <=> CAST(:vec AS vector)
+                LIMIT :limit
+                """)
+            .param("scope", rbacScope)
+            .param("version", scopeVersion)
+            .param("vec", vectorLiteral)
+            .param("limit", limit)
+            .query(String.class)
+            .list();
+    }
+
+    private Optional<SemanticCacheEntry> queryBestMatch(
+        String rbacScope,
+        long scopeVersion,
+        String vectorLiteral,
+        double minSimilarity
+    ) {
+        return jdbcClient().sql("""
                 SELECT id,
                        rbac_scope,
                        scope_version,
@@ -159,43 +241,29 @@ public class SemanticCacheVectorRepository {
                 rs.getDouble("similarity_score")
             ))
             .optional();
+    }
 
-        match.ifPresent(entry -> jdbcClient().sql("""
+    private void incrementHitCount(UUID id, PlatformTransactionManager txManager) {
+        if (txManager != null
+            && TransactionSynchronizationManager.isActualTransactionActive()
+            && TransactionSynchronizationManager.isCurrentTransactionReadOnly()) {
+            TransactionTemplate writeTx = new TransactionTemplate(txManager);
+            writeTx.setPropagationBehavior(TransactionDefinition.PROPAGATION_REQUIRES_NEW);
+            writeTx.setReadOnly(false);
+            writeTx.executeWithoutResult(status -> executeIncrementHitCount(id));
+            return;
+        }
+        executeIncrementHitCount(id);
+    }
+
+    private void executeIncrementHitCount(UUID id) {
+        jdbcClient().sql("""
                 UPDATE semantic_cache
                 SET hit_count = hit_count + 1
                 WHERE id = :id
                 """)
-            .param("id", entry.id())
-            .update());
-
-        return match;
-    }
-
-    /**
-     * Runs PostgreSQL {@code EXPLAIN} on an RBAC-scoped cosine-distance lookup against {@code semantic_cache}.
-     */
-    public List<String> explainCosineSearch(String rbacScope, long scopeVersion, float[] queryVector, int limit) {
-        validateScopeAndVersion(rbacScope, scopeVersion);
-        if (limit < 1) {
-            throw new IllegalArgumentException("limit must be >= 1");
-        }
-        String vectorLiteral = PgVectorLiterals.toNonZeroFiniteVectorLiteral(queryVector, "queryVector");
-
-        return jdbcClient().sql("""
-                EXPLAIN
-                SELECT id
-                FROM semantic_cache
-                WHERE rbac_scope = :scope
-                  AND scope_version = :version
-                ORDER BY query_embedding <=> CAST(:vec AS vector)
-                LIMIT :limit
-                """)
-            .param("scope", rbacScope)
-            .param("version", scopeVersion)
-            .param("vec", vectorLiteral)
-            .param("limit", limit)
-            .query(String.class)
-            .list();
+            .param("id", id)
+            .update();
     }
 
     private JdbcClient jdbcClient() {

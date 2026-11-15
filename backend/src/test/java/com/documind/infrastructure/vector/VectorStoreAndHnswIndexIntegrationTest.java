@@ -24,6 +24,7 @@ import org.springframework.context.annotation.Import;
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.dao.InvalidDataAccessApiUsageException;
 import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.support.TransactionTemplate;
 
 import java.time.OffsetDateTime;
@@ -66,6 +67,9 @@ class VectorStoreAndHnswIndexIntegrationTest {
 
     @Autowired
     private TransactionTemplate transactionTemplate;
+
+    @Autowired
+    private PlatformTransactionManager transactionManager;
 
     @AfterEach
     void cleanUpTestRows() {
@@ -227,11 +231,189 @@ class VectorStoreAndHnswIndexIntegrationTest {
 
         Document orphanWithUnknownDocId = new Document(
             "orphan chunk with unknown document_id",
-            Map.of("document_id", UUID.randomUUID().toString(), "access_level", "PUBLIC")
+            Map.of(
+                "document_id", UUID.randomUUID().toString(),
+                "department_id", UUID.randomUUID().toString(),
+                "file_name", "missing.pdf",
+                "access_level", "PUBLIC"
+            )
         );
 
         assertThatThrownBy(() -> vectorStore.add(List.of(orphanWithUnknownDocId)))
             .isInstanceOf(DataIntegrityViolationException.class);
+    }
+
+    @Test
+    void pgVectorStoreUpsertUpdatesColumnsAndEnforcesRbacMetadataConstraints() {
+        DepartmentEntity hr = departmentRepository.findByCodeIgnoreCase("HR").orElseThrow();
+        UserEntity hrManager = userRepository.findByEmailIgnoreCase("manager.hr@documind.ai").orElseThrow();
+        UUID hrId = hr.getId();
+
+        DocumentEntity hrDoc = new DocumentEntity();
+        hrDoc.setDepartment(hr);
+        hrDoc.setUploadedBy(hrManager);
+        hrDoc.setOriginalName("policy-upsert.md");
+        hrDoc.setStorageKey("hr/policy-upsert.md");
+        hrDoc.setFileExtension("md");
+        hrDoc.setMimeType("text/markdown");
+        hrDoc.setFileSizeBytes(1024L);
+        hrDoc.setFileHash("b".repeat(64));
+        hrDoc.setAccessLevel(AccessLevel.DEPARTMENT);
+        hrDoc.setStatus(DocumentStatus.COMPLETED);
+        hrDoc = documentRepository.saveAndFlush(hrDoc);
+        UUID docId = hrDoc.getId();
+
+        UUID chunkUuid = UUID.randomUUID();
+        String chunkId = chunkUuid.toString();
+
+        Document initialChunk = new Document(
+            chunkId,
+            "Nội dung phiên bản 1 có số trang",
+            Map.of(
+                "document_id", docId.toString(),
+                "department_id", hrId.toString(),
+                "access_level", "DEPARTMENT",
+                "file_name", "policy-upsert.md",
+                "page_number", 5,
+                "chunk_index", 2,
+                "doc_version", 1
+            )
+        );
+        vectorStore.add(List.of(initialChunk));
+
+        // Upsert same chunk ID without page_number -> trigger must clear stale page_number to NULL and update version/index
+        Document upsertedChunkWithoutPage = new Document(
+            chunkId,
+            "Nội dung phiên bản 2 định dạng markdown không phân trang",
+            Map.of(
+                "document_id", docId.toString(),
+                "department_id", hrId.toString(),
+                "access_level", "DEPARTMENT",
+                "file_name", "policy-upsert.md",
+                "doc_version", 2
+            )
+        );
+        vectorStore.add(List.of(upsertedChunkWithoutPage));
+
+        Map<String, Object> row = jdbcTemplate.queryForMap(
+            "SELECT document_id, page_number, doc_version, chunk_index FROM document_chunks WHERE id = ?",
+            chunkUuid
+        );
+        assertThat(row.get("document_id")).isEqualTo(docId);
+        assertThat(row.get("page_number")).isNull();
+        assertThat(row.get("doc_version")).isEqualTo(2);
+        assertThat(row.get("chunk_index")).isEqualTo(0);
+
+        // Upsert same chunk ID omitting document_id must fail instead of silently retaining OLD.document_id
+        Document upsertMissingDocId = new Document(
+            chunkId,
+            "Nội dung thiếu document_id khi upsert",
+            Map.of(
+                "department_id", hrId.toString(),
+                "access_level", "DEPARTMENT",
+                "file_name", "policy-upsert.md"
+            )
+        );
+        assertThatThrownBy(() -> vectorStore.add(List.of(upsertMissingDocId)))
+            .isInstanceOf(DataIntegrityViolationException.class);
+
+        // Mandatory RBAC metadata CHECK constraint: department_id, file_name, and canonical access_level
+        Document missingDepartmentId = new Document(
+            "Chunk thiếu department_id",
+            Map.of(
+                "document_id", docId.toString(),
+                "access_level", "DEPARTMENT",
+                "file_name", "policy-upsert.md"
+            )
+        );
+        assertThatThrownBy(() -> vectorStore.add(List.of(missingDepartmentId)))
+            .isInstanceOf(DataIntegrityViolationException.class);
+
+        Document missingFileName = new Document(
+            "Chunk thiếu file_name",
+            Map.of(
+                "document_id", docId.toString(),
+                "department_id", hrId.toString(),
+                "access_level", "DEPARTMENT"
+            )
+        );
+        assertThatThrownBy(() -> vectorStore.add(List.of(missingFileName)))
+            .isInstanceOf(DataIntegrityViolationException.class);
+
+        Document invalidAccessLevel = new Document(
+            "Chunk sai chuẩn chữ hoa access_level",
+            Map.of(
+                "document_id", docId.toString(),
+                "department_id", hrId.toString(),
+                "access_level", "Department",
+                "file_name", "policy-upsert.md"
+            )
+        );
+        assertThatThrownBy(() -> vectorStore.add(List.of(invalidAccessLevel)))
+            .isInstanceOf(DataIntegrityViolationException.class);
+    }
+
+    @Test
+    void semanticCacheUpsertsDuplicateQueryHashAndSupportsReadOnlyCallerTransactions() {
+        UUID hrId = departmentRepository.findByCodeIgnoreCase("HR").orElseThrow().getId();
+        String managerScope = "DEPT:" + hrId + ":MANAGER";
+        String queryHash = "12345678".repeat(8);
+        String queryText = "Chính sách làm việc từ xa Hybrid";
+        float[] queryVector = embeddingModel.embed(queryText);
+        List<CitationPayload> citations = List.of(
+            new CitationPayload(UUID.randomUUID(), "hybrid-work.pdf", 2, 0.9510d, "Tối đa 2 ngày làm việc từ xa mỗi tuần.")
+        );
+
+        UUID firstId = semanticCacheRepository.save(
+            managerScope,
+            1L,
+            queryHash,
+            queryText,
+            queryVector,
+            "Câu trả lời lần đầu.",
+            citations,
+            "groq",
+            OffsetDateTime.now(ZoneOffset.UTC).plusHours(1)
+        );
+
+        UUID upsertedId = semanticCacheRepository.save(
+            managerScope,
+            1L,
+            queryHash,
+            queryText,
+            queryVector,
+            "Câu trả lời đã được làm mới idempotent.",
+            citations,
+            "gemini",
+            OffsetDateTime.now(ZoneOffset.UTC).plusHours(2)
+        );
+        assertThat(upsertedId).isEqualTo(firstId);
+
+        Integer rowCount = jdbcTemplate.queryForObject(
+            "SELECT COUNT(*) FROM semantic_cache WHERE rbac_scope = ? AND scope_version = 1 AND query_hash = ?",
+            Integer.class,
+            managerScope,
+            queryHash
+        );
+        assertThat(rowCount).isEqualTo(1);
+
+        TransactionTemplate readOnlyTx = new TransactionTemplate(transactionManager);
+        readOnlyTx.setReadOnly(true);
+
+        Optional<SemanticCacheEntry> hitInReadOnlyTx = readOnlyTx.execute(
+            status -> semanticCacheRepository.findBestMatch(managerScope, 1L, queryVector, 0.94d)
+        );
+        assertThat(hitInReadOnlyTx).isPresent();
+        assertThat(hitInReadOnlyTx.orElseThrow().responseContent())
+            .isEqualTo("Câu trả lời đã được làm mới idempotent.");
+        assertThat(hitInReadOnlyTx.orElseThrow().modelProvider()).isEqualTo("gemini");
+
+        Integer hitCount = jdbcTemplate.queryForObject(
+            "SELECT hit_count FROM semantic_cache WHERE id = ?",
+            Integer.class,
+            upsertedId
+        );
+        assertThat(hitCount).isEqualTo(1);
     }
 
     @Test
@@ -358,8 +540,9 @@ class VectorStoreAndHnswIndexIntegrationTest {
         float[] negInfVector = new float[PostgresTestcontainersConfig.EMBEDDING_DIMENSIONS];
         negInfVector[0] = 1.0f;
         negInfVector[1] = Float.NEGATIVE_INFINITY;
+        float[] wrongDimensionVector = new float[]{1.0f, 0.0f, 0.0f};
 
-        List<float[]> invalidVectors = List.of(zeroVector, nanVector, posInfVector, negInfVector);
+        List<float[]> invalidVectors = List.of(zeroVector, nanVector, posInfVector, negInfVector, wrongDimensionVector);
 
         assertThatThrownBy(() -> PgVectorLiterals.toNonZeroFiniteVectorLiteral(null, "queryVector"))
             .isInstanceOf(IllegalArgumentException.class);

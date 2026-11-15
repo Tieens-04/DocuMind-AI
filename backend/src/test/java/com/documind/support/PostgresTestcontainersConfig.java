@@ -24,12 +24,18 @@ public class PostgresTestcontainersConfig {
 
     public static final int EMBEDDING_DIMENSIONS = 1024;
 
-    @Bean
+    private static final PostgreSQLContainer<?> SHARED_POSTGRES = new PostgreSQLContainer<>(
+        DockerImageName.parse("pgvector/pgvector:pg16").asCompatibleSubstituteFor("postgres")
+    );
+
+    static {
+        SHARED_POSTGRES.start();
+    }
+
+    @Bean(destroyMethod = "")
     @ServiceConnection
     PostgreSQLContainer<?> postgresContainer() {
-        return new PostgreSQLContainer<>(
-            DockerImageName.parse("pgvector/pgvector:pg16").asCompatibleSubstituteFor("postgres")
-        );
+        return SHARED_POSTGRES;
     }
 
     @Bean

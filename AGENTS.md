@@ -23,8 +23,8 @@
 1. **Mandatory Vector RBAC Filtering (Zero Cross-Department Leakage):**
    - Every chunk stored in `pgvector` MUST carry metadata: `document_id`, `file_name`, `page_number`, `department_id`, and `access_level` (`PUBLIC`, `DEPARTMENT`, `CONFIDENTIAL`).
    - Every `VectorStore.similaritySearch(...)` call MUST attach a server-enforced `Filter.Expression` derived strictly from `SecurityContextHolder` (never from unvalidated request parameters):
-     - `STANDARD_EMPLOYEE` (`VIEWER`): `access_level == 'PUBLIC' || department_id == <user.departmentId>`
-     - `DEPARTMENT_MANAGER` (`EDITOR`): manage documents only within `<user.departmentId>`; query `access_level == 'PUBLIC' || department_id == <user.departmentId>`
+     - `STANDARD_EMPLOYEE` (`VIEWER`): `access_level == 'PUBLIC' || (department_id == <user.departmentId> && access_level == 'DEPARTMENT')` (never `CONFIDENTIAL`)
+     - `DEPARTMENT_MANAGER` (`EDITOR`): manage documents only within `<user.departmentId>`; query `access_level == 'PUBLIC' || department_id == <user.departmentId>` (includes `DEPARTMENT` and `CONFIDENTIAL` within own department)
      - `SYSTEM_ADMIN`: full governance/audit access and authorized administrative scope.
 2. **Deterministic Anti-Hallucination Fallback & Citations:**
    - Enforce a configurable `similarityThreshold` on vector retrieval.

@@ -22,6 +22,8 @@ CREATE TABLE departments (
     updated_at    TIMESTAMPTZ  NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
+CREATE UNIQUE INDEX uq_departments_code_lower ON departments (LOWER(code));
+
 CREATE TRIGGER trg_departments_updated_at
 BEFORE UPDATE ON departments
 FOR EACH ROW EXECUTE FUNCTION set_updated_at_timestamp();
@@ -39,6 +41,7 @@ CREATE TABLE users (
     updated_at    TIMESTAMPTZ  NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
+CREATE UNIQUE INDEX uq_users_email_lower ON users (LOWER(email));
 CREATE INDEX idx_users_department_id ON users (department_id);
 CREATE INDEX idx_users_role ON users (role);
 
@@ -68,7 +71,7 @@ CREATE TABLE documents (
     department_id   UUID         NOT NULL CONSTRAINT fk_documents_department REFERENCES departments(id) ON DELETE RESTRICT,
     uploaded_by     UUID         CONSTRAINT fk_documents_uploaded_by REFERENCES users(id) ON DELETE SET NULL,
     original_name   VARCHAR(255) NOT NULL,
-    storage_key     VARCHAR(512) NOT NULL,
+    storage_key     VARCHAR(512) NOT NULL CONSTRAINT uq_documents_storage_key UNIQUE,
     file_extension  VARCHAR(16)  NOT NULL CONSTRAINT chk_documents_extension CHECK (file_extension IN ('pdf', 'docx', 'txt', 'md')),
     mime_type       VARCHAR(128) NOT NULL,
     file_size_bytes BIGINT       NOT NULL CONSTRAINT chk_documents_size CHECK (file_size_bytes > 0 AND file_size_bytes <= 52428800),
@@ -141,7 +144,11 @@ CREATE TABLE audit_logs (
     provider          VARCHAR(64),
     status_code       INT         NOT NULL DEFAULT 200,
     ip_address        VARCHAR(45),
-    created_at        TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+    created_at        TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT chk_audit_logs_cache_consistency CHECK (
+        (cache_hit = FALSE AND cache_tier = 'NONE')
+        OR (cache_hit = TRUE AND cache_tier IN ('L1', 'L2'))
+    )
 );
 
 CREATE INDEX idx_audit_logs_created_at ON audit_logs (created_at DESC);

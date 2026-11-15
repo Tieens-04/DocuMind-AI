@@ -66,6 +66,60 @@ class FlywaySchemaAndProdIsolationIntegrationTest {
     }
 
     @Test
+    void enforcesCaseInsensitiveUniquenessOnUserEmailsAndDepartmentCodes() {
+        try {
+            assertThatThrownBy(() -> jdbcTemplate.update("""
+                INSERT INTO users (department_id, email, password_hash, full_name, role)
+                VALUES ('11111111-1111-1111-1111-111111111111', 'Admin@DocuMind.ai', 'hash', 'Mixed Case Admin', 'SYSTEM_ADMIN')
+                """)).isInstanceOf(DataIntegrityViolationException.class);
+
+            assertThatThrownBy(() -> jdbcTemplate.update("""
+                INSERT INTO departments (code, name)
+                VALUES ('hr', 'Duplicate Lowercase HR')
+                """)).isInstanceOf(DataIntegrityViolationException.class);
+        } finally {
+            jdbcTemplate.update("DELETE FROM users WHERE email = 'Admin@DocuMind.ai'");
+            jdbcTemplate.update("DELETE FROM departments WHERE code = 'hr'");
+        }
+    }
+
+    @Test
+    void enforcesUniqueDocumentStorageKeyAndAuditLogCacheConsistency() {
+        jdbcTemplate.update("""
+            INSERT INTO documents (id, department_id, original_name, storage_key, file_extension, mime_type,
+                                   file_size_bytes, file_hash, access_level, status)
+            VALUES ('99999999-9999-9999-9999-999999999991', '11111111-1111-1111-1111-111111111111',
+                    'first.pdf', 'shared/object-key.pdf', 'pdf', 'application/pdf',
+                    1024, repeat('1', 64), 'DEPARTMENT', 'PENDING')
+            """);
+        try {
+            assertThatThrownBy(() -> jdbcTemplate.update("""
+                INSERT INTO documents (id, department_id, original_name, storage_key, file_extension, mime_type,
+                                       file_size_bytes, file_hash, access_level, status)
+                VALUES ('99999999-9999-9999-9999-999999999992', '22222222-2222-2222-2222-222222222222',
+                        'second.pdf', 'shared/object-key.pdf', 'pdf', 'application/pdf',
+                        1024, repeat('2', 64), 'DEPARTMENT', 'PENDING')
+                """)).isInstanceOf(DataIntegrityViolationException.class);
+        } finally {
+            jdbcTemplate.update("DELETE FROM documents WHERE id IN ('99999999-9999-9999-9999-999999999991', '99999999-9999-9999-9999-999999999992')");
+        }
+
+        try {
+            assertThatThrownBy(() -> jdbcTemplate.update("""
+                INSERT INTO audit_logs (action_type, cache_hit, cache_tier)
+                VALUES ('CHAT_QUERY', FALSE, 'L1')
+                """)).isInstanceOf(DataIntegrityViolationException.class);
+
+            assertThatThrownBy(() -> jdbcTemplate.update("""
+                INSERT INTO audit_logs (action_type, cache_hit, cache_tier)
+                VALUES ('CHAT_QUERY', TRUE, 'NONE')
+                """)).isInstanceOf(DataIntegrityViolationException.class);
+        } finally {
+            jdbcTemplate.update("DELETE FROM audit_logs");
+        }
+    }
+
+    @Test
     void prodFlywayLocationsExcludeSeedMigrationV3() {
         YamlPropertiesFactoryBean yaml = new YamlPropertiesFactoryBean();
         yaml.setResources(new ClassPathResource("application-prod.yml"));

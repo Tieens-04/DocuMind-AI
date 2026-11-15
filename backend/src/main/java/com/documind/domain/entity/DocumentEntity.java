@@ -7,16 +7,17 @@ import jakarta.persistence.Entity;
 import jakarta.persistence.EnumType;
 import jakarta.persistence.Enumerated;
 import jakarta.persistence.FetchType;
-import jakarta.persistence.GeneratedValue;
-import jakarta.persistence.GenerationType;
 import jakarta.persistence.Id;
 import jakarta.persistence.JoinColumn;
 import jakarta.persistence.ManyToOne;
+import jakarta.persistence.PostLoad;
+import jakarta.persistence.PostPersist;
 import jakarta.persistence.PrePersist;
 import jakarta.persistence.PreUpdate;
 import jakarta.persistence.Table;
+import jakarta.persistence.Transient;
 import jakarta.persistence.UniqueConstraint;
-import org.hibernate.Hibernate;
+import org.springframework.data.domain.Persistable;
 
 import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
@@ -29,14 +30,20 @@ import java.util.UUID;
 @Entity
 @Table(
     name = "documents",
-    uniqueConstraints = @UniqueConstraint(name = "uq_documents_department_hash", columnNames = {"department_id", "file_hash"})
+    uniqueConstraints = {
+        @UniqueConstraint(name = "uq_documents_department_hash", columnNames = {"department_id", "file_hash"}),
+        @UniqueConstraint(name = "uq_documents_storage_key", columnNames = {"storage_key"})
+    }
 )
-public class DocumentEntity {
+public class DocumentEntity implements Persistable<UUID> {
 
     @Id
-    @GeneratedValue(strategy = GenerationType.UUID)
+    @AssignedOrRandomUuid
     @Column(name = "id", nullable = false, updatable = false)
     private UUID id;
+
+    @Transient
+    private boolean isNew = true;
 
     @ManyToOne(fetch = FetchType.LAZY, optional = false)
     @JoinColumn(name = "department_id", nullable = false)
@@ -55,7 +62,7 @@ public class DocumentEntity {
     @Column(name = "original_name", nullable = false, length = 255)
     private String originalName;
 
-    @Column(name = "storage_key", nullable = false, length = 512)
+    @Column(name = "storage_key", nullable = false, unique = true, length = 512)
     private String storageKey;
 
     @Column(name = "file_extension", nullable = false, length = 16)
@@ -118,6 +125,18 @@ public class DocumentEntity {
         updatedAt = OffsetDateTime.now(ZoneOffset.UTC);
     }
 
+    @PostPersist
+    @PostLoad
+    void markPersisted() {
+        this.isNew = false;
+    }
+
+    @Override
+    public boolean isNew() {
+        return isNew;
+    }
+
+    @Override
     public UUID getId() {
         return id;
     }
@@ -132,11 +151,11 @@ public class DocumentEntity {
 
     public void setDepartment(DepartmentEntity department) {
         this.department = department;
-        this.departmentId = department != null ? department.getId() : null;
+        this.departmentId = JpaProxyUtils.extractId(department);
     }
 
     public UUID getDepartmentId() {
-        return departmentId != null ? departmentId : (department != null ? department.getId() : null);
+        return departmentId != null ? departmentId : JpaProxyUtils.extractId(department);
     }
 
     public UserEntity getUploadedBy() {
@@ -145,11 +164,11 @@ public class DocumentEntity {
 
     public void setUploadedBy(UserEntity uploadedBy) {
         this.uploadedBy = uploadedBy;
-        this.uploadedById = uploadedBy != null ? uploadedBy.getId() : null;
+        this.uploadedById = JpaProxyUtils.extractId(uploadedBy);
     }
 
     public UUID getUploadedById() {
-        return uploadedById != null ? uploadedById : (uploadedBy != null ? uploadedBy.getId() : null);
+        return uploadedById != null ? uploadedById : JpaProxyUtils.extractId(uploadedBy);
     }
 
     public String getOriginalName() {
@@ -261,16 +280,18 @@ public class DocumentEntity {
         if (this == o) {
             return true;
         }
-        if (o == null || Hibernate.getClass(this) != Hibernate.getClass(o)) {
+        if (o == null || JpaProxyUtils.effectiveClass(this) != JpaProxyUtils.effectiveClass(o)) {
             return false;
         }
         DocumentEntity that = (DocumentEntity) o;
-        return id != null && Objects.equals(id, that.getId());
+        UUID thisId = JpaProxyUtils.extractId(this);
+        UUID thatId = JpaProxyUtils.extractId(that);
+        return thisId != null && Objects.equals(thisId, thatId);
     }
 
     @Override
     public int hashCode() {
-        return Hibernate.getClass(this).hashCode();
+        return JpaProxyUtils.effectiveClass(this).hashCode();
     }
 
     @Override

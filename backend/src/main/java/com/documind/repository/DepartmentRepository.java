@@ -5,6 +5,7 @@ import org.springframework.data.jpa.repository.JpaRepository;
 import org.springframework.data.jpa.repository.Modifying;
 import org.springframework.data.jpa.repository.Query;
 import org.springframework.data.repository.query.Param;
+import org.springframework.transaction.annotation.Transactional;
 
 import java.util.Optional;
 import java.util.UUID;
@@ -16,10 +17,12 @@ public interface DepartmentRepository extends JpaRepository<DepartmentEntity, UU
 
     Optional<DepartmentEntity> findByCodeIgnoreCase(String code);
 
+    @Transactional
     @Modifying(clearAutomatically = true, flushAutomatically = true)
     @Query("UPDATE DepartmentEntity d SET d.cacheVersion = d.cacheVersion + 1 WHERE d.id = :id")
     int incrementCacheVersion(@Param("id") UUID id);
 
+    @Transactional
     @Modifying(clearAutomatically = true, flushAutomatically = true)
     @Query("UPDATE DepartmentEntity d SET d.cacheVersion = d.cacheVersion + 1")
     int incrementAllCacheVersions();

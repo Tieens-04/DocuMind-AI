@@ -76,6 +76,7 @@ Creates the `set_updated_at_timestamp()` trigger function and all **7 relational
    - `cache_version BIGINT NOT NULL DEFAULT 1 CONSTRAINT chk_departments_cache_version CHECK (cache_version >= 1)`
    - `created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP`
    - `updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP`
+   - Case-insensitive unique index: `uq_departments_code_lower (LOWER(code))`
 
 2. **`users`**
    - `id UUID PRIMARY KEY DEFAULT gen_random_uuid()`
@@ -87,7 +88,7 @@ Creates the `set_updated_at_timestamp()` trigger function and all **7 relational
    - `is_active BOOLEAN NOT NULL DEFAULT TRUE`
    - `created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP`
    - `updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP`
-   - Indexes: `idx_users_department_id (department_id)`, `idx_users_role (role)`
+   - Indexes: `uq_users_email_lower (LOWER(email))`, `idx_users_department_id (department_id)`, `idx_users_role (role)`
 
 3. **`refresh_tokens`**
    - `id UUID PRIMARY KEY DEFAULT gen_random_uuid()`
@@ -106,7 +107,7 @@ Creates the `set_updated_at_timestamp()` trigger function and all **7 relational
    - `department_id UUID NOT NULL CONSTRAINT fk_documents_department REFERENCES departments(id) ON DELETE RESTRICT`
    - `uploaded_by UUID CONSTRAINT fk_documents_uploaded_by REFERENCES users(id) ON DELETE SET NULL`
    - `original_name VARCHAR(255) NOT NULL`
-   - `storage_key VARCHAR(512) NOT NULL`
+   - `storage_key VARCHAR(512) NOT NULL CONSTRAINT uq_documents_storage_key UNIQUE`
    - `file_extension VARCHAR(16) NOT NULL CONSTRAINT chk_documents_extension CHECK (file_extension IN ('pdf', 'docx', 'txt', 'md'))`
    - `mime_type VARCHAR(128) NOT NULL`
    - `file_size_bytes BIGINT NOT NULL CONSTRAINT chk_documents_size CHECK (file_size_bytes > 0 AND file_size_bytes <= 52428800)`
@@ -161,6 +162,7 @@ Creates the `set_updated_at_timestamp()` trigger function and all **7 relational
    - `status_code INT NOT NULL DEFAULT 200`
    - `ip_address VARCHAR(45)`
    - `created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP`
+   - Constraint: `chk_audit_logs_cache_consistency CHECK ((cache_hit = FALSE AND cache_tier = 'NONE') OR (cache_hit = TRUE AND cache_tier IN ('L1', 'L2')))`
    - Indexes: `idx_audit_logs_created_at (created_at DESC)`, `idx_audit_logs_dept_created (department_id, created_at DESC)`, `idx_audit_logs_action_created (action_type, created_at DESC)`
 
 ### 3.2 `V2__init_pgvector_and_semantic_cache.sql` (`classpath:db/migration`)
@@ -174,11 +176,11 @@ Enables `CREATE EXTENSION IF NOT EXISTS vector;` and creates the **2 vector tabl
    - `chunk_index INT NOT NULL DEFAULT 0 CONSTRAINT chk_document_chunks_index CHECK (chunk_index >= 0)`
    - `page_number INT CONSTRAINT chk_document_chunks_page CHECK (page_number IS NULL OR page_number >= 1)`
    - `content TEXT NOT NULL`
-   - `metadata JSONB NOT NULL DEFAULT '{}'::jsonb`
+   - `metadata JSONB NOT NULL DEFAULT '{}'::jsonb` (guarded by `chk_document_chunks_rbac_metadata` requiring non-blank `document_id`, `department_id`, `file_name`, and `access_level IN ('PUBLIC', 'DEPARTMENT', 'CONFIDENTIAL')`)
    - `embedding vector(1024) NOT NULL`
    - `created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP`
    - **Trigger `trg_sync_document_chunk_metadata` (`BEFORE INSERT OR UPDATE`):**
-     Extracts `metadata->>'document_id'` (into `NEW.document_id` when present), `metadata->>'doc_version'` (defaulting to `1`), `metadata->>'chunk_index'` (defaulting to `0`), and `metadata->>'page_number'` (nullable `INT`).
+     Synchronizes `metadata->>'document_id'`, `metadata->>'doc_version'` (defaulting to `1`), `metadata->>'chunk_index'` (defaulting to `0`), and `metadata->>'page_number'` (nullable `INT`, cleared to `NULL` if omitted on `ON CONFLICT DO UPDATE`).
    - **Indexes:**
      - `idx_document_chunks_embedding_hnsw`: `USING hnsw (embedding vector_cosine_ops) WITH (m = 16, ef_construction = 64)`
      - `idx_document_chunks_metadata_gin`: `USING gin (metadata)`
@@ -197,8 +199,9 @@ Enables `CREATE EXTENSION IF NOT EXISTS vector;` and creates the **2 vector tabl
    - `hit_count INT NOT NULL DEFAULT 0 CONSTRAINT chk_semantic_cache_hit_count CHECK (hit_count >= 0)`
    - `created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP`
    - `expires_at TIMESTAMPTZ`
-   - **Indexes:**
-     - `idx_semantic_cache_embedding_hnsw`: `USING hnsw (query_embedding vector_cosine_ops) WITH (m = 16, ef_construction = 64)`
+   - **Constraints & Indexes:**
+     - `uq_semantic_cache_scope_hash`: `UNIQUE (rbac_scope, scope_version, query_hash)` (supports idempotent `ON CONFLICT DO UPDATE` writes)
+     - `idx_semantic_cache_embedding_hnsw`: `USING hnsw (query_embedding vector_cosine_ops) WITH (m = 16, ef_construction = 64)` (queried with `SET LOCAL hnsw.iterative_scan = 'relaxed_order'`)
      - `idx_semantic_cache_scope_lookup`: `(rbac_scope, scope_version)`
 
 ### 3.3 `V3__seed_dev_data.sql` (`classpath:db/seed`)
