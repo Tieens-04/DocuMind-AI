@@ -1,0 +1,398 @@
+package com.documind.infrastructure.vector;
+
+import com.documind.domain.entity.DepartmentEntity;
+import com.documind.domain.entity.DocumentEntity;
+import com.documind.domain.entity.UserEntity;
+import com.documind.domain.enums.AccessLevel;
+import com.documind.domain.enums.DocumentStatus;
+import com.documind.domain.model.CitationPayload;
+import com.documind.repository.DepartmentRepository;
+import com.documind.repository.DocumentRepository;
+import com.documind.repository.UserRepository;
+import com.documind.support.PostgresTestcontainersConfig;
+import com.pgvector.PGvector;
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.Test;
+import org.springframework.ai.document.Document;
+import org.springframework.ai.embedding.EmbeddingModel;
+import org.springframework.ai.vectorstore.SearchRequest;
+import org.springframework.ai.vectorstore.VectorStore;
+import org.springframework.ai.vectorstore.filter.FilterExpressionBuilder;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.context.annotation.Import;
+import org.springframework.dao.DataIntegrityViolationException;
+import org.springframework.dao.InvalidDataAccessApiUsageException;
+import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.transaction.support.TransactionTemplate;
+
+import java.time.OffsetDateTime;
+import java.time.ZoneOffset;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+import java.util.UUID;
+
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
+
+@SpringBootTest
+@Import(PostgresTestcontainersConfig.class)
+class VectorStoreAndHnswIndexIntegrationTest {
+
+    @Autowired
+    private VectorStore vectorStore;
+
+    @Autowired
+    private EmbeddingModel embeddingModel;
+
+    @Autowired
+    private DocumentChunkVectorRepository chunkVectorRepository;
+
+    @Autowired
+    private SemanticCacheVectorRepository semanticCacheRepository;
+
+    @Autowired
+    private DocumentRepository documentRepository;
+
+    @Autowired
+    private DepartmentRepository departmentRepository;
+
+    @Autowired
+    private UserRepository userRepository;
+
+    @Autowired
+    private JdbcTemplate jdbcTemplate;
+
+    @Autowired
+    private TransactionTemplate transactionTemplate;
+
+    @AfterEach
+    void cleanUpTestRows() {
+        jdbcTemplate.update("DELETE FROM semantic_cache");
+        jdbcTemplate.update("DELETE FROM documents");
+    }
+
+    @Test
+    void pgVectorStoreSyncsMetadataFiltersByDepartmentPrunesOldVersionsAndCascadesOnDelete() {
+        DepartmentEntity hr = departmentRepository.findByCodeIgnoreCase("HR").orElseThrow();
+        DepartmentEntity sales = departmentRepository.findByCodeIgnoreCase("SALES").orElseThrow();
+        UserEntity hrManager = userRepository.findByEmailIgnoreCase("manager.hr@documind.ai").orElseThrow();
+        UUID hrId = hr.getId();
+
+        DocumentEntity hrDoc = new DocumentEntity();
+        hrDoc.setDepartment(hr);
+        hrDoc.setUploadedBy(hrManager);
+        hrDoc.setOriginalName("handbook.pdf");
+        hrDoc.setStorageKey("hr/handbook.pdf");
+        hrDoc.setFileExtension("pdf");
+        hrDoc.setMimeType("application/pdf");
+        hrDoc.setFileSizeBytes(4096L);
+        hrDoc.setFileHash("c".repeat(64));
+        hrDoc.setAccessLevel(AccessLevel.DEPARTMENT);
+        hrDoc.setStatus(DocumentStatus.COMPLETED);
+        hrDoc.setCurrentVersion(1);
+        hrDoc = documentRepository.saveAndFlush(hrDoc);
+        UUID docId = hrDoc.getId();
+
+        DocumentEntity salesDoc = new DocumentEntity();
+        salesDoc.setDepartment(sales);
+        salesDoc.setUploadedBy(hrManager);
+        salesDoc.setOriginalName("sales-playbook.pdf");
+        salesDoc.setStorageKey("sales/sales-playbook.pdf");
+        salesDoc.setFileExtension("pdf");
+        salesDoc.setMimeType("application/pdf");
+        salesDoc.setFileSizeBytes(2048L);
+        salesDoc.setFileHash("d".repeat(64));
+        salesDoc.setAccessLevel(AccessLevel.DEPARTMENT);
+        salesDoc.setStatus(DocumentStatus.COMPLETED);
+        salesDoc.setCurrentVersion(1);
+        salesDoc = documentRepository.saveAndFlush(salesDoc);
+
+        Document chunk0 = new Document(
+            "nghỉ phép",
+            Map.of(
+                "document_id", docId.toString(),
+                "department_id", hrId.toString(),
+                "access_level", "DEPARTMENT",
+                "file_name", "handbook.pdf",
+                "page_number", 3,
+                "chunk_index", 0,
+                "doc_version", 1
+            )
+        );
+        Document chunk1 = new Document(
+            "Quy định nghỉ phép năm cho nhân viên chính thức tại công ty",
+            Map.of(
+                "document_id", docId.toString(),
+                "department_id", hrId.toString(),
+                "access_level", "DEPARTMENT",
+                "file_name", "handbook.pdf",
+                "page_number", 3,
+                "chunk_index", 1,
+                "doc_version", 1
+            )
+        );
+        Document salesChunk = new Document(
+            "nghỉ phép",
+            Map.of(
+                "document_id", salesDoc.getId().toString(),
+                "department_id", sales.getId().toString(),
+                "access_level", "DEPARTMENT",
+                "file_name", "sales-playbook.pdf",
+                "page_number", 1,
+                "chunk_index", 0,
+                "doc_version", 1
+            )
+        );
+
+        vectorStore.add(List.of(chunk0, chunk1, salesChunk));
+
+        assertThat(chunkVectorRepository.countByDocumentId(docId)).isEqualTo(2L);
+        List<Map<String, Object>> persistedRows = jdbcTemplate.queryForList(
+            "SELECT document_id, page_number, doc_version, chunk_index FROM document_chunks WHERE document_id = ? ORDER BY chunk_index",
+            docId
+        );
+        assertThat(persistedRows).hasSize(2);
+        assertThat(persistedRows).allSatisfy(row -> {
+            assertThat(row.get("document_id")).isEqualTo(docId);
+            assertThat(row.get("page_number")).isEqualTo(3);
+            assertThat(row.get("doc_version")).isEqualTo(1);
+        });
+
+        FilterExpressionBuilder builder = new FilterExpressionBuilder();
+        List<Document> hrHits = vectorStore.similaritySearch(
+            SearchRequest.builder()
+                .query("nghỉ phép")
+                .topK(5)
+                .similarityThreshold(0.0)
+                .filterExpression(builder.eq("department_id", hrId.toString()).build())
+                .build()
+        );
+        assertThat(hrHits).isNotEmpty();
+        assertThat(hrHits).allSatisfy(hit -> {
+            assertThat(hit.getMetadata().get("department_id")).isEqualTo(hrId.toString());
+            assertThat(hit.getMetadata().get("document_id")).isEqualTo(docId.toString());
+        });
+
+        List<Document> salesHits = vectorStore.similaritySearch(
+            SearchRequest.builder()
+                .query("nghỉ phép")
+                .topK(5)
+                .similarityThreshold(0.0)
+                .filterExpression(builder.eq("department_id", sales.getId().toString()).build())
+                .build()
+        );
+        assertThat(salesHits).hasSize(1);
+        assertThat(salesHits.getFirst().getMetadata().get("document_id")).isEqualTo(salesDoc.getId().toString());
+
+        Document v2Chunk = new Document(
+            "Chính sách nghỉ phép năm cập nhật phiên bản 2",
+            Map.of(
+                "document_id", docId.toString(),
+                "department_id", hrId.toString(),
+                "access_level", "DEPARTMENT",
+                "file_name", "handbook.pdf",
+                "page_number", 4,
+                "chunk_index", 0,
+                "doc_version", 2
+            )
+        );
+        vectorStore.add(List.of(v2Chunk));
+        assertThat(chunkVectorRepository.countByDocumentId(docId)).isEqualTo(3L);
+
+        int pruned = chunkVectorRepository.deleteByDocumentIdAndVersionLessThan(docId, 2);
+        assertThat(pruned).isEqualTo(2);
+        assertThat(chunkVectorRepository.countByDocumentId(docId)).isEqualTo(1L);
+        Integer remainingVersion = jdbcTemplate.queryForObject(
+            "SELECT doc_version FROM document_chunks WHERE document_id = ?",
+            Integer.class,
+            docId
+        );
+        assertThat(remainingVersion).isEqualTo(2);
+
+        documentRepository.deleteById(docId);
+        assertThat(chunkVectorRepository.countByDocumentId(docId)).isZero();
+    }
+
+    @Test
+    void rejectsOrphanVectorChunkWithoutDocumentIdAtDatabaseLevel() {
+        Document orphanWithoutDocId = new Document(
+            "orphan chunk without document_id",
+            Map.of("access_level", "PUBLIC")
+        );
+
+        assertThatThrownBy(() -> vectorStore.add(List.of(orphanWithoutDocId)))
+            .isInstanceOf(DataIntegrityViolationException.class);
+
+        Document orphanWithUnknownDocId = new Document(
+            "orphan chunk with unknown document_id",
+            Map.of("document_id", UUID.randomUUID().toString(), "access_level", "PUBLIC")
+        );
+
+        assertThatThrownBy(() -> vectorStore.add(List.of(orphanWithUnknownDocId)))
+            .isInstanceOf(DataIntegrityViolationException.class);
+    }
+
+    @Test
+    void semanticCacheIsolatesByRbacScopeAndScopeVersionAndTracksHits() {
+        UUID hrId = departmentRepository.findByCodeIgnoreCase("HR").orElseThrow().getId();
+        String managerScope = "DEPT:" + hrId + ":MANAGER";
+        String employeeScope = "DEPT:" + hrId + ":EMPLOYEE";
+        String queryText = "Quy trình phê duyệt nghỉ phép đặc biệt";
+        float[] queryVector = embeddingModel.embed(queryText);
+        float[] unrelatedVector = embeddingModel.embed("Quy trình cấp phát máy tính xách tay mới");
+        List<CitationPayload> citations = List.of(
+            new CitationPayload(UUID.randomUUID(), "hr-confidential.pdf", 7, 0.9625d, "Trích đoạn bảo mật HR.")
+        );
+
+        UUID savedId = semanticCacheRepository.save(
+            managerScope,
+            1L,
+            "e".repeat(64),
+            queryText,
+            queryVector,
+            "Quản lý nhân sự phê duyệt tối đa 5 ngày phép đặc biệt.",
+            citations,
+            "groq",
+            OffsetDateTime.now(ZoneOffset.UTC).plusHours(2)
+        );
+        assertThat(savedId).isNotNull();
+
+        semanticCacheRepository.save(
+            managerScope,
+            1L,
+            "f".repeat(64),
+            "Câu hỏi đã hết hạn TTL",
+            unrelatedVector,
+            "Nội dung đã hết hạn.",
+            List.of(),
+            "groq",
+            OffsetDateTime.now(ZoneOffset.UTC).minusMinutes(5)
+        );
+
+        Optional<SemanticCacheEntry> hit = semanticCacheRepository.findBestMatch(managerScope, 1L, queryVector, 0.94d);
+        assertThat(hit).isPresent();
+        SemanticCacheEntry entry = hit.orElseThrow();
+        assertThat(entry.id()).isEqualTo(savedId);
+        assertThat(entry.rbacScope()).isEqualTo(managerScope);
+        assertThat(entry.scopeVersion()).isEqualTo(1L);
+        assertThat(entry.similarityScore()).isGreaterThanOrEqualTo(0.99d);
+        assertThat(entry.citations()).containsExactlyElementsOf(citations);
+        assertThat(entry.modelProvider()).isEqualTo("groq");
+
+        Integer hitCount = jdbcTemplate.queryForObject(
+            "SELECT hit_count FROM semantic_cache WHERE id = ?",
+            Integer.class,
+            savedId
+        );
+        assertThat(hitCount).isEqualTo(1);
+
+        assertThat(semanticCacheRepository.findBestMatch(employeeScope, 1L, queryVector, 0.94d)).isEmpty();
+        assertThat(semanticCacheRepository.findBestMatch(managerScope, 2L, queryVector, 0.94d)).isEmpty();
+        assertThat(semanticCacheRepository.findBestMatch(managerScope, 1L, unrelatedVector, 0.94d)).isEmpty();
+
+        float[] permanentVector = embeddingModel.embed("Quy định bảo mật nội bộ không hết hạn");
+        UUID permanentId = semanticCacheRepository.save(
+            "GLOBAL:ADMIN",
+            1L,
+            "9".repeat(64),
+            "Quy định bảo mật nội bộ",
+            permanentVector,
+            "Nội dung vĩnh viễn cho admin.",
+            null,
+            null,
+            null
+        );
+        Optional<SemanticCacheEntry> permanentHit = semanticCacheRepository.findBestMatch(
+            "GLOBAL:ADMIN", 1L, permanentVector, 0.94d
+        );
+        assertThat(permanentHit).isPresent();
+        assertThat(permanentHit.orElseThrow().id()).isEqualTo(permanentId);
+        assertThat(permanentHit.orElseThrow().citations()).isEmpty();
+        assertThat(permanentHit.orElseThrow().modelProvider()).isNull();
+    }
+
+    @Test
+    void explainCosineSearchUsesHnswIndexesOnDocumentChunksAndSemanticCache() {
+        UUID hrId = departmentRepository.findByCodeIgnoreCase("HR").orElseThrow().getId();
+        String managerScope = "DEPT:" + hrId + ":MANAGER";
+        float[] sampleVector = embeddingModel.embed("Truy vấn kiểm tra HNSW index");
+        String vectorLiteral = new PGvector(sampleVector).toString();
+
+        // Populate enough rows and refresh planner stats so HNSW beats B-Tree (rbac_scope, scope_version) + Sort
+        jdbcTemplate.update("""
+                INSERT INTO semantic_cache (
+                    rbac_scope, scope_version, query_hash, query_text, query_embedding, response_content
+                )
+                SELECT ?, 1, md5(gs::text), 'cached query ' || gs, CAST(? AS vector), 'cached response ' || gs
+                FROM generate_series(1, 1000) AS gs
+                """,
+            managerScope,
+            vectorLiteral
+        );
+        jdbcTemplate.execute("ANALYZE semantic_cache");
+
+        transactionTemplate.executeWithoutResult(status -> {
+            jdbcTemplate.execute("SET LOCAL enable_seqscan = off");
+
+            List<String> chunkPlan = chunkVectorRepository.explainCosineSearch(sampleVector, 5);
+            assertThat(String.join("\n", chunkPlan))
+                .contains("Index Scan using idx_document_chunks_embedding_hnsw");
+
+            List<String> cachePlan = semanticCacheRepository.explainCosineSearch(managerScope, 1L, sampleVector, 1);
+            assertThat(String.join("\n", cachePlan))
+                .contains("Index Scan using idx_semantic_cache_embedding_hnsw");
+        });
+    }
+
+    @Test
+    void rejectsZeroNormAndNonFiniteVectorsInPgVectorRepositories() {
+        float[] zeroVector = new float[PostgresTestcontainersConfig.EMBEDDING_DIMENSIONS];
+        float[] nanVector = new float[PostgresTestcontainersConfig.EMBEDDING_DIMENSIONS];
+        nanVector[0] = 1.0f;
+        nanVector[1] = Float.NaN;
+        float[] posInfVector = new float[PostgresTestcontainersConfig.EMBEDDING_DIMENSIONS];
+        posInfVector[0] = 1.0f;
+        posInfVector[1] = Float.POSITIVE_INFINITY;
+        float[] negInfVector = new float[PostgresTestcontainersConfig.EMBEDDING_DIMENSIONS];
+        negInfVector[0] = 1.0f;
+        negInfVector[1] = Float.NEGATIVE_INFINITY;
+
+        List<float[]> invalidVectors = List.of(zeroVector, nanVector, posInfVector, negInfVector);
+
+        assertThatThrownBy(() -> PgVectorLiterals.toNonZeroFiniteVectorLiteral(null, "queryVector"))
+            .isInstanceOf(IllegalArgumentException.class);
+        assertThatThrownBy(() -> PgVectorLiterals.toNonZeroFiniteVectorLiteral(new float[0], "queryVector"))
+            .isInstanceOf(IllegalArgumentException.class);
+
+        for (float[] invalidVector : invalidVectors) {
+            assertThatThrownBy(() -> PgVectorLiterals.toNonZeroFiniteVectorLiteral(invalidVector, "queryVector"))
+                .isInstanceOf(IllegalArgumentException.class);
+
+            // Spring @Repository PersistenceExceptionTranslationPostProcessor wraps IllegalArgumentException in InvalidDataAccessApiUsageException
+            assertThatThrownBy(() -> chunkVectorRepository.explainCosineSearch(invalidVector, 5))
+                .isInstanceOf(InvalidDataAccessApiUsageException.class)
+                .hasCauseInstanceOf(IllegalArgumentException.class);
+            assertThatThrownBy(() -> semanticCacheRepository.save(
+                "GLOBAL:ADMIN",
+                1L,
+                "a".repeat(64),
+                "invalid vector query",
+                invalidVector,
+                "unused",
+                List.of(),
+                "groq",
+                null
+            ))
+                .isInstanceOf(InvalidDataAccessApiUsageException.class)
+                .hasCauseInstanceOf(IllegalArgumentException.class);
+            assertThatThrownBy(() -> semanticCacheRepository.findBestMatch("GLOBAL:ADMIN", 1L, invalidVector, 0.94d))
+                .isInstanceOf(InvalidDataAccessApiUsageException.class)
+                .hasCauseInstanceOf(IllegalArgumentException.class);
+            assertThatThrownBy(() -> semanticCacheRepository.explainCosineSearch("GLOBAL:ADMIN", 1L, invalidVector, 1))
+                .isInstanceOf(InvalidDataAccessApiUsageException.class)
+                .hasCauseInstanceOf(IllegalArgumentException.class);
+        }
+    }
+}

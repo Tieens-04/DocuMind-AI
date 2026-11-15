@@ -1,5 +1,6 @@
 package com.documind.infrastructure.ai;
 
+import com.documind.infrastructure.vector.DocumentChunkVectorRepository;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.junit.jupiter.api.Test;
@@ -14,8 +15,10 @@ import org.springframework.core.env.Environment;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.transaction.support.TransactionTemplate;
 
 import java.net.URI;
+import java.util.List;
 import java.util.Locale;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -53,6 +56,12 @@ class Day1InfrastructureAndAiSmokeTest {
 
     @Autowired
     private Environment environment;
+
+    @Autowired
+    private DocumentChunkVectorRepository chunkVectorRepository;
+
+    @Autowired
+    private TransactionTemplate transactionTemplate;
 
     @Test
     void actuatorHealthReportsUpForPostgresRedisAndMinio() throws Exception {
@@ -133,5 +142,69 @@ class Day1InfrastructureAndAiSmokeTest {
             assertThat(geminiAnswer.toLowerCase(Locale.ROOT)).containsAnyOf("4", "bốn");
             System.out.println("[SMOKE] Secondary Gemini ChatClient Vietnamese response verified (" + geminiAnswer.length() + " chars)");
         }
+    }
+
+    @Test
+    void livePostgresAppliesFlywayV1ToV3AndCreatesAllNineTables() {
+        Integer failedMigrations = jdbcTemplate.queryForObject(
+            "SELECT COUNT(*) FROM flyway_schema_history WHERE success = false",
+            Integer.class
+        );
+        assertThat(failedMigrations).isZero();
+
+        List<String> versions = jdbcTemplate.queryForList(
+            "SELECT version FROM flyway_schema_history WHERE success = true AND version IS NOT NULL AND version <> '0' ORDER BY installed_rank",
+            String.class
+        );
+        assertThat(versions).containsSubsequence("1", "2", "3");
+
+        List<String> tables = jdbcTemplate.queryForList(
+            "SELECT table_name FROM information_schema.tables WHERE table_schema = 'public' AND table_type = 'BASE TABLE'",
+            String.class
+        );
+        assertThat(tables).contains(
+            "departments", "users", "refresh_tokens", "documents",
+            "chat_sessions", "chat_messages", "audit_logs",
+            "document_chunks", "semantic_cache"
+        );
+        System.out.println("[SMOKE] Live Flyway versions verified: " + versions);
+    }
+
+    @Test
+    void livePostgresContainsSeededDepartmentsAndUsers() {
+        List<String> departmentCodes = jdbcTemplate.queryForList(
+            "SELECT code FROM departments ORDER BY code",
+            String.class
+        );
+        assertThat(departmentCodes).containsExactlyInAnyOrder("IT", "HR", "SALES");
+
+        List<String> userEmails = jdbcTemplate.queryForList(
+            "SELECT email FROM users ORDER BY email",
+            String.class
+        );
+        assertThat(userEmails).containsExactlyInAnyOrder(
+            "admin@documind.ai",
+            "manager.hr@documind.ai",
+            "employee.sales@documind.ai"
+        );
+        System.out.println("[SMOKE] Live seeded departments=" + departmentCodes + ", users=" + userEmails);
+    }
+
+    @Test
+    void liveExplainCosineSearchWithBgeM3VectorUsesHnswIndex() {
+        float[] queryVector = embeddingModel.embed(VIETNAMESE_EMBED_SAMPLE);
+        assertThat(queryVector).hasSize(1024);
+
+        transactionTemplate.executeWithoutResult(status -> {
+            status.setRollbackOnly();
+            jdbcTemplate.execute("SET LOCAL enable_seqscan = off");
+
+            List<String> planLines = chunkVectorRepository.explainCosineSearch(queryVector, 5);
+            assertThat(planLines).isNotEmpty();
+            planLines.forEach(line -> System.out.println("[SMOKE][EXPLAIN] " + line));
+
+            String fullPlan = String.join("\n", planLines);
+            assertThat(fullPlan).contains("Index Scan using idx_document_chunks_embedding_hnsw");
+        });
     }
 }
