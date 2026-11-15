@@ -1,0 +1,29 @@
+package com.documind.repository;
+
+import com.documind.domain.entity.DepartmentEntity;
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.data.jpa.repository.Modifying;
+import org.springframework.data.jpa.repository.Query;
+import org.springframework.data.repository.query.Param;
+
+import java.util.Optional;
+import java.util.UUID;
+
+/**
+ * Spring Data JPA repository for {@link DepartmentEntity} and RBAC cache-version tracking.
+ */
+public interface DepartmentRepository extends JpaRepository<DepartmentEntity, UUID> {
+
+    Optional<DepartmentEntity> findByCodeIgnoreCase(String code);
+
+    @Modifying(clearAutomatically = true, flushAutomatically = true)
+    @Query("UPDATE DepartmentEntity d SET d.cacheVersion = d.cacheVersion + 1 WHERE d.id = :id")
+    int incrementCacheVersion(@Param("id") UUID id);
+
+    @Modifying(clearAutomatically = true, flushAutomatically = true)
+    @Query("UPDATE DepartmentEntity d SET d.cacheVersion = d.cacheVersion + 1")
+    int incrementAllCacheVersions();
+
+    @Query("SELECT COALESCE(SUM(d.cacheVersion), 0) FROM DepartmentEntity d")
+    long sumCacheVersions();
+}
