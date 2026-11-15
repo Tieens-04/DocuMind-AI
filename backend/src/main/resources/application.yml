@@ -18,9 +18,6 @@ spring:
     open-in-view: false
     hibernate:
       ddl-auto: none
-    properties:
-      hibernate:
-        dialect: org.hibernate.dialect.PostgreSQLDialect
   flyway:
     enabled: true
     locations: classpath:db/migration
@@ -50,7 +47,7 @@ spring:
       api-key: ${GROQ_API_KEY:unconfigured-api-key}
       chat:
         options:
-          model: ${GROQ_CHAT_MODEL:llama-3.3-70b-versatile}
+          model: ${GROQ_CHAT_MODEL:openai/gpt-oss-120b}
           temperature: 0.1
     vectorstore:
       pgvector:
@@ -80,7 +77,7 @@ documind:
       base-url: ${GEMINI_BASE_URL:https://generativelanguage.googleapis.com/v1beta/openai}
       completions-path: ${GEMINI_COMPLETIONS_PATH:/chat/completions}
       api-key: ${GEMINI_API_KEY:unconfigured-api-key}
-      model: ${GEMINI_CHAT_MODEL:gemini-2.5-flash}
+      model: ${GEMINI_CHAT_MODEL:gemini-3.5-flash}
       temperature: 0.1
   storage:
     endpoint: ${MINIO_ENDPOINT:http://localhost:${MINIO_API_PORT:9000}}

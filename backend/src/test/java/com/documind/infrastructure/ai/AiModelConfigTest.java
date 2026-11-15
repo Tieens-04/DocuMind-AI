@@ -49,7 +49,7 @@ class AiModelConfigTest {
         OpenAiChatModel baseModel = OpenAiChatModel.builder()
             .openAiApi(baseApi)
             .defaultOptions(OpenAiChatOptions.builder()
-                .model("llama-3.3-70b-versatile")
+                .model("openai/gpt-oss-120b")
                 .temperature(0.1)
                 .build())
             .build();
@@ -57,7 +57,7 @@ class AiModelConfigTest {
             "https://generativelanguage.googleapis.com/v1beta/openai/",
             "chat/completions",
             "",
-            "gemini-2.5-flash",
+            "gemini-3.5-flash",
             0.1
         ));
 

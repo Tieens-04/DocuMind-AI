@@ -17,7 +17,7 @@ public class AiModelConfig {
     public static final String UNCONFIGURED_API_KEY = "unconfigured-api-key";
     private static final String DEFAULT_GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai";
     private static final String DEFAULT_GEMINI_COMPLETIONS_PATH = "/chat/completions";
-    private static final String DEFAULT_GEMINI_MODEL = "gemini-2.5-flash";
+    private static final String DEFAULT_GEMINI_MODEL = "gemini-3.5-flash";
     private static final double DEFAULT_TEMPERATURE = 0.1;
 
     @Bean
