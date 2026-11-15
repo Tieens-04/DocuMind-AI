@@ -55,7 +55,7 @@ services:
       retries: 10
 
   minio:
-    image: cgr.dev/chainguard/minio:latest
+    image: cgr.dev/chainguard/minio:latest@sha256:634c989a2f1029162fc2676c263caa181213b9410449968532f750a6fb77532d
     container_name: documind-minio
     restart: unless-stopped
     ports:
@@ -76,18 +76,23 @@ services:
       start_period: 5s
 
   minio-init:
-    image: cgr.dev/chainguard/minio-client:latest-dev
+    image: cgr.dev/chainguard/minio-client:latest-dev@sha256:072cfdbce847a7ca180687745004c41d1165b57db178be357f73bc1c12143351
     container_name: documind-minio-init
     depends_on:
       minio:
         condition: service_healthy
     restart: "no"
-    entrypoint: >
-      /bin/sh -c "
-      mc alias set local http://minio:9000 ${MINIO_ROOT_USER:-documind_minio} ${MINIO_ROOT_PASSWORD:-documind_minio_secret} &&
-      mc mb --ignore-existing local/${MINIO_BUCKET:-documind-documents} &&
-      mc anonymous set none local/${MINIO_BUCKET:-documind-documents}
-      "
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-documind_minio}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-documind_minio_secret}
+      MINIO_BUCKET: ${MINIO_BUCKET:-documind-documents}
+    entrypoint:
+      - "/bin/sh"
+      - "-c"
+      - >
+        mc alias set local http://minio:9000 "$$MINIO_ROOT_USER" "$$MINIO_ROOT_PASSWORD" &&
+        mc mb --ignore-existing "local/$$MINIO_BUCKET" &&
+        mc anonymous set none "local/$$MINIO_BUCKET"
 
 volumes:
   documind_pgdata:

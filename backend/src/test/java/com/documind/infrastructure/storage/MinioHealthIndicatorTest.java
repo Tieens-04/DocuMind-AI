@@ -8,6 +8,7 @@ import software.amazon.awssdk.services.s3.model.HeadBucketRequest;
 import software.amazon.awssdk.services.s3.model.HeadBucketResponse;
 import software.amazon.awssdk.services.s3.model.NoSuchBucketException;
 
+import java.time.Duration;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Consumer;
 
@@ -57,5 +58,15 @@ class MinioHealthIndicatorTest {
         Health health = indicator.health();
         assertThat(health.getStatus()).isEqualTo(Status.DOWN);
         assertThat(health.getDetails()).containsEntry("bucket", "documind-documents");
+    }
+
+    @Test
+    void s3ClientConfiguresBoundedApiCallTimeouts() {
+        var props = new StorageProperties("http://localhost:9000", "ak", "sk", "documind-documents", "us-east-1");
+        try (S3Client client = new MinioConfig().s3Client(props)) {
+            var overrideConfig = client.serviceClientConfiguration().overrideConfiguration();
+            assertThat(overrideConfig.apiCallTimeout()).contains(Duration.ofSeconds(15));
+            assertThat(overrideConfig.apiCallAttemptTimeout()).contains(Duration.ofSeconds(5));
+        }
     }
 }
