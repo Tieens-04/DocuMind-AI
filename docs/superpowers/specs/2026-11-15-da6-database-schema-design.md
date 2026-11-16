@@ -226,6 +226,12 @@ Additive post-merge migration (leaving `V1` and `V2` byte-for-byte immutable) en
 - Hardened `sync_document_chunk_metadata()` requiring `document_id`, `department_id`, `file_name`, `access_level`, `doc_version`, and `chunk_index`, normalizing `page_number` to JSON `null` when omitted, validating parent `documents.department_id` and `documents.access_level` ownership, plus `chk_document_chunks_rbac_metadata` and `uq_document_chunks_doc_version_index`.
 - `trg_propagate_document_rbac_to_chunks` (`AFTER UPDATE OF department_id, access_level ON documents`) propagating RBAC metadata updates to existing `document_chunks`.
 
+### 3.5 `V5` & `V6` Post-Review Hardening (`classpath:db/migration`)
+
+- **`V5__lock_parent_document_on_chunk_sync_and_align_indexes.sql`:** Drops redundant case-sensitive `uq_departments_code` / `uq_users_email` constraints, adds partial TTL index `idx_semantic_cache_expires_at`, locks parent `documents` rows `FOR SHARE` and validates `file_name` parity in `sync_document_chunk_metadata()`, and propagates `original_name` + `departments.cache_version` updates on document changes.
+- **`V6__deterministic_department_cache_version_locking.sql`:** Enforces deterministic `ORDER BY id FOR NO KEY UPDATE` locking on multi-row `departments.cache_version` updates (including `original_name` renames) to prevent `40P01` deadlocks and stale cached citation filenames.
+- **Fail-Closed Default Seed Opt-In:** `application.yml` restricts Flyway to `classpath:db/migration` (`baseline-on-migrate: false`); `application-dev.yml` explicitly opts into `classpath:db/seed` (`out-of-order: true`).
+
 ---
 
 ## 4. Backend Package & Class Design (`backend/`)
@@ -265,11 +271,15 @@ backend/src/main/
 │           ├── DocumentChunkVectorRepository.java
 │           └── SemanticCacheVectorRepository.java
 └── resources/
-    ├── application.yml                       # flyway locations: db/migration,db/seed; ddl-auto: validate; schema-validation: true
+    ├── application.yml                       # flyway locations: db/migration (fail-closed); ddl-auto: validate; schema-validation: true
+    ├── application-dev.yml                   # opts in to classpath:db/seed (out-of-order: true)
     ├── application-prod.yml                  # flyway locations: db/migration (no dev seeds)
     ├── db/migration/
     │   ├── V1__init_relational_schema.sql
-    │   └── V2__init_pgvector_and_semantic_cache.sql
+    │   ├── V2__init_pgvector_and_semantic_cache.sql
+    │   ├── V4__harden_schema_and_rbac_invariants.sql
+    │   ├── V5__lock_parent_document_on_chunk_sync_and_align_indexes.sql
+    │   └── V6__deterministic_department_cache_version_locking.sql
     └── db/seed/
         └── V3__seed_dev_data.sql
 ```

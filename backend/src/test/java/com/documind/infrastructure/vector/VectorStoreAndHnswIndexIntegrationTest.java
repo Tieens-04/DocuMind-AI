@@ -650,6 +650,7 @@ class VectorStoreAndHnswIndexIntegrationTest {
             .isEqualTo("Câu trả lời đã được làm mới idempotent.");
         assertThat(hitInReadOnlyTx.orElseThrow().modelProvider()).isEqualTo("gemini");
 
+        semanticCacheRepository.flushPendingHitCounts();
         Integer hitCount = jdbcTemplate.queryForObject(
             "SELECT hit_count FROM semantic_cache WHERE id = ?",
             Integer.class,
@@ -981,6 +982,7 @@ class VectorStoreAndHnswIndexIntegrationTest {
         DocumentEntity hrConf = saveDoc(hr, hrManager, "hr-conf.pdf", "hr/conf.pdf", "3", AccessLevel.CONFIDENTIAL);
         DocumentEntity salesPublic = saveDoc(sales, hrManager, "sales-pub.pdf", "sales/pub.pdf", "4", AccessLevel.PUBLIC);
         DocumentEntity salesDept = saveDoc(sales, hrManager, "sales-dept.pdf", "sales/dept.pdf", "5", AccessLevel.DEPARTMENT);
+        DocumentEntity salesConf = saveDoc(sales, hrManager, "sales-conf.pdf", "sales/conf.pdf", "6", AccessLevel.CONFIDENTIAL);
 
         String sharedTopic = "Chính sách lương thưởng năm 2026";
         vectorStore.add(List.of(
@@ -988,7 +990,8 @@ class VectorStoreAndHnswIndexIntegrationTest {
             chunkDoc(hrDept, sharedTopic),
             chunkDoc(hrConf, sharedTopic),
             chunkDoc(salesPublic, sharedTopic),
-            chunkDoc(salesDept, sharedTopic)
+            chunkDoc(salesDept, sharedTopic),
+            chunkDoc(salesConf, sharedTopic)
         ));
 
         FilterExpressionBuilder b = new FilterExpressionBuilder();
@@ -1012,7 +1015,7 @@ class VectorStoreAndHnswIndexIntegrationTest {
                 hrDept.getId().toString(),
                 salesPublic.getId().toString()
             )
-            .doesNotContain(hrConf.getId().toString(), salesDept.getId().toString());
+            .doesNotContain(hrConf.getId().toString(), salesDept.getId().toString(), salesConf.getId().toString());
 
         var managerFilter = b.or(
             b.eq("access_level", "PUBLIC"),
@@ -1035,7 +1038,7 @@ class VectorStoreAndHnswIndexIntegrationTest {
                 hrConf.getId().toString(),
                 salesPublic.getId().toString()
             )
-            .doesNotContain(salesDept.getId().toString());
+            .doesNotContain(salesDept.getId().toString(), salesConf.getId().toString());
         assertThat(salesId).isNotEqualTo(hrId);
     }
 

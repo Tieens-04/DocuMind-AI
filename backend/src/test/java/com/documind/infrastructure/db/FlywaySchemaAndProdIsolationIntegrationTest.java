@@ -35,11 +35,11 @@ class FlywaySchemaAndProdIsolationIntegrationTest {
     private TransactionTemplate transactionTemplate;
 
     @Test
-    void appliesV1ToV5AllNineTablesAndSeededUsersWithBcryptHashes() {
+    void appliesV1ToV6AllNineTablesAndSeededUsersWithBcryptHashes() {
         List<String> versions = jdbcTemplate.queryForList(
             "SELECT version FROM flyway_schema_history WHERE success = true ORDER BY installed_rank",
             String.class);
-        assertThat(versions).containsExactly("1", "2", "3", "4", "5");
+        assertThat(versions).containsExactly("1", "2", "3", "4", "5", "6");
 
         List<String> tables = jdbcTemplate.queryForList(
             "SELECT table_name FROM information_schema.tables WHERE table_schema = 'public' AND table_type = 'BASE TABLE'",
@@ -162,7 +162,7 @@ class FlywaySchemaAndProdIsolationIntegrationTest {
         List<String> prodVersions = jdbcTemplate.queryForList(
             "SELECT version FROM prod_verify.flyway_schema_history WHERE success = true AND version <> '0' ORDER BY installed_rank",
             String.class);
-        assertThat(prodVersions).containsExactly("1", "2", "4", "5");
+        assertThat(prodVersions).containsExactly("1", "2", "4", "5", "6");
 
         Integer prodUsers = jdbcTemplate.queryForObject("SELECT COUNT(*) FROM prod_verify.users", Integer.class);
         assertThat(prodUsers).isZero();

@@ -25,7 +25,18 @@ public interface DepartmentRepository extends JpaRepository<DepartmentEntity, UU
 
     @Transactional
     @Modifying(clearAutomatically = true, flushAutomatically = true)
-    @Query("UPDATE DepartmentEntity d SET d.cacheVersion = d.cacheVersion + 1")
+    @Query(
+        value = """
+            WITH locked AS (
+                SELECT id FROM departments ORDER BY id FOR NO KEY UPDATE
+            )
+            UPDATE departments d
+            SET cache_version = d.cache_version + 1
+            FROM locked
+            WHERE d.id = locked.id
+            """,
+        nativeQuery = true
+    )
     int incrementAllCacheVersions();
 
     @Query("SELECT COALESCE(SUM(d.cacheVersion), 0) FROM DepartmentEntity d")
