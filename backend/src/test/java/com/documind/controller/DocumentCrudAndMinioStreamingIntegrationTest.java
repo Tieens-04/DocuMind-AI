@@ -21,6 +21,8 @@ import com.documind.repository.DepartmentRepository;
 import com.documind.repository.DocumentRepository;
 import com.documind.support.MinioTestcontainersConfig;
 import com.documind.support.PostgresTestcontainersConfig;
+import com.documind.support.StreamingMultipartTestSupport;
+import com.documind.support.StreamingMultipartTestSupport.RepeatingPdfInputStream;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
@@ -59,9 +61,6 @@ import software.amazon.awssdk.services.s3.model.ListObjectsV2Response;
 import software.amazon.awssdk.services.s3.model.NoSuchKeyException;
 import software.amazon.awssdk.services.s3.model.S3Object;
 
-import java.io.ByteArrayInputStream;
-import java.io.InputStream;
-import java.io.SequenceInputStream;
 import java.lang.management.ManagementFactory;
 import java.lang.management.MemoryMXBean;
 import java.net.URI;
@@ -72,7 +71,6 @@ import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.time.Duration;
-import java.util.Collections;
 import java.util.HexFormat;
 import java.util.List;
 import java.util.Map;
@@ -138,10 +136,6 @@ class DocumentCrudAndMinioStreamingIntegrationTest {
 
     @Autowired
     private GlobalExceptionHandler globalExceptionHandler;
-
-    private final HttpClient httpClient = HttpClient.newBuilder()
-        .connectTimeout(Duration.ofSeconds(10))
-        .build();
 
     @BeforeEach
     @AfterEach
@@ -225,10 +219,13 @@ class DocumentCrudAndMinioStreamingIntegrationTest {
 
         DocumentEntity persisted = documentRepository.findById(created.id()).orElseThrow();
         URL presignedUrl = minioStorageService.generatePresignedGetUrl(persisted.getStorageKey(), persisted.getOriginalName());
-        HttpResponse<byte[]> downloaded = httpClient.send(
-            HttpRequest.newBuilder(presignedUrl.toURI()).GET().build(),
-            HttpResponse.BodyHandlers.ofByteArray()
-        );
+        HttpResponse<byte[]> downloaded;
+        try (HttpClient httpClient = StreamingMultipartTestSupport.newHttp11Client()) {
+            downloaded = httpClient.send(
+                HttpRequest.newBuilder(presignedUrl.toURI()).GET().build(),
+                HttpResponse.BodyHandlers.ofByteArray()
+            );
+        }
         assertThat(downloaded.statusCode()).isEqualTo(200);
         assertThat(downloaded.headers().firstValue("Content-Disposition"))
             .isPresent()
@@ -410,27 +407,19 @@ class DocumentCrudAndMinioStreamingIntegrationTest {
     @Test
     void rejectsOversizedUploadAbove50MiBWith413ProblemDetail() throws Exception {
         long oversizedBytes = HashingBoundedInputStream.MAX_FILE_SIZE_BYTES + 1L;
-        String boundary = "----DocuMindTooLarge" + UUID.randomUUID().toString().replace("-", "");
-        byte[] preamble = (
-            "--" + boundary + "\r\n"
-                + "Content-Disposition: form-data; name=\"file\"; filename=\"oversized-50mib-plus-1.pdf\"\r\n"
-                + "Content-Type: application/pdf\r\n"
-                + "\r\n"
-        ).getBytes(StandardCharsets.UTF_8);
-        byte[] epilogue = ("\r\n--" + boundary + "--\r\n").getBytes(StandardCharsets.UTF_8);
+        HttpRequest request = StreamingMultipartTestSupport.buildMultipartUploadRequest(
+            URI.create("http://localhost:" + port + "/api/v1/documents/upload?departmentId=" + IT_DEPT_ID),
+            "----DocuMindTooLarge",
+            "oversized-50mib-plus-1.pdf",
+            "application/pdf",
+            () -> new RepeatingPdfInputStream(oversizedBytes),
+            Duration.ofSeconds(120)
+        );
 
-        HttpRequest request = HttpRequest.newBuilder()
-            .uri(URI.create("http://localhost:" + port + "/api/v1/documents/upload?departmentId=" + IT_DEPT_ID))
-            .header("Content-Type", "multipart/form-data; boundary=" + boundary)
-            .timeout(Duration.ofSeconds(120))
-            .POST(HttpRequest.BodyPublishers.ofInputStream(() -> new SequenceInputStream(Collections.enumeration(List.of(
-                new ByteArrayInputStream(preamble),
-                new RepeatingPdfInputStream(oversizedBytes),
-                new ByteArrayInputStream(epilogue)
-            )))))
-            .build();
-
-        HttpResponse<String> response = httpClient.send(request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
+        HttpResponse<String> response;
+        try (HttpClient httpClient = StreamingMultipartTestSupport.newHttp11Client()) {
+            response = httpClient.send(request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
+        }
         assertThat(response.statusCode()).isEqualTo(413);
 
         ProblemDetail problem = objectMapper.readValue(response.body(), ProblemDetail.class);
@@ -555,6 +544,27 @@ class DocumentCrudAndMinioStreamingIntegrationTest {
         String itStorageKey = documentRepository.findById(itDeptDoc.id()).orElseThrow().getStorageKey();
         long cacheVersionBeforeDelete = departmentRepository.findById(IT_DEPT_ID).orElseThrow().getCacheVersion();
 
+        HttpHeaders unknownUserItHeaders = new HttpHeaders();
+        unknownUserItHeaders.set("X-Department-Id", IT_DEPT_ID.toString());
+        unknownUserItHeaders.set("X-User-Id", UUID.randomUUID().toString());
+        ResponseEntity<ProblemDetail> unknownUserDeleteResp = restTemplate.exchange(
+            "/api/v1/documents/" + itDeptDoc.id(),
+            HttpMethod.DELETE,
+            new HttpEntity<>(unknownUserItHeaders),
+            ProblemDetail.class
+        );
+        assertThat(unknownUserDeleteResp.getStatusCode()).isEqualTo(HttpStatus.NOT_FOUND);
+        assertThat(Objects.requireNonNull(unknownUserDeleteResp.getBody()).getProperties())
+            .containsEntry("errorCode", "RESOURCE_NOT_FOUND");
+        assertThat(documentRepository.findById(itDeptDoc.id())).isPresent();
+        assertThat(chunkVectorRepository.countByDocumentId(itDeptDoc.id())).isEqualTo(1L);
+        assertThat(departmentRepository.findById(IT_DEPT_ID).orElseThrow().getCacheVersion())
+            .isEqualTo(cacheVersionBeforeDelete);
+        assertThat(s3Client.headObject(HeadObjectRequest.builder()
+            .bucket(storageProperties.bucket())
+            .key(itStorageKey)
+            .build()).contentLength()).isPositive();
+
         ResponseEntity<Void> deleteResp = restTemplate.exchange(
             "/api/v1/documents/" + itDeptDoc.id(),
             HttpMethod.DELETE,
@@ -598,28 +608,20 @@ class DocumentCrudAndMinioStreamingIntegrationTest {
 
         long heapBefore = settledUsedHeapBytes();
 
-        String boundary = "----DocuMind40MiB" + UUID.randomUUID().toString().replace("-", "");
-        byte[] preamble = (
-            "--" + boundary + "\r\n"
-                + "Content-Disposition: form-data; name=\"file\"; filename=\"large-40mib.pdf\"\r\n"
-                + "Content-Type: application/pdf\r\n"
-                + "\r\n"
-        ).getBytes(StandardCharsets.UTF_8);
-        byte[] epilogue = ("\r\n--" + boundary + "--\r\n").getBytes(StandardCharsets.UTF_8);
+        HttpRequest request = StreamingMultipartTestSupport.buildMultipartUploadRequest(
+            URI.create("http://localhost:" + port + "/api/v1/documents/upload?departmentId="
+                + IT_DEPT_ID + "&accessLevel=DEPARTMENT"),
+            "----DocuMind40MiB",
+            "large-40mib.pdf",
+            "application/pdf",
+            () -> new RepeatingPdfInputStream(FORTY_MIB_BYTES),
+            Duration.ofSeconds(120)
+        );
 
-        HttpRequest request = HttpRequest.newBuilder()
-            .uri(URI.create("http://localhost:" + port + "/api/v1/documents/upload?departmentId="
-                + IT_DEPT_ID + "&accessLevel=DEPARTMENT"))
-            .header("Content-Type", "multipart/form-data; boundary=" + boundary)
-            .timeout(Duration.ofSeconds(120))
-            .POST(HttpRequest.BodyPublishers.ofInputStream(() -> new SequenceInputStream(Collections.enumeration(List.of(
-                new ByteArrayInputStream(preamble),
-                new RepeatingPdfInputStream(FORTY_MIB_BYTES),
-                new ByteArrayInputStream(epilogue)
-            )))))
-            .build();
-
-        HttpResponse<String> response = httpClient.send(request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
+        HttpResponse<String> response;
+        try (HttpClient httpClient = StreamingMultipartTestSupport.newHttp11Client()) {
+            response = httpClient.send(request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
+        }
         assertThat(response.statusCode()).isEqualTo(202);
 
         DocumentResponse created = objectMapper.readValue(response.body(), DocumentResponse.class);
@@ -752,77 +754,6 @@ class DocumentCrudAndMinioStreamingIntegrationTest {
 
         void clear() {
             events.clear();
-        }
-    }
-
-    /**
-     * Lazy {@link InputStream} emitting a deterministic valid {@code %PDF-1.4} payload of exact length
-     * without allocating a multi-megabyte buffer in JVM Heap.
-     */
-    private static final class RepeatingPdfInputStream extends InputStream {
-
-        private static final byte[] PDF_PREFIX = "%PDF-1.4\n1 0 obj\n<< /Type /Catalog >>\nendobj\n% "
-            .getBytes(StandardCharsets.US_ASCII);
-        private static final byte[] PDF_SUFFIX = "\n%%EOF\n".getBytes(StandardCharsets.US_ASCII);
-        private static final byte[] PATTERN_CHUNK = "DOCUMIND_STREAM_PDF_PAYLOAD_0123456789ABCDEF\n"
-            .repeat(180)
-            .getBytes(StandardCharsets.US_ASCII);
-
-        private final long totalLength;
-        private final long suffixStart;
-        private long position;
-
-        private RepeatingPdfInputStream(long totalLength) {
-            if (totalLength < PDF_PREFIX.length + PDF_SUFFIX.length) {
-                throw new IllegalArgumentException("totalLength too small for PDF framing");
-            }
-            this.totalLength = totalLength;
-            this.suffixStart = totalLength - PDF_SUFFIX.length;
-        }
-
-        @Override
-        public int read() {
-            byte[] single = new byte[1];
-            int count = read(single, 0, 1);
-            return count == -1 ? -1 : (single[0] & 0xFF);
-        }
-
-        @Override
-        public int read(byte[] b, int off, int len) {
-            Objects.checkFromIndexSize(off, len, b.length);
-            if (len == 0) {
-                return 0;
-            }
-            if (position >= totalLength) {
-                return -1;
-            }
-
-            int totalCopied = 0;
-            while (totalCopied < len && position < totalLength) {
-                int remainingOut = len - totalCopied;
-                if (position < PDF_PREFIX.length) {
-                    int prefixOffset = (int) position;
-                    int toCopy = Math.min(remainingOut, PDF_PREFIX.length - prefixOffset);
-                    System.arraycopy(PDF_PREFIX, prefixOffset, b, off + totalCopied, toCopy);
-                    position += toCopy;
-                    totalCopied += toCopy;
-                } else if (position < suffixStart) {
-                    long bodyOffset = position - PDF_PREFIX.length;
-                    int patternOffset = (int) (bodyOffset % PATTERN_CHUNK.length);
-                    long bytesUntilSuffix = suffixStart - position;
-                    int toCopy = (int) Math.min(remainingOut, Math.min(PATTERN_CHUNK.length - patternOffset, bytesUntilSuffix));
-                    System.arraycopy(PATTERN_CHUNK, patternOffset, b, off + totalCopied, toCopy);
-                    position += toCopy;
-                    totalCopied += toCopy;
-                } else {
-                    int suffixOffset = (int) (position - suffixStart);
-                    int toCopy = Math.min(remainingOut, PDF_SUFFIX.length - suffixOffset);
-                    System.arraycopy(PDF_SUFFIX, suffixOffset, b, off + totalCopied, toCopy);
-                    position += toCopy;
-                    totalCopied += toCopy;
-                }
-            }
-            return totalCopied;
         }
     }
 }

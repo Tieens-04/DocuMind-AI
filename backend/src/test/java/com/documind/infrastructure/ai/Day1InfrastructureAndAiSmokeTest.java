@@ -3,6 +3,8 @@ package com.documind.infrastructure.ai;
 import com.documind.controller.dto.DocumentResponse;
 import com.documind.infrastructure.storage.StorageProperties;
 import com.documind.infrastructure.vector.DocumentChunkVectorRepository;
+import com.documind.support.StreamingMultipartTestSupport;
+import com.documind.support.StreamingMultipartTestSupport.RepeatingPdfInputStream;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.junit.jupiter.api.Test;
@@ -26,7 +28,6 @@ import software.amazon.awssdk.services.s3.model.NoSuchKeyException;
 
 import java.io.ByteArrayInputStream;
 import java.io.InputStream;
-import java.io.SequenceInputStream;
 import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
@@ -34,10 +35,8 @@ import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.ArrayList;
-import java.util.Collections;
 import java.util.List;
 import java.util.Locale;
-import java.util.Objects;
 import java.util.UUID;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Supplier;
@@ -249,99 +248,107 @@ class Day1InfrastructureAndAiSmokeTest {
         assertThat(storageProperties.bucket()).isEqualTo(EXPECTED_MINIO_BUCKET);
 
         String runMarker = UUID.randomUUID().toString();
-        HttpClient httpClient = HttpClient.newBuilder()
-            .connectTimeout(Duration.ofSeconds(10))
-            .build();
         List<UUID> createdDocumentIds = new ArrayList<>();
         Throwable primaryFailure = null;
 
-        try {
-            // Stream 40 MiB PDF first to validate zero-Heap streaming and warm Tomcat/Multipart/Tika/Hikari/S3 pools
-            HttpResponse<String> pdfResponse = uploadMultipartStream(
-                httpClient,
-                "smoke-40mib-" + runMarker + ".pdf",
-                "application/pdf",
-                SMOKE_IT_DEPARTMENT_ID,
-                () -> new RepeatingPdfInputStream(FORTY_MIB_BYTES, runMarker)
-            );
-            assertThat(pdfResponse.statusCode()).isEqualTo(HttpStatus.ACCEPTED.value());
+        try (HttpClient httpClient = StreamingMultipartTestSupport.newHttp11Client()) {
+            try {
+                // Stream 40 MiB PDF first to validate zero-Heap streaming and warm Tomcat/Multipart/Tika/Hikari/S3 pools
+                HttpResponse<String> pdfResponse = uploadMultipartStream(
+                    httpClient,
+                    "smoke-40mib-" + runMarker + ".pdf",
+                    "application/pdf",
+                    SMOKE_IT_DEPARTMENT_ID,
+                    () -> new RepeatingPdfInputStream(FORTY_MIB_BYTES, runMarker)
+                );
+                assertThat(pdfResponse.statusCode()).isEqualTo(HttpStatus.ACCEPTED.value());
 
-            DocumentResponse createdPdf = objectMapper.readValue(pdfResponse.body(), DocumentResponse.class);
-            assertThat(createdPdf.id()).isNotNull();
-            createdDocumentIds.add(createdPdf.id());
-            assertThat(createdPdf.departmentId()).isEqualTo(SMOKE_IT_DEPARTMENT_ID);
-            assertThat(createdPdf.fileSizeBytes()).isEqualTo(FORTY_MIB_BYTES);
-            assertThat(createdPdf.mimeType()).isEqualTo("application/pdf");
+                DocumentResponse createdPdf = objectMapper.readValue(pdfResponse.body(), DocumentResponse.class);
+                assertThat(createdPdf.id()).isNotNull();
+                createdDocumentIds.add(createdPdf.id());
+                assertThat(createdPdf.departmentId()).isEqualTo(SMOKE_IT_DEPARTMENT_ID);
+                assertThat(createdPdf.fileSizeBytes()).isEqualTo(FORTY_MIB_BYTES);
+                assertThat(createdPdf.mimeType()).isEqualTo("application/pdf");
 
-            String pdfStorageKey = jdbcTemplate.queryForObject(
-                "SELECT storage_key FROM documents WHERE id = ?",
-                String.class,
-                createdPdf.id()
-            );
-            assertThat(pdfStorageKey).isNotBlank();
+                String pdfStorageKey = jdbcTemplate.queryForObject(
+                    "SELECT storage_key FROM documents WHERE id = ?",
+                    String.class,
+                    createdPdf.id()
+                );
+                assertThat(pdfStorageKey).isNotBlank();
 
-            HeadObjectResponse headObject = s3Client.headObject(HeadObjectRequest.builder()
-                .bucket(EXPECTED_MINIO_BUCKET)
-                .key(pdfStorageKey)
-                .build());
-            assertThat(headObject.contentLength()).isEqualTo(FORTY_MIB_BYTES);
-            System.out.println(
-                "[SMOKE] Live 40 MiB PDF streamed to MinIO bucket=" + EXPECTED_MINIO_BUCKET
-                    + " docId=" + createdPdf.id()
-                    + " size=" + headObject.contentLength()
-                    + " storageKey=" + pdfStorageKey
-            );
+                HeadObjectResponse headObject = s3Client.headObject(HeadObjectRequest.builder()
+                    .bucket(EXPECTED_MINIO_BUCKET)
+                    .key(pdfStorageKey)
+                    .build());
+                assertThat(headObject.contentLength()).isEqualTo(FORTY_MIB_BYTES);
+                System.out.println(
+                    "[SMOKE] Live 40 MiB PDF streamed to MinIO bucket=" + EXPECTED_MINIO_BUCKET
+                        + " docId=" + createdPdf.id()
+                        + " size=" + headObject.contentLength()
+                        + " storageKey=" + pdfStorageKey
+                );
 
-            // Stream small Vietnamese Markdown document twice: warm <300ms 202 Accepted, then 409 Conflict
-            byte[] markdownBytes = (
-                "# Quy chế nghỉ phép năm 2026 (" + runMarker + ")\n"
-                    + "- Nhân viên chính thức được hưởng 12 ngày nghỉ phép nguyên lương.\n"
-                    + "- Tài liệu kiểm thử MinIO smoke test tiếng Việt.\n"
-            ).getBytes(StandardCharsets.UTF_8);
+                // Stream small Vietnamese Markdown document twice: warm <300ms 202 Accepted, then 409 Conflict
+                byte[] markdownBytes = (
+                    "# Quy chế nghỉ phép năm 2026 (" + runMarker + ")\n"
+                        + "- Nhân viên chính thức được hưởng 12 ngày nghỉ phép nguyên lương.\n"
+                        + "- Tài liệu kiểm thử MinIO smoke test tiếng Việt.\n"
+                ).getBytes(StandardCharsets.UTF_8);
 
-            long mdStartedNanos = System.nanoTime();
-            HttpResponse<String> mdFirstResponse = uploadMultipartStream(
-                httpClient,
-                "quy-che-nghi-phep-smoke-" + runMarker + ".md",
-                "text/markdown",
-                SMOKE_IT_DEPARTMENT_ID,
-                () -> new ByteArrayInputStream(markdownBytes)
-            );
-            long mdElapsedMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - mdStartedNanos);
+                long mdStartedNanos = System.nanoTime();
+                HttpResponse<String> mdFirstResponse = uploadMultipartStream(
+                    httpClient,
+                    "quy-che-nghi-phep-smoke-" + runMarker + ".md",
+                    "text/markdown",
+                    SMOKE_IT_DEPARTMENT_ID,
+                    () -> new ByteArrayInputStream(markdownBytes)
+                );
+                long mdElapsedMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - mdStartedNanos);
 
-            assertThat(mdFirstResponse.statusCode()).isEqualTo(HttpStatus.ACCEPTED.value());
-            DocumentResponse createdMd = objectMapper.readValue(mdFirstResponse.body(), DocumentResponse.class);
-            assertThat(createdMd.id()).isNotNull();
-            createdDocumentIds.add(createdMd.id());
-            assertThat(mdElapsedMs)
-                .as("Warm Vietnamese .md upload latency (ms)")
-                .isLessThan(MAX_STANDARD_UPLOAD_MS);
-            assertThat(createdMd.fileExtension()).isEqualTo("md");
-            assertThat(createdMd.mimeType()).isEqualTo("text/markdown");
-            assertThat(createdMd.fileSizeBytes()).isEqualTo(markdownBytes.length);
+                assertThat(mdFirstResponse.statusCode()).isEqualTo(HttpStatus.ACCEPTED.value());
+                DocumentResponse createdMd = objectMapper.readValue(mdFirstResponse.body(), DocumentResponse.class);
+                assertThat(createdMd.id()).isNotNull();
+                createdDocumentIds.add(createdMd.id());
+                assertThat(mdElapsedMs)
+                    .as("Warm Vietnamese .md upload latency (ms)")
+                    .isLessThan(MAX_STANDARD_UPLOAD_MS);
+                assertThat(createdMd.fileExtension()).isEqualTo("md");
+                assertThat(createdMd.mimeType()).isEqualTo("text/markdown");
+                assertThat(createdMd.fileSizeBytes()).isEqualTo(markdownBytes.length);
 
-            HttpResponse<String> mdDuplicateResponse = uploadMultipartStream(
-                httpClient,
-                "quy-che-nghi-phep-smoke-" + runMarker + "-duplicate.md",
-                "text/markdown",
-                SMOKE_IT_DEPARTMENT_ID,
-                () -> new ByteArrayInputStream(markdownBytes)
-            );
-            assertThat(mdDuplicateResponse.statusCode()).isEqualTo(HttpStatus.CONFLICT.value());
-            JsonNode duplicateProblem = objectMapper.readTree(mdDuplicateResponse.body());
-            assertThat(duplicateProblem.path("status").asInt()).isEqualTo(HttpStatus.CONFLICT.value());
-            assertThat(duplicateProblem.path("errorCode").asText()).isEqualTo("DUPLICATE_DOCUMENT");
-            assertThat(duplicateProblem.path("existingDocumentId").asText()).isEqualTo(createdMd.id().toString());
-            System.out.println(
-                "[SMOKE] Live Vietnamese .md upload verified: docId=" + createdMd.id()
-                    + " latencyMs=" + mdElapsedMs
-                    + " duplicateStatus=" + mdDuplicateResponse.statusCode()
-            );
-        } catch (Throwable failure) {
-            primaryFailure = failure;
-            throw failure;
-        } finally {
-            deleteAndVerifyCleanup(httpClient, createdDocumentIds, primaryFailure);
+                HttpResponse<String> mdDuplicateResponse = uploadMultipartStream(
+                    httpClient,
+                    "quy-che-nghi-phep-smoke-" + runMarker + "-duplicate.md",
+                    "text/markdown",
+                    SMOKE_IT_DEPARTMENT_ID,
+                    () -> new ByteArrayInputStream(markdownBytes)
+                );
+                if (mdDuplicateResponse.statusCode() == HttpStatus.ACCEPTED.value()) {
+                    DocumentResponse unexpectedDuplicate = objectMapper.readValue(
+                        mdDuplicateResponse.body(),
+                        DocumentResponse.class
+                    );
+                    if (unexpectedDuplicate.id() != null) {
+                        createdDocumentIds.add(unexpectedDuplicate.id());
+                    }
+                }
+                assertThat(mdDuplicateResponse.statusCode()).isEqualTo(HttpStatus.CONFLICT.value());
+                JsonNode duplicateProblem = objectMapper.readTree(mdDuplicateResponse.body());
+                assertThat(duplicateProblem.path("status").asInt()).isEqualTo(HttpStatus.CONFLICT.value());
+                assertThat(duplicateProblem.path("errorCode").asText()).isEqualTo("DUPLICATE_DOCUMENT");
+                assertThat(duplicateProblem.path("existingDocumentId").asText()).isEqualTo(createdMd.id().toString());
+                System.out.println(
+                    "[SMOKE] Live Vietnamese .md upload verified: docId=" + createdMd.id()
+                        + " latencyMs=" + mdElapsedMs
+                        + " duplicateStatus=" + mdDuplicateResponse.statusCode()
+                );
+            } catch (Throwable failure) {
+                primaryFailure = failure;
+                throw failure;
+            } finally {
+                deleteAndVerifyCleanup(httpClient, createdDocumentIds, primaryFailure);
+            }
         }
     }
 
@@ -352,27 +359,15 @@ class Day1InfrastructureAndAiSmokeTest {
         UUID departmentId,
         Supplier<InputStream> contentStreamSupplier
     ) throws Exception {
-        String boundary = "----DocuMindSmoke" + UUID.randomUUID().toString().replace("-", "");
-        byte[] preamble = (
-            "--" + boundary + "\r\n"
-                + "Content-Disposition: form-data; name=\"file\"; filename=\"" + filename + "\"\r\n"
-                + "Content-Type: " + contentType + "\r\n"
-                + "\r\n"
-        ).getBytes(StandardCharsets.UTF_8);
-        byte[] epilogue = ("\r\n--" + boundary + "--\r\n").getBytes(StandardCharsets.UTF_8);
-
-        HttpRequest request = HttpRequest.newBuilder()
-            .uri(URI.create("http://localhost:" + port + "/api/v1/documents/upload?departmentId="
-                + departmentId + "&accessLevel=DEPARTMENT"))
-            .header("Content-Type", "multipart/form-data; boundary=" + boundary)
-            .timeout(Duration.ofSeconds(120))
-            .POST(HttpRequest.BodyPublishers.ofInputStream(() -> new SequenceInputStream(Collections.enumeration(List.of(
-                new ByteArrayInputStream(preamble),
-                contentStreamSupplier.get(),
-                new ByteArrayInputStream(epilogue)
-            )))))
-            .build();
-
+        HttpRequest request = StreamingMultipartTestSupport.buildMultipartUploadRequest(
+            URI.create("http://localhost:" + port + "/api/v1/documents/upload?departmentId="
+                + departmentId + "&accessLevel=DEPARTMENT"),
+            "----DocuMindSmoke",
+            filename,
+            contentType,
+            contentStreamSupplier,
+            Duration.ofSeconds(120)
+        );
         return httpClient.send(request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
     }
 
@@ -438,79 +433,6 @@ class Day1InfrastructureAndAiSmokeTest {
 
         if (!createdDocumentIds.isEmpty()) {
             System.out.println("[SMOKE] Live cleanup verified (204 No Content, 0 Postgres rows, 0 MinIO objects): " + createdDocumentIds);
-        }
-    }
-
-    /**
-     * Lazy {@link InputStream} emitting a unique valid {@code %PDF-1.4} payload of exact length
-     * without materializing a multi-megabyte buffer on the JVM heap.
-     */
-    private static final class RepeatingPdfInputStream extends InputStream {
-
-        private static final byte[] PDF_SUFFIX = "\n%%EOF\n".getBytes(StandardCharsets.US_ASCII);
-        private static final byte[] PATTERN_CHUNK = "DOCUMIND_SMOKE_STREAM_PDF_0123456789ABCDEF\n"
-            .repeat(180)
-            .getBytes(StandardCharsets.US_ASCII);
-
-        private final byte[] pdfPrefix;
-        private final long totalLength;
-        private final long suffixStart;
-        private long position;
-
-        private RepeatingPdfInputStream(long totalLength, String runMarker) {
-            this.pdfPrefix = ("%PDF-1.4\n1 0 obj\n<< /Type /Catalog >>\nendobj\n% smoke-run="
-                + Objects.requireNonNull(runMarker, "runMarker must not be null") + "\n")
-                .getBytes(StandardCharsets.US_ASCII);
-            if (totalLength < this.pdfPrefix.length + PDF_SUFFIX.length) {
-                throw new IllegalArgumentException("totalLength too small for PDF framing");
-            }
-            this.totalLength = totalLength;
-            this.suffixStart = totalLength - PDF_SUFFIX.length;
-        }
-
-        @Override
-        public int read() {
-            byte[] single = new byte[1];
-            int count = read(single, 0, 1);
-            return count == -1 ? -1 : (single[0] & 0xFF);
-        }
-
-        @Override
-        public int read(byte[] b, int off, int len) {
-            Objects.checkFromIndexSize(off, len, b.length);
-            if (len == 0) {
-                return 0;
-            }
-            if (position >= totalLength) {
-                return -1;
-            }
-
-            int totalCopied = 0;
-            while (totalCopied < len && position < totalLength) {
-                int remainingOut = len - totalCopied;
-                if (position < pdfPrefix.length) {
-                    int prefixOffset = (int) position;
-                    int toCopy = Math.min(remainingOut, pdfPrefix.length - prefixOffset);
-                    System.arraycopy(pdfPrefix, prefixOffset, b, off + totalCopied, toCopy);
-                    position += toCopy;
-                    totalCopied += toCopy;
-                } else if (position < suffixStart) {
-                    long bodyOffset = position - pdfPrefix.length;
-                    int patternOffset = (int) (bodyOffset % PATTERN_CHUNK.length);
-                    long bytesUntilSuffix = suffixStart - position;
-                    int toCopy = (int) Math.min(remainingOut, Math.min(PATTERN_CHUNK.length - patternOffset, bytesUntilSuffix));
-                    System.arraycopy(PATTERN_CHUNK, patternOffset, b, off + totalCopied, toCopy);
-                    position += toCopy;
-                    totalCopied += toCopy;
-                } else {
-                    int suffixOffset = (int) (position - suffixStart);
-                    int toCopy = Math.min(remainingOut, PDF_SUFFIX.length - suffixOffset);
-                    System.arraycopy(PDF_SUFFIX, suffixOffset, b, off + totalCopied, toCopy);
-                    position += toCopy;
-                    totalCopied += toCopy;
-                }
-            }
-            return totalCopied;
         }
     }
 }

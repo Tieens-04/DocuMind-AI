@@ -649,6 +649,57 @@ class DocumentServiceTest {
     }
 
     @Test
+    void deleteDocumentHandlesDevFallbackVsExplicitAndProdMissingUser() {
+        DepartmentEntity itDept = department(IT_DEPT_ID, "IT");
+        DocumentEntity deptDoc = document(DOC_ID, itDept, AccessLevel.DEPARTMENT, DocumentStatus.COMPLETED);
+        when(documentRepository.findById(DOC_ID)).thenReturn(Optional.of(deptDoc));
+        when(userRepository.findById(HR_USER_ID)).thenReturn(Optional.empty());
+        when(userRepository.findById(ADMIN_USER_ID)).thenReturn(Optional.empty());
+
+        // 1. Explicit nonexistent userId throws ResourceNotFoundException before any DB/S3 mutation
+        assertThatThrownBy(() -> documentService.deleteDocument(
+            DOC_ID, new CallerContext(IT_DEPT_ID, HR_USER_ID, true, "127.0.0.1")
+        )).isInstanceOf(ResourceNotFoundException.class);
+        verify(documentRepository, never()).delete(any(DocumentEntity.class));
+        verify(auditLogRepository, never()).save(any(AuditLogEntity.class));
+        verify(departmentRepository, never()).incrementCacheVersion(any());
+        verify(departmentRepository, never()).incrementAllCacheVersions();
+        verifyNoInteractions(minioStorageService);
+
+        // 2. Prod profile throws ResourceNotFoundException even when default dev UUID is absent
+        DocumentService prodService = new DocumentService(
+            documentRepository,
+            departmentRepository,
+            userRepository,
+            auditLogRepository,
+            fileValidationService,
+            minioStorageService,
+            transactionTemplate,
+            eventPublisher,
+            new MockEnvironment().withProperty("spring.profiles.active", "prod")
+        );
+        assertThatThrownBy(() -> prodService.deleteDocument(
+            DOC_ID, new CallerContext(IT_DEPT_ID, ADMIN_USER_ID, true, "127.0.0.1")
+        )).isInstanceOf(ResourceNotFoundException.class);
+        verify(documentRepository, never()).delete(any(DocumentEntity.class));
+        verify(auditLogRepository, never()).save(any(AuditLogEntity.class));
+        verifyNoInteractions(minioStorageService);
+
+        // 3. Non-prod dev fallback admin ID absent in a custom DB resolves cleanly to null
+        documentService.deleteDocument(
+            DOC_ID, new CallerContext(IT_DEPT_ID, ADMIN_USER_ID, false, "127.0.0.1")
+        );
+        ArgumentCaptor<AuditLogEntity> auditCaptor = ArgumentCaptor.forClass(AuditLogEntity.class);
+        verify(auditLogRepository).save(auditCaptor.capture());
+        assertThat(auditCaptor.getValue().getUser()).isNull();
+        assertThat(auditCaptor.getValue().getActionType()).isEqualTo(AuditActionType.DOC_DELETE);
+        verify(documentRepository).delete(deptDoc);
+        verify(minioStorageService).deleteObjectQuietly(deptDoc.getStorageKey());
+        assertThat(transactionManager.commitCount).isEqualTo(1);
+        assertThat(transactionManager.rollbackCount).isEqualTo(2);
+    }
+
+    @Test
     void deleteDocumentNeverDeletesMinioObjectWhenTransactionRollsBack() {
         DepartmentEntity itDept = department(IT_DEPT_ID, "IT");
         DocumentEntity deptDoc = document(DOC_ID, itDept, AccessLevel.DEPARTMENT, DocumentStatus.COMPLETED);

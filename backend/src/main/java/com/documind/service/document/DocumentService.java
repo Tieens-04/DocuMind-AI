@@ -261,9 +261,7 @@ public class DocumentService {
             DepartmentEntity department = document.getDepartment();
             AccessLevel accessLevel = document.getAccessLevel();
             String originalName = document.getOriginalName();
-            UserEntity auditUser = caller.userId() != null
-                ? userRepository().findById(caller.userId()).orElse(null)
-                : null;
+            UserEntity auditUser = resolveOptionalUploader(caller.userId());
 
             documentRepository().delete(document);
             saveAuditLog(
