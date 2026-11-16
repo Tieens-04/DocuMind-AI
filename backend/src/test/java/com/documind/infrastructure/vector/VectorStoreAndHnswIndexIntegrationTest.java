@@ -10,7 +10,10 @@ import com.documind.repository.DepartmentRepository;
 import com.documind.repository.DocumentRepository;
 import com.documind.repository.UserRepository;
 import com.documind.support.PostgresTestcontainersConfig;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.pgvector.PGvector;
+import com.zaxxer.hikari.HikariConfig;
+import com.zaxxer.hikari.HikariDataSource;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.ai.document.Document;
@@ -24,9 +27,16 @@ import org.springframework.context.annotation.Import;
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.dao.InvalidDataAccessApiUsageException;
 import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.jdbc.core.simple.JdbcClient;
+import org.springframework.jdbc.datasource.DataSourceTransactionManager;
+import org.springframework.test.context.ActiveProfiles;
 import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.support.TransactionTemplate;
 
+import javax.sql.DataSource;
+import java.sql.Connection;
+import java.sql.PreparedStatement;
+import java.sql.SQLException;
 import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
 import java.util.ArrayList;
@@ -34,11 +44,18 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.UUID;
+import java.util.concurrent.CyclicBarrier;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 @SpringBootTest
+@ActiveProfiles("dev")
 @Import(PostgresTestcontainersConfig.class)
 class VectorStoreAndHnswIndexIntegrationTest {
 
@@ -67,6 +84,12 @@ class VectorStoreAndHnswIndexIntegrationTest {
     private JdbcTemplate jdbcTemplate;
 
     @Autowired
+    private DataSource dataSource;
+
+    @Autowired
+    private ObjectMapper objectMapper;
+
+    @Autowired
     private TransactionTemplate transactionTemplate;
 
     @Autowired
@@ -76,6 +99,7 @@ class VectorStoreAndHnswIndexIntegrationTest {
     void cleanUpTestRows() {
         jdbcTemplate.update("DELETE FROM semantic_cache");
         jdbcTemplate.update("DELETE FROM documents");
+        jdbcTemplate.update("UPDATE departments SET cache_version = 1");
     }
 
     @Test
@@ -420,6 +444,20 @@ class VectorStoreAndHnswIndexIntegrationTest {
         assertThatThrownBy(() -> vectorStore.add(List.of(mismatchedAccessLevel)))
             .isInstanceOf(DataIntegrityViolationException.class);
 
+        Document mismatchedFileName = new Document(
+            "Chunk sai file_name so với document cha",
+            Map.of(
+                "document_id", docId.toString(),
+                "department_id", hrId.toString(),
+                "access_level", "DEPARTMENT",
+                "file_name", "spoofed-filename.md",
+                "doc_version", 2,
+                "chunk_index", 1
+            )
+        );
+        assertThatThrownBy(() -> vectorStore.add(List.of(mismatchedFileName)))
+            .isInstanceOf(DataIntegrityViolationException.class);
+
         Document duplicateDocVersionChunkIndex = new Document(
             UUID.randomUUID().toString(),
             "Chunk trùng (document_id, doc_version, chunk_index)",
@@ -435,15 +473,23 @@ class VectorStoreAndHnswIndexIntegrationTest {
         assertThatThrownBy(() -> vectorStore.add(List.of(duplicateDocVersionChunkIndex)))
             .isInstanceOf(DataIntegrityViolationException.class);
 
-        // Parent update on documents.access_level must propagate to existing document_chunks.metadata
+        long hrCacheVersionBefore = departmentRepository.findByCodeIgnoreCase("HR").orElseThrow().getCacheVersion();
+        long itCacheVersionBefore = departmentRepository.findByCodeIgnoreCase("IT").orElseThrow().getCacheVersion();
+
+        // Parent update on documents.access_level and original_name must propagate to document_chunks and bump cache_version
         hrDoc.setAccessLevel(AccessLevel.PUBLIC);
+        hrDoc.setOriginalName("policy-public-renamed.md");
         documentRepository.saveAndFlush(hrDoc);
-        String propagatedAccess = jdbcTemplate.queryForObject(
-            "SELECT metadata->>'access_level' FROM document_chunks WHERE id = ?",
-            String.class,
+        Map<String, Object> propagated = jdbcTemplate.queryForMap(
+            "SELECT metadata->>'access_level' AS access_level, metadata->>'file_name' AS file_name FROM document_chunks WHERE id = ?",
             chunkUuid
         );
-        assertThat(propagatedAccess).isEqualTo("PUBLIC");
+        assertThat(propagated.get("access_level")).isEqualTo("PUBLIC");
+        assertThat(propagated.get("file_name")).isEqualTo("policy-public-renamed.md");
+        assertThat(departmentRepository.findByCodeIgnoreCase("HR").orElseThrow().getCacheVersion())
+            .isEqualTo(hrCacheVersionBefore + 1L);
+        assertThat(departmentRepository.findByCodeIgnoreCase("IT").orElseThrow().getCacheVersion())
+            .isEqualTo(itCacheVersionBefore + 1L);
     }
 
     @Test
@@ -541,6 +587,7 @@ class VectorStoreAndHnswIndexIntegrationTest {
 
         transactionTemplate.executeWithoutResult(status -> {
             status.setRollbackOnly();
+            // Force index plan check because PostgreSQL favors sequential scan on tiny test tables (< hundreds of pages)
             jdbcTemplate.execute("SET LOCAL enable_seqscan = off");
             List<String> filteredPlan = chunkVectorRepository.explainFilteredCosineSearch(hrId, queryVector, 5);
             assertThat(String.join("\n", filteredPlan))
@@ -711,6 +758,7 @@ class VectorStoreAndHnswIndexIntegrationTest {
         jdbcTemplate.execute("ANALYZE semantic_cache");
 
         transactionTemplate.executeWithoutResult(status -> {
+            // Force index plan check because PostgreSQL favors sequential scan on small test datasets
             jdbcTemplate.execute("SET LOCAL enable_seqscan = off");
 
             List<String> chunkPlan = chunkVectorRepository.explainCosineSearch(sampleVector, 5);
@@ -772,5 +820,329 @@ class VectorStoreAndHnswIndexIntegrationTest {
                 .isInstanceOf(InvalidDataAccessApiUsageException.class)
                 .hasCauseInstanceOf(IllegalArgumentException.class);
         }
+    }
+
+    @Test
+    void concurrentChunkInsertAndParentReclassificationSerializesViaParentShareLock() throws Exception {
+        DepartmentEntity hr = departmentRepository.findByCodeIgnoreCase("HR").orElseThrow();
+        UserEntity hrManager = userRepository.findByEmailIgnoreCase("manager.hr@documind.ai").orElseThrow();
+        UUID hrId = hr.getId();
+
+        DocumentEntity docA = new DocumentEntity();
+        docA.setDepartment(hr);
+        docA.setUploadedBy(hrManager);
+        docA.setOriginalName("race-a.pdf");
+        docA.setStorageKey("hr/race-a.pdf");
+        docA.setFileExtension("pdf");
+        docA.setMimeType("application/pdf");
+        docA.setFileSizeBytes(2048L);
+        docA.setFileHash("4".repeat(64));
+        docA.setAccessLevel(AccessLevel.DEPARTMENT);
+        docA.setStatus(DocumentStatus.COMPLETED);
+        docA = documentRepository.saveAndFlush(docA);
+
+        DocumentEntity docB = new DocumentEntity();
+        docB.setDepartment(hr);
+        docB.setUploadedBy(hrManager);
+        docB.setOriginalName("race-b.pdf");
+        docB.setStorageKey("hr/race-b.pdf");
+        docB.setFileExtension("pdf");
+        docB.setMimeType("application/pdf");
+        docB.setFileSizeBytes(2048L);
+        docB.setFileHash("5".repeat(64));
+        docB.setAccessLevel(AccessLevel.DEPARTMENT);
+        docB.setStatus(DocumentStatus.COMPLETED);
+        docB = documentRepository.saveAndFlush(docB);
+
+        String vecLiteral = new PGvector(embeddingModel.embed("Concurrency RBAC lock test")).toString();
+        String insertSql = """
+            INSERT INTO document_chunks (id, document_id, doc_version, chunk_index, page_number, content, metadata, embedding)
+            VALUES (?, ?, 1, 0, 1, 'Chunk content', CAST(? AS jsonb), CAST(? AS vector))
+            """;
+
+        try (ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor()) {
+            // Direction A: Uncommitted chunk insert holds FOR SHARE on parent; concurrent reclassification blocks, then propagates
+            UUID docAId = docA.getId();
+            UUID chunkAId = UUID.randomUUID();
+            String metadataA = objectMapper.writeValueAsString(Map.of(
+                "document_id", docAId.toString(),
+                "department_id", hrId.toString(),
+                "file_name", "race-a.pdf",
+                "access_level", "DEPARTMENT",
+                "doc_version", 1,
+                "chunk_index", 0,
+                "page_number", 1
+            ));
+            long cacheBeforeA = departmentRepository.findByCodeIgnoreCase("HR").orElseThrow().getCacheVersion();
+
+            try (Connection conn1 = dataSource.getConnection();
+                 Connection conn2 = dataSource.getConnection()) {
+                conn1.setAutoCommit(false);
+                conn2.setAutoCommit(false);
+
+                try (PreparedStatement insertStmt = conn1.prepareStatement(insertSql)) {
+                    insertStmt.setObject(1, chunkAId);
+                    insertStmt.setObject(2, docAId);
+                    insertStmt.setString(3, metadataA);
+                    insertStmt.setString(4, vecLiteral);
+                    insertStmt.executeUpdate();
+                }
+
+                Future<?> reclassifyFuture = executor.submit(() -> {
+                    try (PreparedStatement updateStmt = conn2.prepareStatement(
+                        "UPDATE documents SET access_level = 'CONFIDENTIAL' WHERE id = ?"
+                    )) {
+                        updateStmt.setObject(1, docAId);
+                        updateStmt.executeUpdate();
+                        conn2.commit();
+                    }
+                    return null;
+                });
+
+                Thread.sleep(150L);
+                assertThat(reclassifyFuture.isDone()).isFalse();
+
+                conn1.commit();
+                reclassifyFuture.get(5, TimeUnit.SECONDS);
+            }
+
+            String chunkAccessAfter = jdbcTemplate.queryForObject(
+                "SELECT metadata->>'access_level' FROM document_chunks WHERE id = ?",
+                String.class,
+                chunkAId
+            );
+            assertThat(chunkAccessAfter).isEqualTo("CONFIDENTIAL");
+            assertThat(departmentRepository.findByCodeIgnoreCase("HR").orElseThrow().getCacheVersion())
+                .isEqualTo(cacheBeforeA + 1L);
+
+            // Direction B: Uncommitted parent reclassification blocks concurrent DEPARTMENT chunk insert, which then fails 23514
+            UUID docBId = docB.getId();
+            UUID chunkBId = UUID.randomUUID();
+            String metadataB = objectMapper.writeValueAsString(Map.of(
+                "document_id", docBId.toString(),
+                "department_id", hrId.toString(),
+                "file_name", "race-b.pdf",
+                "access_level", "DEPARTMENT",
+                "doc_version", 1,
+                "chunk_index", 0,
+                "page_number", 1
+            ));
+
+            try (Connection conn1 = dataSource.getConnection();
+                 Connection conn2 = dataSource.getConnection()) {
+                conn1.setAutoCommit(false);
+                conn2.setAutoCommit(false);
+
+                try (PreparedStatement updateStmt = conn1.prepareStatement(
+                    "UPDATE documents SET access_level = 'CONFIDENTIAL' WHERE id = ?"
+                )) {
+                    updateStmt.setObject(1, docBId);
+                    updateStmt.executeUpdate();
+                }
+
+                Future<?> insertFuture = executor.submit(() -> {
+                    try (PreparedStatement insertStmt = conn2.prepareStatement(insertSql)) {
+                        insertStmt.setObject(1, chunkBId);
+                        insertStmt.setObject(2, docBId);
+                        insertStmt.setString(3, metadataB);
+                        insertStmt.setString(4, vecLiteral);
+                        insertStmt.executeUpdate();
+                        conn2.commit();
+                    } catch (SQLException ex) {
+                        conn2.rollback();
+                        throw ex;
+                    }
+                    return null;
+                });
+
+                Thread.sleep(150L);
+                assertThat(insertFuture.isDone()).isFalse();
+
+                conn1.commit();
+                assertThatThrownBy(() -> insertFuture.get(5, TimeUnit.SECONDS))
+                    .isInstanceOf(ExecutionException.class)
+                    .hasCauseInstanceOf(SQLException.class)
+                    .satisfies(ex -> assertThat(((SQLException) ex.getCause()).getSQLState()).isEqualTo("23514"));
+            }
+            assertThat(chunkVectorRepository.countByDocumentId(docBId)).isZero();
+        }
+    }
+
+    @Test
+    void roleBasedPgVectorFilterEnforcesStandardEmployeeAndManagerVisibility() {
+        DepartmentEntity hr = departmentRepository.findByCodeIgnoreCase("HR").orElseThrow();
+        DepartmentEntity sales = departmentRepository.findByCodeIgnoreCase("SALES").orElseThrow();
+        UserEntity hrManager = userRepository.findByEmailIgnoreCase("manager.hr@documind.ai").orElseThrow();
+        UUID hrId = hr.getId();
+        UUID salesId = sales.getId();
+
+        DocumentEntity hrPublic = saveDoc(hr, hrManager, "hr-pub.pdf", "hr/pub.pdf", "1", AccessLevel.PUBLIC);
+        DocumentEntity hrDept = saveDoc(hr, hrManager, "hr-dept.pdf", "hr/dept.pdf", "2", AccessLevel.DEPARTMENT);
+        DocumentEntity hrConf = saveDoc(hr, hrManager, "hr-conf.pdf", "hr/conf.pdf", "3", AccessLevel.CONFIDENTIAL);
+        DocumentEntity salesPublic = saveDoc(sales, hrManager, "sales-pub.pdf", "sales/pub.pdf", "4", AccessLevel.PUBLIC);
+        DocumentEntity salesDept = saveDoc(sales, hrManager, "sales-dept.pdf", "sales/dept.pdf", "5", AccessLevel.DEPARTMENT);
+
+        String sharedTopic = "Chính sách lương thưởng năm 2026";
+        vectorStore.add(List.of(
+            chunkDoc(hrPublic, sharedTopic),
+            chunkDoc(hrDept, sharedTopic),
+            chunkDoc(hrConf, sharedTopic),
+            chunkDoc(salesPublic, sharedTopic),
+            chunkDoc(salesDept, sharedTopic)
+        ));
+
+        FilterExpressionBuilder b = new FilterExpressionBuilder();
+        var standardEmployeeFilter = b.or(
+            b.eq("access_level", "PUBLIC"),
+            b.and(b.eq("department_id", hrId.toString()), b.eq("access_level", "DEPARTMENT"))
+        ).build();
+
+        List<Document> employeeHits = vectorStore.similaritySearch(
+            SearchRequest.builder()
+                .query(sharedTopic)
+                .topK(10)
+                .similarityThreshold(0.0)
+                .filterExpression(standardEmployeeFilter)
+                .build()
+        );
+        assertThat(employeeHits)
+            .extracting(doc -> doc.getMetadata().get("document_id").toString())
+            .containsExactlyInAnyOrder(
+                hrPublic.getId().toString(),
+                hrDept.getId().toString(),
+                salesPublic.getId().toString()
+            )
+            .doesNotContain(hrConf.getId().toString(), salesDept.getId().toString());
+
+        var managerFilter = b.or(
+            b.eq("access_level", "PUBLIC"),
+            b.eq("department_id", hrId.toString())
+        ).build();
+
+        List<Document> managerHits = vectorStore.similaritySearch(
+            SearchRequest.builder()
+                .query(sharedTopic)
+                .topK(10)
+                .similarityThreshold(0.0)
+                .filterExpression(managerFilter)
+                .build()
+        );
+        assertThat(managerHits)
+            .extracting(doc -> doc.getMetadata().get("document_id").toString())
+            .containsExactlyInAnyOrder(
+                hrPublic.getId().toString(),
+                hrDept.getId().toString(),
+                hrConf.getId().toString(),
+                salesPublic.getId().toString()
+            )
+            .doesNotContain(salesDept.getId().toString());
+        assertThat(salesId).isNotEqualTo(hrId);
+    }
+
+    @Test
+    void semanticCacheHitIncrementDoesNotStarveSaturatedPoolInReadOnlyTransactions() throws Exception {
+        UUID hrId = departmentRepository.findByCodeIgnoreCase("HR").orElseThrow().getId();
+        String managerScope = "DEPT:" + hrId + ":POOL_TEST";
+        String queryText = "Kiểm tra tránh cạn kết nối HikariCP khi cache hit";
+        float[] queryVector = embeddingModel.embed(queryText);
+
+        UUID cachedId = semanticCacheRepository.save(
+            managerScope,
+            1L,
+            "9".repeat(64),
+            queryText,
+            queryVector,
+            "Kết quả cached an toàn với pool bão hòa.",
+            List.of(),
+            "groq",
+            OffsetDateTime.now(ZoneOffset.UTC).plusHours(1)
+        );
+
+        HikariDataSource mainPool = dataSource.unwrap(HikariDataSource.class);
+        HikariConfig tinyPoolConfig = new HikariConfig();
+        tinyPoolConfig.setJdbcUrl(mainPool.getJdbcUrl());
+        tinyPoolConfig.setUsername(mainPool.getUsername());
+        tinyPoolConfig.setPassword(mainPool.getPassword());
+        tinyPoolConfig.setMaximumPoolSize(2);
+        tinyPoolConfig.setConnectionTimeout(1_000L);
+        tinyPoolConfig.setConnectionInitSql("SET hnsw.iterative_scan = 'relaxed_order'");
+
+        try (HikariDataSource tinyPool = new HikariDataSource(tinyPoolConfig);
+             ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor()) {
+            DataSourceTransactionManager tinyTxManager = new DataSourceTransactionManager(tinyPool);
+            SemanticCacheVectorRepository pooledRepo = new SemanticCacheVectorRepository(
+                JdbcClient.create(tinyPool),
+                tinyTxManager,
+                objectMapper
+            );
+            TransactionTemplate readOnlyTx = new TransactionTemplate(tinyTxManager);
+            readOnlyTx.setReadOnly(true);
+
+            CyclicBarrier bothConnectionsHeld = new CyclicBarrier(2);
+            List<Future<Optional<SemanticCacheEntry>>> futures = new ArrayList<>(2);
+            for (int i = 0; i < 2; i++) {
+                futures.add(executor.submit(() -> readOnlyTx.execute(status -> {
+                    Optional<SemanticCacheEntry> hit = pooledRepo.findBestMatch(managerScope, 1L, queryVector, 0.94d);
+                    try {
+                        // Hold both 2/2 pool connections simultaneously to prove hit_count write never self-deadlocks
+                        bothConnectionsHeld.await(5, TimeUnit.SECONDS);
+                    } catch (Exception ex) {
+                        throw new IllegalStateException("Barrier failed while holding read-only pool connections", ex);
+                    }
+                    return hit;
+                })));
+            }
+
+            for (Future<Optional<SemanticCacheEntry>> future : futures) {
+                Optional<SemanticCacheEntry> hit = future.get(5, TimeUnit.SECONDS);
+                assertThat(hit).isPresent();
+                assertThat(hit.orElseThrow().id()).isEqualTo(cachedId);
+            }
+
+            pooledRepo.flushPendingHitCounts();
+            Integer hitCount = jdbcTemplate.queryForObject(
+                "SELECT hit_count FROM semantic_cache WHERE id = ?",
+                Integer.class,
+                cachedId
+            );
+            assertThat(hitCount).isEqualTo(2);
+        }
+    }
+
+    private DocumentEntity saveDoc(
+        DepartmentEntity dept,
+        UserEntity uploader,
+        String originalName,
+        String storageKey,
+        String hashFill,
+        AccessLevel accessLevel
+    ) {
+        DocumentEntity doc = new DocumentEntity();
+        doc.setDepartment(dept);
+        doc.setUploadedBy(uploader);
+        doc.setOriginalName(originalName);
+        doc.setStorageKey(storageKey);
+        doc.setFileExtension("pdf");
+        doc.setMimeType("application/pdf");
+        doc.setFileSizeBytes(2048L);
+        doc.setFileHash(hashFill.repeat(64));
+        doc.setAccessLevel(accessLevel);
+        doc.setStatus(DocumentStatus.COMPLETED);
+        return documentRepository.saveAndFlush(doc);
+    }
+
+    private static Document chunkDoc(DocumentEntity doc, String content) {
+        return new Document(
+            content,
+            Map.of(
+                "document_id", doc.getId().toString(),
+                "department_id", doc.getDepartmentId().toString(),
+                "access_level", doc.getAccessLevel().name(),
+                "file_name", doc.getOriginalName(),
+                "page_number", 1,
+                "chunk_index", 0,
+                "doc_version", 1
+            )
+        );
     }
 }

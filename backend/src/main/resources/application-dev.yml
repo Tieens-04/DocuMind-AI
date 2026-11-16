@@ -1,0 +1,5 @@
+# Local development profile: opts in to dev seed data (V3 preserved immutable; future seeds must use R__*.sql)
+spring:
+  flyway:
+    locations: classpath:db/migration,classpath:db/seed
+    out-of-order: true

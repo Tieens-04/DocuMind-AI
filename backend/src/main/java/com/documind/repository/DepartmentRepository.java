@@ -15,7 +15,8 @@ import java.util.UUID;
  */
 public interface DepartmentRepository extends JpaRepository<DepartmentEntity, UUID> {
 
-    Optional<DepartmentEntity> findByCodeIgnoreCase(String code);
+    @Query("SELECT d FROM DepartmentEntity d WHERE LOWER(d.code) = LOWER(:code)")
+    Optional<DepartmentEntity> findByCodeIgnoreCase(@Param("code") String code);
 
     @Transactional
     @Modifying(clearAutomatically = true, flushAutomatically = true)

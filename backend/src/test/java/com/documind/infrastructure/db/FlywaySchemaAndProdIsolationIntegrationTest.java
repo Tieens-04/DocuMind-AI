@@ -10,6 +10,8 @@ import org.springframework.context.annotation.Import;
 import org.springframework.core.io.ClassPathResource;
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.test.context.ActiveProfiles;
+import org.springframework.transaction.support.TransactionTemplate;
 
 import javax.sql.DataSource;
 import java.util.List;
@@ -19,6 +21,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 @SpringBootTest
+@ActiveProfiles("dev")
 @Import(PostgresTestcontainersConfig.class)
 class FlywaySchemaAndProdIsolationIntegrationTest {
 
@@ -28,12 +31,15 @@ class FlywaySchemaAndProdIsolationIntegrationTest {
     @Autowired
     private DataSource dataSource;
 
+    @Autowired
+    private TransactionTemplate transactionTemplate;
+
     @Test
-    void appliesV1ToV4AllNineTablesAndSeededUsersWithBcryptHashes() {
+    void appliesV1ToV5AllNineTablesAndSeededUsersWithBcryptHashes() {
         List<String> versions = jdbcTemplate.queryForList(
             "SELECT version FROM flyway_schema_history WHERE success = true ORDER BY installed_rank",
             String.class);
-        assertThat(versions).containsExactly("1", "2", "3", "4");
+        assertThat(versions).containsExactly("1", "2", "3", "4", "5");
 
         List<String> tables = jdbcTemplate.queryForList(
             "SELECT table_name FROM information_schema.tables WHERE table_schema = 'public' AND table_type = 'BASE TABLE'",
@@ -120,7 +126,21 @@ class FlywaySchemaAndProdIsolationIntegrationTest {
     }
 
     @Test
-    void prodFlywayLocationsExcludeSeedMigrationV3() {
+    void defaultAndProdFlywayLocationsExcludeSeedMigrationV3AndDevOptInEnablesIt() {
+        YamlPropertiesFactoryBean baseYaml = new YamlPropertiesFactoryBean();
+        baseYaml.setResources(new ClassPathResource("application.yml"));
+        Properties baseProps = baseYaml.getObject();
+        assertThat(baseProps).isNotNull();
+        assertThat(baseProps.getProperty("spring.flyway.locations")).isEqualTo("classpath:db/migration");
+        assertThat(String.valueOf(baseProps.get("spring.flyway.baseline-on-migrate"))).isEqualTo("false");
+
+        YamlPropertiesFactoryBean devYaml = new YamlPropertiesFactoryBean();
+        devYaml.setResources(new ClassPathResource("application-dev.yml"));
+        Properties devProps = devYaml.getObject();
+        assertThat(devProps).isNotNull();
+        assertThat(devProps.getProperty("spring.flyway.locations")).isEqualTo("classpath:db/migration,classpath:db/seed");
+        assertThat(String.valueOf(devProps.get("spring.flyway.out-of-order"))).isEqualTo("true");
+
         YamlPropertiesFactoryBean yaml = new YamlPropertiesFactoryBean();
         yaml.setResources(new ClassPathResource("application-prod.yml"));
         Properties prodProps = yaml.getObject();
@@ -142,12 +162,50 @@ class FlywaySchemaAndProdIsolationIntegrationTest {
         List<String> prodVersions = jdbcTemplate.queryForList(
             "SELECT version FROM prod_verify.flyway_schema_history WHERE success = true AND version <> '0' ORDER BY installed_rank",
             String.class);
-        assertThat(prodVersions).containsExactly("1", "2", "4");
+        assertThat(prodVersions).containsExactly("1", "2", "4", "5");
 
         Integer prodUsers = jdbcTemplate.queryForObject("SELECT COUNT(*) FROM prod_verify.users", Integer.class);
         assertThat(prodUsers).isZero();
 
         Integer prodDepartments = jdbcTemplate.queryForObject("SELECT COUNT(*) FROM prod_verify.departments", Integer.class);
         assertThat(prodDepartments).isZero();
+    }
+
+    @Test
+    void caseInsensitiveLowerQueriesUseFunctionalIndexesAndRedundantConstraintsAreRemoved() {
+        Integer redundantConstraints = jdbcTemplate.queryForObject(
+            """
+            SELECT COUNT(*) FROM pg_constraint
+            WHERE conname IN ('uq_departments_code', 'uq_users_email')
+            """,
+            Integer.class
+        );
+        assertThat(redundantConstraints).isZero();
+
+        Integer ttlIndexCount = jdbcTemplate.queryForObject(
+            """
+            SELECT COUNT(*) FROM pg_indexes
+            WHERE schemaname = 'public' AND tablename = 'semantic_cache' AND indexname = 'idx_semantic_cache_expires_at'
+            """,
+            Integer.class
+        );
+        assertThat(ttlIndexCount).isEqualTo(1);
+
+        transactionTemplate.executeWithoutResult(status -> {
+            status.setRollbackOnly();
+            jdbcTemplate.execute("SET LOCAL enable_seqscan = off");
+
+            String userPlan = String.join("\n", jdbcTemplate.queryForList(
+                "EXPLAIN SELECT id FROM users WHERE LOWER(email) = LOWER('ADMIN@documind.ai')",
+                String.class
+            ));
+            assertThat(userPlan).contains("uq_users_email_lower");
+
+            String deptPlan = String.join("\n", jdbcTemplate.queryForList(
+                "EXPLAIN SELECT id FROM departments WHERE LOWER(code) = LOWER('hr')",
+                String.class
+            ));
+            assertThat(deptPlan).contains("uq_departments_code_lower");
+        });
     }
 }

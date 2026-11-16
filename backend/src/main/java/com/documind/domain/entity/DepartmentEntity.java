@@ -31,7 +31,7 @@ public class DepartmentEntity implements Persistable<UUID> {
     @Transient
     private boolean isNew = true;
 
-    @Column(name = "code", nullable = false, unique = true, length = 32)
+    @Column(name = "code", nullable = false, length = 32)
     private String code;
 
     @Column(name = "name", nullable = false, length = 120)

@@ -44,7 +44,7 @@ public class UserEntity implements Persistable<UUID> {
     @Column(name = "department_id", nullable = false, insertable = false, updatable = false)
     private UUID departmentId;
 
-    @Column(name = "email", nullable = false, unique = true, length = 255)
+    @Column(name = "email", nullable = false, length = 255)
     private String email;
 
     @Column(name = "password_hash", nullable = false, length = 255)

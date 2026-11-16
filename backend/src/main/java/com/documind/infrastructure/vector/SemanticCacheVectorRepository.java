@@ -4,6 +4,8 @@ import com.documind.domain.model.CitationPayload;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.jdbc.core.simple.JdbcClient;
@@ -15,10 +17,21 @@ import org.springframework.transaction.support.TransactionTemplate;
 
 import java.sql.Types;
 import java.time.OffsetDateTime;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.UUID;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Semaphore;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Supplier;
 
 /**
@@ -28,12 +41,17 @@ import java.util.function.Supplier;
 @Repository
 public class SemanticCacheVectorRepository {
 
+    private static final Logger log = LoggerFactory.getLogger(SemanticCacheVectorRepository.class);
+    private static final long ASYNC_HIT_FLUSH_WAIT_MS = 50L;
+    private static final ExecutorService HIT_FLUSH_EXECUTOR = Executors.newVirtualThreadPerTaskExecutor();
     private static final TypeReference<List<CitationPayload>> CITATION_LIST_TYPE = new TypeReference<>() {
     };
 
     private final Supplier<JdbcClient> jdbcClientSupplier;
     private final Supplier<PlatformTransactionManager> transactionManagerSupplier;
     private final ObjectMapper objectMapper;
+    private final ConcurrentHashMap<UUID, AtomicInteger> pendingHitDeltas = new ConcurrentHashMap<>();
+    private final Semaphore flushPermit = new Semaphore(1);
 
     @Autowired
     public SemanticCacheVectorRepository(
@@ -49,9 +67,17 @@ public class SemanticCacheVectorRepository {
     }
 
     public SemanticCacheVectorRepository(JdbcClient jdbcClient, ObjectMapper objectMapper) {
+        this(jdbcClient, null, objectMapper);
+    }
+
+    public SemanticCacheVectorRepository(
+        JdbcClient jdbcClient,
+        PlatformTransactionManager transactionManager,
+        ObjectMapper objectMapper
+    ) {
         this(
             () -> Objects.requireNonNull(jdbcClient, "jdbcClient must not be null"),
-            () -> null,
+            () -> transactionManager,
             objectMapper
         );
     }
@@ -155,14 +181,17 @@ public class SemanticCacheVectorRepository {
 
         PlatformTransactionManager txManager = transactionManagerSupplier.get();
         Optional<SemanticCacheEntry> match;
-        if (txManager != null) {
+        if (txManager != null && !TransactionSynchronizationManager.isActualTransactionActive()) {
+            // Scope SET LOCAL strictly to a short read-only search tx when no caller tx exists
             TransactionTemplate searchTx = new TransactionTemplate(txManager);
             searchTx.setPropagationBehavior(TransactionDefinition.PROPAGATION_REQUIRED);
+            searchTx.setReadOnly(true);
             match = searchTx.execute(status -> {
                 jdbcClient().sql("SET LOCAL hnsw.iterative_scan = 'relaxed_order'").update();
                 return queryBestMatch(rbacScope, scopeVersion, vectorLiteral, minSimilarity);
             });
         } else {
+            // Caller already owns an active tx (Hikari init SQL applies session iterative_scan) or txManager is absent
             match = queryBestMatch(rbacScope, scopeVersion, vectorLiteral, minSimilarity);
         }
 
@@ -261,21 +290,113 @@ public class SemanticCacheVectorRepository {
         if (txManager != null
             && TransactionSynchronizationManager.isActualTransactionActive()
             && TransactionSynchronizationManager.isCurrentTransactionReadOnly()) {
-            TransactionTemplate writeTx = new TransactionTemplate(txManager);
-            writeTx.setPropagationBehavior(TransactionDefinition.PROPAGATION_REQUIRES_NEW);
-            writeTx.setReadOnly(false);
-            writeTx.executeWithoutResult(status -> executeIncrementHitCount(id));
+            pendingHitDeltas.computeIfAbsent(id, ignored -> new AtomicInteger()).incrementAndGet();
+            CompletableFuture<Void> flushFuture = CompletableFuture.runAsync(
+                () -> drainPendingHitDeltas(txManager),
+                HIT_FLUSH_EXECUTOR
+            );
+            try {
+                flushFuture.get(ASYNC_HIT_FLUSH_WAIT_MS, TimeUnit.MILLISECONDS);
+            } catch (TimeoutException ignored) {
+                // Pool is busy while caller holds outer read-only connection; delta remains queued and drains once released
+            } catch (InterruptedException ex) {
+                Thread.currentThread().interrupt();
+            } catch (ExecutionException ex) {
+                log.warn("Failed to flush semantic cache hit_count asynchronously: {}", ex.getMessage());
+            }
             return;
         }
-        executeIncrementHitCount(id);
+        executeIncrementHitCount(id, 1);
     }
 
-    private void executeIncrementHitCount(UUID id) {
+    void flushPendingHitCounts() {
+        PlatformTransactionManager txManager = transactionManagerSupplier.get();
+        while (hasPendingDeltas()) {
+            try {
+                flushPermit.acquire();
+            } catch (InterruptedException ex) {
+                Thread.currentThread().interrupt();
+                return;
+            }
+            boolean batchSucceeded = false;
+            try {
+                if (!hasPendingDeltas()) {
+                    return;
+                }
+                batchSucceeded = drainBatch(txManager);
+            } finally {
+                flushPermit.release();
+            }
+            if (!batchSucceeded) {
+                return;
+            }
+        }
+    }
+
+    private void drainPendingHitDeltas(PlatformTransactionManager txManager) {
+        while (hasPendingDeltas()) {
+            if (!flushPermit.tryAcquire()) {
+                return;
+            }
+            boolean batchSucceeded = false;
+            try {
+                batchSucceeded = drainBatch(txManager);
+            } finally {
+                flushPermit.release();
+            }
+            if (!batchSucceeded) {
+                return;
+            }
+        }
+    }
+
+    private boolean drainBatch(PlatformTransactionManager txManager) {
+        Map<UUID, Integer> snapshot = new LinkedHashMap<>();
+        pendingHitDeltas.forEach((entryId, counter) -> {
+            int delta = counter.getAndSet(0);
+            if (delta > 0) {
+                snapshot.put(entryId, delta);
+            }
+        });
+        if (snapshot.isEmpty()) {
+            return true;
+        }
+        try {
+            Runnable applyDeltas = () -> snapshot.forEach(this::executeIncrementHitCount);
+            if (txManager != null) {
+                TransactionTemplate writeTx = new TransactionTemplate(txManager);
+                writeTx.setPropagationBehavior(TransactionDefinition.PROPAGATION_REQUIRES_NEW);
+                writeTx.setReadOnly(false);
+                writeTx.executeWithoutResult(status -> applyDeltas.run());
+            } else {
+                applyDeltas.run();
+            }
+            return true;
+        } catch (RuntimeException ex) {
+            snapshot.forEach((entryId, delta) ->
+                pendingHitDeltas.computeIfAbsent(entryId, ignored -> new AtomicInteger()).addAndGet(delta)
+            );
+            log.warn("Deferred semantic cache hit_count flush failed; deltas retained for retry: {}", ex.getMessage());
+            return false;
+        }
+    }
+
+    private boolean hasPendingDeltas() {
+        for (AtomicInteger counter : pendingHitDeltas.values()) {
+            if (counter.get() > 0) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private void executeIncrementHitCount(UUID id, int delta) {
         jdbcClient().sql("""
                 UPDATE semantic_cache
-                SET hit_count = hit_count + 1
+                SET hit_count = hit_count + :delta
                 WHERE id = :id
                 """)
+            .param("delta", delta)
             .param("id", id)
             .update();
     }
