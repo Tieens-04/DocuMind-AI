@@ -29,11 +29,11 @@ class FlywaySchemaAndProdIsolationIntegrationTest {
     private DataSource dataSource;
 
     @Test
-    void appliesV1ToV3AllNineTablesAndSeededUsersWithBcryptHashes() {
+    void appliesV1ToV4AllNineTablesAndSeededUsersWithBcryptHashes() {
         List<String> versions = jdbcTemplate.queryForList(
             "SELECT version FROM flyway_schema_history WHERE success = true ORDER BY installed_rank",
             String.class);
-        assertThat(versions).containsExactly("1", "2", "3");
+        assertThat(versions).containsExactly("1", "2", "3", "4");
 
         List<String> tables = jdbcTemplate.queryForList(
             "SELECT table_name FROM information_schema.tables WHERE table_schema = 'public' AND table_type = 'BASE TABLE'",
@@ -127,14 +127,14 @@ class FlywaySchemaAndProdIsolationIntegrationTest {
         assertThat(prodProps).isNotNull();
         String prodLocations = prodProps.getProperty("spring.flyway.locations");
         assertThat(prodLocations).isEqualTo("classpath:db/migration");
+        assertThat(String.valueOf(prodProps.get("spring.flyway.baseline-on-migrate"))).isEqualTo("false");
 
         jdbcTemplate.execute("CREATE SCHEMA IF NOT EXISTS prod_verify");
         Flyway prodFlyway = Flyway.configure()
             .dataSource(dataSource)
-            .schemas("prod_verify", "public")
+            .schemas("prod_verify")
             .defaultSchema("prod_verify")
-            .baselineOnMigrate(true)
-            .baselineVersion("0")
+            .baselineOnMigrate(false)
             .locations(prodLocations.split(","))
             .load();
         prodFlyway.migrate();
@@ -142,7 +142,7 @@ class FlywaySchemaAndProdIsolationIntegrationTest {
         List<String> prodVersions = jdbcTemplate.queryForList(
             "SELECT version FROM prod_verify.flyway_schema_history WHERE success = true AND version <> '0' ORDER BY installed_rank",
             String.class);
-        assertThat(prodVersions).containsExactly("1", "2");
+        assertThat(prodVersions).containsExactly("1", "2", "4");
 
         Integer prodUsers = jdbcTemplate.queryForObject("SELECT COUNT(*) FROM prod_verify.users", Integer.class);
         assertThat(prodUsers).isZero();

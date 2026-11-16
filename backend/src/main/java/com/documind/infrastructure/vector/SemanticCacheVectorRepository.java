@@ -208,21 +208,35 @@ public class SemanticCacheVectorRepository {
         double minSimilarity
     ) {
         return jdbcClient().sql("""
+                WITH relaxed_candidates AS MATERIALIZED (
+                    SELECT id,
+                           rbac_scope,
+                           scope_version,
+                           query_hash,
+                           query_text,
+                           response_content,
+                           citations::text AS citations_json,
+                           model_provider,
+                           (query_embedding <=> CAST(:vec AS vector)) AS cosine_distance
+                    FROM semantic_cache
+                    WHERE rbac_scope = :scope
+                      AND scope_version = :version
+                      AND (expires_at IS NULL OR expires_at > CURRENT_TIMESTAMP)
+                    ORDER BY query_embedding <=> CAST(:vec AS vector)
+                    LIMIT 5
+                )
                 SELECT id,
                        rbac_scope,
                        scope_version,
                        query_hash,
                        query_text,
                        response_content,
-                       citations::text AS citations_json,
+                       citations_json,
                        model_provider,
-                       (1.0 - (query_embedding <=> CAST(:vec AS vector))) AS similarity_score
-                FROM semantic_cache
-                WHERE rbac_scope = :scope
-                  AND scope_version = :version
-                  AND (expires_at IS NULL OR expires_at > CURRENT_TIMESTAMP)
-                  AND (1.0 - (query_embedding <=> CAST(:vec AS vector))) >= :minSimilarity
-                ORDER BY query_embedding <=> CAST(:vec AS vector)
+                       (1.0 - cosine_distance) AS similarity_score
+                FROM relaxed_candidates
+                WHERE (1.0 - cosine_distance) >= :minSimilarity
+                ORDER BY cosine_distance ASC
                 LIMIT 1
                 """)
             .param("scope", rbacScope)

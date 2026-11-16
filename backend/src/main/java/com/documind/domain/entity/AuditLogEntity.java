@@ -106,9 +106,7 @@ public class AuditLogEntity implements Persistable<UUID> {
         if (cacheTier == null) {
             cacheTier = CacheTier.NONE;
         }
-        if (cacheHit == null) {
-            cacheHit = (cacheTier != CacheTier.NONE);
-        }
+        cacheHit = (cacheTier != CacheTier.NONE);
         if (promptTokens == null) {
             promptTokens = 0;
         }

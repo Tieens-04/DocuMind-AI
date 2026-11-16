@@ -23,7 +23,8 @@ Design and initialize all **9 database tables** (`7` relational tables + `2` `10
 ### 2.1 Hybrid Persistence Boundary (JPA for Relational + `PgVectorStore`/`JdbcClient` for Vector)
 - **7 Relational Tables (`V1`):** Mapped via JPA `@Entity` classes (`com.documind.domain.entity`) and Spring Data `JpaRepository` interfaces (`com.documind.repository`). All `@ManyToOne` associations use `FetchType.LAZY` (`open-in-view: false`), and JSONB payloads (`chat_messages.citations`) use Hibernate 6 native `@JdbcTypeCode(SqlTypes.JSON)`.
 - **2 Vector Tables (`V2`):** Accessed via Spring AI `VectorStore` (`PgVectorStore`) and lightweight `JdbcClient` repositories (`com.documind.infrastructure.vector`) without adding `hibernate-vector` or loading `float[1024]` arrays into JPA Persistence Context memory.
-- **Trigger-Synchronized `ON DELETE CASCADE` on `document_chunks`:** Spring AI `1.0.3` `PgVectorStore` executes hardcoded `INSERT INTO public.document_chunks (id, content, metadata, embedding) VALUES (?, ?, ?::jsonb, ?) ON CONFLICT (id) DO UPDATE ...`. To preserve native `PgVectorStore` compatibility *and* guarantee zero orphan vectors at the database level, `document_chunks` defines `document_id UUID NOT NULL REFERENCES documents(id) ON DELETE CASCADE` (plus `doc_version`, `chunk_index`, `page_number`) populated automatically by a `BEFORE INSERT OR UPDATE` trigger (`trg_sync_document_chunk_metadata`) reading `NEW.metadata`.
+- **Trigger-Synchronized `ON DELETE CASCADE` on `document_chunks`:** Spring AI `1.0.3` `PgVectorStore` executes hardcoded `INSERT INTO public.document_chunks (id, content, metadata, embedding) VALUES (?, ?, ?::jsonb, ?) ON CONFLICT (id) DO UPDATE ...`. To preserve native `PgVectorStore` compatibility *and* guarantee zero orphan vectors at the database level, `document_chunks` defines `document_id UUID NOT NULL REFERENCES documents(id) ON DELETE CASCADE` (plus `doc_version`, `chunk_index`, `page_number`) populated automatically by a `BEFORE INSERT OR UPDATE` trigger (`trg_sync_document_chunk_metadata`) reading `NEW.metadata` (`V4` hardens this to reject missing `doc_version`/`chunk_index`, validate parent `department_id`/`access_level` ownership, normalize `page_number`, and propagate `documents` RBAC changes via `trg_propagate_document_rbac_to_chunks`).
+- **HNSW Filtered Search (`iterative_scan`):** `application.yml` configures Hikari `connection-init-sql: SET hnsw.iterative_scan = 'relaxed_order'` (requiring pgvector `>= 0.8.0`, pinned to digest in `docker-compose.yml` and `PostgresTestcontainersConfig`) so RBAC-filtered `PgVectorStore` searches never truncate below `topK` on small departments, while `SemanticCacheVectorRepository` uses pgvector's `MATERIALIZED` CTE re-ranking pattern.
 
 ### 2.2 Canonical Enum & RBAC Semantics
 - Stored in PostgreSQL as `VARCHAR` columns guarded by explicit `CHECK` constraints (`@Enumerated(EnumType.STRING)` in JPA) for clean Flyway evolution and zero PostgreSQL custom-type cast friction:
@@ -216,6 +217,14 @@ Idempotent (`ON CONFLICT DO NOTHING`) seed script with deterministic UUIDs and a
 | User (Admin) | `aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa` | `admin@documind.ai` | `SYSTEM_ADMIN` in `IT` |
 | User (Manager) | `bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb` | `manager.hr@documind.ai` | `DEPARTMENT_MANAGER` in `HR` |
 | User (Employee) | `cccccccc-cccc-cccc-cccc-cccccccccccc` | `employee.sales@documind.ai` | `STANDARD_EMPLOYEE` in `SALES` |
+
+### 3.4 `V4__harden_schema_and_rbac_invariants.sql` (`classpath:db/migration`)
+
+Additive post-merge migration (leaving `V1` and `V2` byte-for-byte immutable) enforcing:
+- Case-insensitive unique indexes `uq_departments_code_lower` and `uq_users_email_lower`.
+- `uq_documents_storage_key`, `chk_audit_logs_cache_consistency` (`NOT VALID` -> `VALIDATE CONSTRAINT`), and `uq_semantic_cache_scope_hash`.
+- Hardened `sync_document_chunk_metadata()` requiring `document_id`, `department_id`, `file_name`, `access_level`, `doc_version`, and `chunk_index`, normalizing `page_number` to JSON `null` when omitted, validating parent `documents.department_id` and `documents.access_level` ownership, plus `chk_document_chunks_rbac_metadata` and `uq_document_chunks_doc_version_index`.
+- `trg_propagate_document_rbac_to_chunks` (`AFTER UPDATE OF department_id, access_level ON documents`) propagating RBAC metadata updates to existing `document_chunks`.
 
 ---
 

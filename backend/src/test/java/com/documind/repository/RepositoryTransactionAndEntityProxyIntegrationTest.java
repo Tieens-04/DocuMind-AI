@@ -159,6 +159,28 @@ class RepositoryTransactionAndEntityProxyIntegrationTest {
         assertThat(saved.isCacheHit()).isTrue();
         assertThat(saved.getCacheTier()).isEqualTo(CacheTier.L1);
 
+        AuditLogEntity staleFalseWithL2 = new AuditLogEntity();
+        staleFalseWithL2.setUser(admin);
+        staleFalseWithL2.setDepartment(admin.getDepartment());
+        staleFalseWithL2.setActionType(AuditActionType.CHAT_QUERY);
+        staleFalseWithL2.setQueryText("Kiểm tra @PrePersist đồng bộ L2");
+        staleFalseWithL2.setCacheTier(CacheTier.L2);
+        staleFalseWithL2.setCacheHit(Boolean.FALSE);
+        AuditLogEntity savedL2 = auditLogRepository.saveAndFlush(staleFalseWithL2);
+        assertThat(savedL2.isCacheHit()).isTrue();
+        assertThat(savedL2.getCacheTier()).isEqualTo(CacheTier.L2);
+
+        AuditLogEntity staleTrueWithNone = new AuditLogEntity();
+        staleTrueWithNone.setUser(admin);
+        staleTrueWithNone.setDepartment(admin.getDepartment());
+        staleTrueWithNone.setActionType(AuditActionType.CHAT_QUERY);
+        staleTrueWithNone.setQueryText("Kiểm tra @PrePersist đồng bộ NONE");
+        staleTrueWithNone.setCacheTier(CacheTier.NONE);
+        staleTrueWithNone.setCacheHit(Boolean.TRUE);
+        AuditLogEntity savedNone = auditLogRepository.saveAndFlush(staleTrueWithNone);
+        assertThat(savedNone.isCacheHit()).isFalse();
+        assertThat(savedNone.getCacheTier()).isEqualTo(CacheTier.NONE);
+
         List<String> jsonPropertyNames = Arrays.stream(CitationPayload.class.getRecordComponents())
             .map(rc -> {
                 JsonProperty ann = rc.getAccessor().getAnnotation(JsonProperty.class);

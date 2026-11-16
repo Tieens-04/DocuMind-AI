@@ -87,6 +87,30 @@ public class DocumentChunkVectorRepository {
             .list();
     }
 
+    /**
+     * Runs PostgreSQL {@code EXPLAIN} on an RBAC-filtered cosine-distance top-K query against {@code document_chunks}.
+     */
+    public List<String> explainFilteredCosineSearch(UUID departmentId, float[] queryVector, int limit) {
+        Objects.requireNonNull(departmentId, "departmentId must not be null");
+        if (limit < 1) {
+            throw new IllegalArgumentException("limit must be >= 1");
+        }
+        String vectorLiteral = PgVectorLiterals.toNonZeroFiniteVectorLiteral(queryVector, "queryVector");
+        return jdbcClient().sql("""
+                EXPLAIN
+                SELECT id
+                FROM document_chunks
+                WHERE (metadata->>'access_level' = 'PUBLIC' OR metadata->>'department_id' = :departmentId)
+                ORDER BY embedding <=> CAST(:vec AS vector)
+                LIMIT :limit
+                """)
+            .param("departmentId", departmentId.toString())
+            .param("vec", vectorLiteral)
+            .param("limit", limit)
+            .query(String.class)
+            .list();
+    }
+
     private JdbcClient jdbcClient() {
         return jdbcClientSupplier.get();
     }

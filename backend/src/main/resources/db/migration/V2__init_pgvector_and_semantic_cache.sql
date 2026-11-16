@@ -15,30 +15,24 @@ CREATE TABLE document_chunks (
     content     TEXT                NOT NULL,
     metadata    JSONB               NOT NULL DEFAULT '{}'::jsonb,
     embedding   public.vector(1024) NOT NULL,
-    created_at  TIMESTAMPTZ         NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    CONSTRAINT chk_document_chunks_rbac_metadata CHECK (
-        NULLIF(BTRIM(metadata->>'document_id'), '') IS NOT NULL
-        AND NULLIF(BTRIM(metadata->>'department_id'), '') IS NOT NULL
-        AND NULLIF(BTRIM(metadata->>'file_name'), '') IS NOT NULL
-        AND (metadata->>'access_level') IN ('PUBLIC', 'DEPARTMENT', 'CONFIDENTIAL')
-    )
+    created_at  TIMESTAMPTZ         NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
 CREATE OR REPLACE FUNCTION sync_document_chunk_metadata()
 RETURNS TRIGGER AS $$
 BEGIN
     IF NEW.metadata IS NOT NULL THEN
-        IF TG_OP = 'UPDATE' OR NULLIF(BTRIM(NEW.metadata->>'document_id'), '') IS NOT NULL THEN
-            NEW.document_id := NULLIF(BTRIM(NEW.metadata->>'document_id'), '')::uuid;
+        IF NULLIF(NEW.metadata->>'document_id', '') IS NOT NULL THEN
+            NEW.document_id := (NEW.metadata->>'document_id')::uuid;
         END IF;
-        IF TG_OP = 'UPDATE' OR NEW.metadata ? 'doc_version' THEN
-            NEW.doc_version := COALESCE(NULLIF(BTRIM(NEW.metadata->>'doc_version'), '')::int, 1);
+        IF NULLIF(NEW.metadata->>'doc_version', '') IS NOT NULL THEN
+            NEW.doc_version := (NEW.metadata->>'doc_version')::int;
         END IF;
-        IF TG_OP = 'UPDATE' OR NEW.metadata ? 'chunk_index' THEN
-            NEW.chunk_index := COALESCE(NULLIF(BTRIM(NEW.metadata->>'chunk_index'), '')::int, 0);
+        IF NULLIF(NEW.metadata->>'chunk_index', '') IS NOT NULL THEN
+            NEW.chunk_index := (NEW.metadata->>'chunk_index')::int;
         END IF;
-        IF TG_OP = 'UPDATE' OR NEW.metadata ? 'page_number' THEN
-            NEW.page_number := NULLIF(BTRIM(NEW.metadata->>'page_number'), '')::int;
+        IF NULLIF(NEW.metadata->>'page_number', '') IS NOT NULL THEN
+            NEW.page_number := (NEW.metadata->>'page_number')::int;
         END IF;
     END IF;
     RETURN NEW;
@@ -69,8 +63,7 @@ CREATE TABLE semantic_cache (
     model_provider   VARCHAR(64),
     hit_count        INT                 NOT NULL DEFAULT 0 CONSTRAINT chk_semantic_cache_hit_count CHECK (hit_count >= 0),
     created_at       TIMESTAMPTZ         NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    expires_at       TIMESTAMPTZ,
-    CONSTRAINT uq_semantic_cache_scope_hash UNIQUE (rbac_scope, scope_version, query_hash)
+    expires_at       TIMESTAMPTZ
 );
 
 CREATE INDEX idx_semantic_cache_embedding_hnsw
