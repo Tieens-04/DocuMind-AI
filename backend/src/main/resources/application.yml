@@ -1,5 +1,7 @@
 server:
   port: ${SERVER_PORT:8081}
+  tomcat:
+    max-swallow-size: 64MB
 
 spring:
   application:
@@ -7,6 +9,11 @@ spring:
   threads:
     virtual:
       enabled: true
+  servlet:
+    multipart:
+      max-file-size: 50MB
+      max-request-size: 52MB
+      file-size-threshold: 2MB
   config:
     import: optional:file:.env[.properties],optional:file:../.env[.properties]
   datasource:
@@ -78,6 +85,9 @@ springdoc:
     path: /swagger-ui.html
 
 documind:
+  security:
+    dev-caller-fallback:
+      enabled: false
   ai:
     gemini:
       base-url: ${GEMINI_BASE_URL:https://generativelanguage.googleapis.com/v1beta/openai}
@@ -91,3 +101,5 @@ documind:
     secret-key: ${MINIO_ROOT_PASSWORD:documind_minio_secret}
     bucket: ${MINIO_BUCKET:documind-documents}
     region: ${MINIO_REGION:us-east-1}
+    upload-timeout: 60s
+    presigned-expiry: 15m
