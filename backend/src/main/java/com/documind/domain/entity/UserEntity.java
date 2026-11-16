@@ -6,15 +6,16 @@ import jakarta.persistence.Entity;
 import jakarta.persistence.EnumType;
 import jakarta.persistence.Enumerated;
 import jakarta.persistence.FetchType;
-import jakarta.persistence.GeneratedValue;
-import jakarta.persistence.GenerationType;
 import jakarta.persistence.Id;
 import jakarta.persistence.JoinColumn;
 import jakarta.persistence.ManyToOne;
+import jakarta.persistence.PostLoad;
+import jakarta.persistence.PostPersist;
 import jakarta.persistence.PrePersist;
 import jakarta.persistence.PreUpdate;
 import jakarta.persistence.Table;
-import org.hibernate.Hibernate;
+import jakarta.persistence.Transient;
+import org.springframework.data.domain.Persistable;
 
 import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
@@ -26,12 +27,15 @@ import java.util.UUID;
  */
 @Entity
 @Table(name = "users")
-public class UserEntity {
+public class UserEntity implements Persistable<UUID> {
 
     @Id
-    @GeneratedValue(strategy = GenerationType.UUID)
+    @AssignedOrRandomUuid
     @Column(name = "id", nullable = false, updatable = false)
     private UUID id;
+
+    @Transient
+    private boolean isNew = true;
 
     @ManyToOne(fetch = FetchType.LAZY, optional = false)
     @JoinColumn(name = "department_id", nullable = false)
@@ -40,7 +44,7 @@ public class UserEntity {
     @Column(name = "department_id", nullable = false, insertable = false, updatable = false)
     private UUID departmentId;
 
-    @Column(name = "email", nullable = false, unique = true, length = 255)
+    @Column(name = "email", nullable = false, length = 255)
     private String email;
 
     @Column(name = "password_hash", nullable = false, length = 255)
@@ -81,6 +85,18 @@ public class UserEntity {
         updatedAt = OffsetDateTime.now(ZoneOffset.UTC);
     }
 
+    @PostPersist
+    @PostLoad
+    void markPersisted() {
+        this.isNew = false;
+    }
+
+    @Override
+    public boolean isNew() {
+        return isNew;
+    }
+
+    @Override
     public UUID getId() {
         return id;
     }
@@ -95,11 +111,11 @@ public class UserEntity {
 
     public void setDepartment(DepartmentEntity department) {
         this.department = department;
-        this.departmentId = department != null ? department.getId() : null;
+        this.departmentId = JpaProxyUtils.extractId(department);
     }
 
     public UUID getDepartmentId() {
-        return departmentId != null ? departmentId : (department != null ? department.getId() : null);
+        return departmentId != null ? departmentId : JpaProxyUtils.extractId(department);
     }
 
     public String getEmail() {
@@ -167,16 +183,18 @@ public class UserEntity {
         if (this == o) {
             return true;
         }
-        if (o == null || Hibernate.getClass(this) != Hibernate.getClass(o)) {
+        if (o == null || JpaProxyUtils.effectiveClass(this) != JpaProxyUtils.effectiveClass(o)) {
             return false;
         }
         UserEntity that = (UserEntity) o;
-        return id != null && Objects.equals(id, that.getId());
+        UUID thisId = JpaProxyUtils.extractId(this);
+        UUID thatId = JpaProxyUtils.extractId(that);
+        return thisId != null && Objects.equals(thisId, thatId);
     }
 
     @Override
     public int hashCode() {
-        return Hibernate.getClass(this).hashCode();
+        return JpaProxyUtils.effectiveClass(this).hashCode();
     }
 
     @Override

@@ -15,15 +15,18 @@ import org.springframework.core.env.Environment;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.test.context.ActiveProfiles;
 import org.springframework.transaction.support.TransactionTemplate;
 
 import java.net.URI;
 import java.util.List;
 import java.util.Locale;
+import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
+@ActiveProfiles("dev")
 @EnabledIfSystemProperty(named = "smoke", matches = "true")
 class Day1InfrastructureAndAiSmokeTest {
 
@@ -145,7 +148,7 @@ class Day1InfrastructureAndAiSmokeTest {
     }
 
     @Test
-    void livePostgresAppliesFlywayV1ToV3AndCreatesAllNineTables() {
+    void livePostgresAppliesFlywayV1ToV6AndCreatesAllNineTables() {
         Integer failedMigrations = jdbcTemplate.queryForObject(
             "SELECT COUNT(*) FROM flyway_schema_history WHERE success = false",
             Integer.class
@@ -156,7 +159,7 @@ class Day1InfrastructureAndAiSmokeTest {
             "SELECT version FROM flyway_schema_history WHERE success = true AND version IS NOT NULL AND version <> '0' ORDER BY installed_rank",
             String.class
         );
-        assertThat(versions).containsSubsequence("1", "2", "3");
+        assertThat(versions).containsSubsequence("1", "2", "3", "4", "5", "6");
 
         List<String> tables = jdbcTemplate.queryForList(
             "SELECT table_name FROM information_schema.tables WHERE table_schema = 'public' AND table_type = 'BASE TABLE'",
@@ -205,6 +208,12 @@ class Day1InfrastructureAndAiSmokeTest {
 
             String fullPlan = String.join("\n", planLines);
             assertThat(fullPlan).contains("Index Scan using idx_document_chunks_embedding_hnsw");
+
+            UUID itDepartmentId = UUID.fromString("11111111-1111-1111-1111-111111111111");
+            List<String> filteredPlanLines = chunkVectorRepository.explainFilteredCosineSearch(itDepartmentId, queryVector, 5);
+            assertThat(filteredPlanLines).isNotEmpty();
+            filteredPlanLines.forEach(line -> System.out.println("[SMOKE][EXPLAIN-FILTERED] " + line));
+            assertThat(String.join("\n", filteredPlanLines)).contains("Index Scan using idx_document_chunks_embedding_hnsw");
         });
     }
 }

@@ -8,16 +8,17 @@ import jakarta.persistence.Entity;
 import jakarta.persistence.EnumType;
 import jakarta.persistence.Enumerated;
 import jakarta.persistence.FetchType;
-import jakarta.persistence.GeneratedValue;
-import jakarta.persistence.GenerationType;
 import jakarta.persistence.Id;
 import jakarta.persistence.JoinColumn;
 import jakarta.persistence.ManyToOne;
+import jakarta.persistence.PostLoad;
+import jakarta.persistence.PostPersist;
 import jakarta.persistence.PrePersist;
 import jakarta.persistence.Table;
-import org.hibernate.Hibernate;
+import jakarta.persistence.Transient;
 import org.hibernate.annotations.JdbcTypeCode;
 import org.hibernate.type.SqlTypes;
+import org.springframework.data.domain.Persistable;
 
 import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
@@ -31,12 +32,15 @@ import java.util.UUID;
  */
 @Entity
 @Table(name = "chat_messages")
-public class ChatMessageEntity {
+public class ChatMessageEntity implements Persistable<UUID> {
 
     @Id
-    @GeneratedValue(strategy = GenerationType.UUID)
+    @AssignedOrRandomUuid
     @Column(name = "id", nullable = false, updatable = false)
     private UUID id;
+
+    @Transient
+    private boolean isNew = true;
 
     @ManyToOne(fetch = FetchType.LAZY, optional = false)
     @JoinColumn(name = "session_id", nullable = false)
@@ -103,6 +107,18 @@ public class ChatMessageEntity {
         }
     }
 
+    @PostPersist
+    @PostLoad
+    void markPersisted() {
+        this.isNew = false;
+    }
+
+    @Override
+    public boolean isNew() {
+        return isNew;
+    }
+
+    @Override
     public UUID getId() {
         return id;
     }
@@ -117,11 +133,11 @@ public class ChatMessageEntity {
 
     public void setSession(ChatSessionEntity session) {
         this.session = session;
-        this.sessionId = session != null ? session.getId() : null;
+        this.sessionId = JpaProxyUtils.extractId(session);
     }
 
     public UUID getSessionId() {
-        return sessionId != null ? sessionId : (session != null ? session.getId() : null);
+        return sessionId != null ? sessionId : JpaProxyUtils.extractId(session);
     }
 
     public MessageRole getRole() {
@@ -221,16 +237,18 @@ public class ChatMessageEntity {
         if (this == o) {
             return true;
         }
-        if (o == null || Hibernate.getClass(this) != Hibernate.getClass(o)) {
+        if (o == null || JpaProxyUtils.effectiveClass(this) != JpaProxyUtils.effectiveClass(o)) {
             return false;
         }
         ChatMessageEntity that = (ChatMessageEntity) o;
-        return id != null && Objects.equals(id, that.getId());
+        UUID thisId = JpaProxyUtils.extractId(this);
+        UUID thatId = JpaProxyUtils.extractId(that);
+        return thisId != null && Objects.equals(thisId, thatId);
     }
 
     @Override
     public int hashCode() {
-        return Hibernate.getClass(this).hashCode();
+        return JpaProxyUtils.effectiveClass(this).hashCode();
     }
 
     @Override

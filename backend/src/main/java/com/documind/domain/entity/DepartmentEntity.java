@@ -2,13 +2,14 @@ package com.documind.domain.entity;
 
 import jakarta.persistence.Column;
 import jakarta.persistence.Entity;
-import jakarta.persistence.GeneratedValue;
-import jakarta.persistence.GenerationType;
 import jakarta.persistence.Id;
+import jakarta.persistence.PostLoad;
+import jakarta.persistence.PostPersist;
 import jakarta.persistence.PrePersist;
 import jakarta.persistence.PreUpdate;
 import jakarta.persistence.Table;
-import org.hibernate.Hibernate;
+import jakarta.persistence.Transient;
+import org.springframework.data.domain.Persistable;
 
 import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
@@ -20,14 +21,17 @@ import java.util.UUID;
  */
 @Entity
 @Table(name = "departments")
-public class DepartmentEntity {
+public class DepartmentEntity implements Persistable<UUID> {
 
     @Id
-    @GeneratedValue(strategy = GenerationType.UUID)
+    @AssignedOrRandomUuid
     @Column(name = "id", nullable = false, updatable = false)
     private UUID id;
 
-    @Column(name = "code", nullable = false, unique = true, length = 32)
+    @Transient
+    private boolean isNew = true;
+
+    @Column(name = "code", nullable = false, length = 32)
     private String code;
 
     @Column(name = "name", nullable = false, length = 120)
@@ -64,6 +68,18 @@ public class DepartmentEntity {
         updatedAt = OffsetDateTime.now(ZoneOffset.UTC);
     }
 
+    @PostPersist
+    @PostLoad
+    void markPersisted() {
+        this.isNew = false;
+    }
+
+    @Override
+    public boolean isNew() {
+        return isNew;
+    }
+
+    @Override
     public UUID getId() {
         return id;
     }
@@ -125,16 +141,18 @@ public class DepartmentEntity {
         if (this == o) {
             return true;
         }
-        if (o == null || Hibernate.getClass(this) != Hibernate.getClass(o)) {
+        if (o == null || JpaProxyUtils.effectiveClass(this) != JpaProxyUtils.effectiveClass(o)) {
             return false;
         }
         DepartmentEntity that = (DepartmentEntity) o;
-        return id != null && Objects.equals(id, that.getId());
+        UUID thisId = JpaProxyUtils.extractId(this);
+        UUID thatId = JpaProxyUtils.extractId(that);
+        return thisId != null && Objects.equals(thisId, thatId);
     }
 
     @Override
     public int hashCode() {
-        return Hibernate.getClass(this).hashCode();
+        return JpaProxyUtils.effectiveClass(this).hashCode();
     }
 
     @Override

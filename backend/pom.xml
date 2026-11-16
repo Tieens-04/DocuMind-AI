@@ -101,6 +101,7 @@
             <groupId>org.flywaydb</groupId>
             <artifactId>flyway-database-postgresql</artifactId>
         </dependency>
+        <!-- Compile scope required: com.pgvector.PGvector extends org.postgresql.util.PGobject / PGBinaryObject -->
         <dependency>
             <groupId>org.postgresql</groupId>
             <artifactId>postgresql</artifactId>

@@ -14,19 +14,23 @@ spring:
     username: ${POSTGRES_USER:documind}
     password: ${POSTGRES_PASSWORD:documind_secret}
     driver-class-name: org.postgresql.Driver
+    hikari:
+      # Session-level init SQL requires session pooling; switch to transaction-scoped SET LOCAL if behind PgBouncer transaction pooling
+      connection-init-sql: SET hnsw.iterative_scan = 'relaxed_order'
   jpa:
     open-in-view: false
     hibernate:
       ddl-auto: validate
   flyway:
     enabled: true
-    locations: classpath:db/migration,classpath:db/seed
-    baseline-on-migrate: true
-    baseline-version: 0
+    locations: classpath:db/migration
+    baseline-on-migrate: false
   data:
     redis:
       host: ${REDIS_HOST:localhost}
       port: ${REDIS_PORT:6380}
+      repositories:
+        enabled: false
   ai:
     model:
       chat: openai

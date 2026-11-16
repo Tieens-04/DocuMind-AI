@@ -3,9 +3,11 @@ package com.documind.infrastructure.vector;
 import com.pgvector.PGvector;
 
 /**
- * Validation and formatting helper for non-zero, finite {@code pgvector} parameter literals.
+ * Validation and formatting helper for 1024-dimensional, non-zero, finite {@code pgvector} parameter literals.
  */
 final class PgVectorLiterals {
+
+    static final int EXPECTED_DIMENSIONS = 1024;
 
     private PgVectorLiterals() {
     }
@@ -14,6 +16,11 @@ final class PgVectorLiterals {
         String label = (paramName == null || paramName.isBlank()) ? "vector" : paramName;
         if (vector == null || vector.length == 0) {
             throw new IllegalArgumentException(label + " must not be null or empty");
+        }
+        if (vector.length != EXPECTED_DIMENSIONS) {
+            throw new IllegalArgumentException(
+                label + " must have exactly " + EXPECTED_DIMENSIONS + " dimensions, but got " + vector.length
+            );
         }
         double normSquared = 0.0d;
         for (int i = 0; i < vector.length; i++) {

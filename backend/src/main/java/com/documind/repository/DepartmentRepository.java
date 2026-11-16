@@ -5,6 +5,7 @@ import org.springframework.data.jpa.repository.JpaRepository;
 import org.springframework.data.jpa.repository.Modifying;
 import org.springframework.data.jpa.repository.Query;
 import org.springframework.data.repository.query.Param;
+import org.springframework.transaction.annotation.Transactional;
 
 import java.util.Optional;
 import java.util.UUID;
@@ -14,14 +15,28 @@ import java.util.UUID;
  */
 public interface DepartmentRepository extends JpaRepository<DepartmentEntity, UUID> {
 
-    Optional<DepartmentEntity> findByCodeIgnoreCase(String code);
+    @Query("SELECT d FROM DepartmentEntity d WHERE LOWER(d.code) = LOWER(:code)")
+    Optional<DepartmentEntity> findByCodeIgnoreCase(@Param("code") String code);
 
+    @Transactional
     @Modifying(clearAutomatically = true, flushAutomatically = true)
     @Query("UPDATE DepartmentEntity d SET d.cacheVersion = d.cacheVersion + 1 WHERE d.id = :id")
     int incrementCacheVersion(@Param("id") UUID id);
 
+    @Transactional
     @Modifying(clearAutomatically = true, flushAutomatically = true)
-    @Query("UPDATE DepartmentEntity d SET d.cacheVersion = d.cacheVersion + 1")
+    @Query(
+        value = """
+            WITH locked AS (
+                SELECT id FROM departments ORDER BY id FOR NO KEY UPDATE
+            )
+            UPDATE departments d
+            SET cache_version = d.cache_version + 1
+            FROM locked
+            WHERE d.id = locked.id
+            """,
+        nativeQuery = true
+    )
     int incrementAllCacheVersions();
 
     @Query("SELECT COALESCE(SUM(d.cacheVersion), 0) FROM DepartmentEntity d")

@@ -23,13 +23,21 @@ import java.util.List;
 public class PostgresTestcontainersConfig {
 
     public static final int EMBEDDING_DIMENSIONS = 1024;
+    public static final String PGVECTOR_IMAGE =
+        "pgvector/pgvector:pg16@sha256:484e838076e04939d27d3e176e91c86eea96236126023be8d3059761122e579f";
 
-    @Bean
+    private static final PostgreSQLContainer<?> SHARED_POSTGRES = new PostgreSQLContainer<>(
+        DockerImageName.parse(PGVECTOR_IMAGE).asCompatibleSubstituteFor("postgres")
+    );
+
+    static {
+        SHARED_POSTGRES.start();
+    }
+
+    @Bean(destroyMethod = "")
     @ServiceConnection
     PostgreSQLContainer<?> postgresContainer() {
-        return new PostgreSQLContainer<>(
-            DockerImageName.parse("pgvector/pgvector:pg16").asCompatibleSubstituteFor("postgres")
-        );
+        return SHARED_POSTGRES;
     }
 
     @Bean
