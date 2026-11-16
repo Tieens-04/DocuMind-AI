@@ -10,6 +10,7 @@ import com.documind.domain.entity.UserEntity;
 import com.documind.domain.enums.AccessLevel;
 import com.documind.domain.enums.AuditActionType;
 import com.documind.domain.enums.DocumentStatus;
+import com.documind.domain.enums.Role;
 import com.documind.domain.event.DocumentUploadedEvent;
 import com.documind.exception.DocumentAccessDeniedException;
 import com.documind.exception.DocumentNotFoundException;
@@ -46,7 +47,8 @@ import java.util.concurrent.TimeUnit;
 import java.util.function.Supplier;
 
 /**
- * Coordinates two-phase non-transactional MinIO S3 streaming and short atomic DB commits for document CRUD.
+ * Coordinates two-phase non-transactional MinIO S3 streaming and short atomic DB commits for document CRUD
+ * with server-enforced department and role authorization.
  */
 @Service
 public class DocumentService {
@@ -139,21 +141,38 @@ public class DocumentService {
     }
 
     /**
-     * Validates and streams an uploaded document to MinIO outside any DB transaction,
+     * Validates RBAC permissions and streams an uploaded document to MinIO outside any DB transaction,
      * then commits metadata, cache invalidation, audit log, and {@link DocumentUploadedEvent} atomically.
      */
     public DocumentResponse uploadDocument(MultipartFile file, AccessLevel accessLevel, CallerContext caller) {
+        return uploadDocument(file, accessLevel, null, caller);
+    }
+
+    /**
+     * Validates RBAC permissions (including optional target department for {@code SYSTEM_ADMIN})
+     * and executes two-phase streaming upload + atomic metadata persistence.
+     */
+    public DocumentResponse uploadDocument(
+        MultipartFile file,
+        AccessLevel accessLevel,
+        UUID targetDepartmentId,
+        CallerContext caller
+    ) {
         long startedAtNanos = System.nanoTime();
-        requireCallerWithDepartment(caller);
+        requireCaller(caller);
+        if (!caller.canManageDocuments()) {
+            throw new DocumentAccessDeniedException("Insufficient permissions to upload documents");
+        }
+        UUID effectiveDepartmentId = resolveUploadDepartmentId(targetDepartmentId, caller);
         if (file == null) {
             throw new InvalidDocumentRequestException("Uploaded file must not be null");
         }
         AccessLevel effectiveAccessLevel = accessLevel != null ? accessLevel : AccessLevel.DEPARTMENT;
 
         // Pre-check outside Phase 2 transaction so zero DB connections are held during S3 I/O
-        DepartmentEntity department = departmentRepository().findById(caller.departmentId())
-            .orElseThrow(() -> new ResourceNotFoundException("Department not found: " + caller.departmentId()));
-        UserEntity uploadedBy = resolveOptionalUploader(caller.userId());
+        DepartmentEntity department = departmentRepository().findById(effectiveDepartmentId)
+            .orElseThrow(() -> new ResourceNotFoundException("Department not found: " + effectiveDepartmentId));
+        UserEntity uploadedBy = resolveVerifiedActor(caller, department.getId());
 
         // Phase 1: Validate bounded 64 KiB header and stream once through SHA-256 + 50 MiB guard into MinIO
         StagedUpload stagedUpload = streamToStorage(file, department.getId());
@@ -188,7 +207,8 @@ public class DocumentService {
     }
 
     /**
-     * Returns paginated documents filtered by optional department, status, and access level.
+     * Returns paginated documents scoped by caller visibility ({@code PUBLIC} or own department for non-admins)
+     * intersected with optional filters.
      */
     public PageResponse<DocumentResponse> listDocuments(
         UUID filterDepartmentId,
@@ -199,6 +219,7 @@ public class DocumentService {
         CallerContext caller
     ) {
         requireCaller(caller);
+        requireCallerDepartment(caller);
         if (page < 0) {
             throw new InvalidDocumentRequestException("Page index must be >= 0");
         }
@@ -206,13 +227,16 @@ public class DocumentService {
             throw new InvalidDocumentRequestException("Page size must be between 1 and " + MAX_PAGE_SIZE);
         }
 
-        UUID effectiveDepartmentId = filterDepartmentId != null
-            ? filterDepartmentId
-            : (caller.explicitDepartment() ? caller.departmentId() : null);
-
         PageRequest pageable = PageRequest.of(page, size, Sort.by(Sort.Direction.DESC, "createdAt"));
         Page<DocumentResponse> mapped = documentRepository()
-            .findAllFiltered(effectiveDepartmentId, status, accessLevel, pageable)
+            .findAllVisible(
+                caller.departmentId(),
+                caller.isSystemAdmin(),
+                filterDepartmentId,
+                status,
+                accessLevel,
+                pageable
+            )
             .map(DocumentResponse::from);
         return PageResponse.from(mapped);
     }
@@ -225,13 +249,14 @@ public class DocumentService {
             throw new InvalidDocumentRequestException("Document ID must not be null");
         }
         requireCaller(caller);
+        requireCallerDepartment(caller);
 
         DocumentEntity document = documentRepository().findById(documentId)
             .orElseThrow(() -> new DocumentNotFoundException(documentId));
-        if (isCrossDepartmentCaller(document, caller) && document.getAccessLevel() != AccessLevel.PUBLIC) {
-            throw new DocumentAccessDeniedException(
-                "Access denied to document " + documentId + " from department " + caller.departmentId()
-            );
+        if (!caller.isSystemAdmin()
+            && !Objects.equals(caller.departmentId(), document.getDepartmentId())
+            && document.getAccessLevel() != AccessLevel.PUBLIC) {
+            throw new DocumentAccessDeniedException("You do not have permission to access this document");
         }
         return DocumentStatusResponse.from(document);
     }
@@ -246,14 +271,16 @@ public class DocumentService {
             throw new InvalidDocumentRequestException("Document ID must not be null");
         }
         requireCaller(caller);
+        if (!caller.canManageDocuments()) {
+            throw new DocumentAccessDeniedException("Insufficient permissions to delete documents");
+        }
+        requireCallerDepartment(caller);
 
         transactionTemplate().executeWithoutResult(status -> {
             DocumentEntity document = documentRepository().findById(documentId)
                 .orElseThrow(() -> new DocumentNotFoundException(documentId));
-            if (isCrossDepartmentCaller(document, caller)) {
-                throw new DocumentAccessDeniedException(
-                    "Cannot delete document " + documentId + " owned by another department"
-                );
+            if (!caller.isSystemAdmin() && !Objects.equals(caller.departmentId(), document.getDepartmentId())) {
+                throw new DocumentAccessDeniedException("You do not have permission to delete this document");
             }
 
             String storageKey = document.getStorageKey();
@@ -261,7 +288,7 @@ public class DocumentService {
             DepartmentEntity department = document.getDepartment();
             AccessLevel accessLevel = document.getAccessLevel();
             String originalName = document.getOriginalName();
-            UserEntity auditUser = resolveOptionalUploader(caller.userId());
+            UserEntity auditUser = resolveVerifiedActor(caller, documentDepartmentId);
 
             documentRepository().delete(document);
             saveAuditLog(
@@ -288,6 +315,19 @@ public class DocumentService {
                 }
             });
         });
+    }
+
+    private UUID resolveUploadDepartmentId(UUID targetDepartmentId, CallerContext caller) {
+        if (targetDepartmentId != null) {
+            if (!caller.isSystemAdmin() && !Objects.equals(targetDepartmentId, caller.departmentId())) {
+                throw new DocumentAccessDeniedException("Cannot upload documents into another department");
+            }
+            return targetDepartmentId;
+        }
+        if (caller.departmentId() == null) {
+            throw new InvalidDocumentRequestException("Caller departmentId must not be null");
+        }
+        return caller.departmentId();
     }
 
     private StagedUpload streamToStorage(MultipartFile file, UUID departmentId) {
@@ -397,11 +437,12 @@ public class DocumentService {
         return DocumentResponse.from(saved);
     }
 
-    private UserEntity resolveOptionalUploader(UUID userId) {
+    private UserEntity resolveVerifiedActor(CallerContext caller, UUID targetDepartmentId) {
+        UUID userId = caller.userId();
         if (userId == null) {
             return null;
         }
-        return userRepository().findById(userId)
+        UserEntity user = userRepository().findById(userId)
             .orElseGet(() -> {
                 if (!environment.acceptsProfiles(Profiles.of("prod"))
                     && DevFallbackCallerContextResolver.DEFAULT_DEV_USER_ID.equals(userId)) {
@@ -409,6 +450,18 @@ public class DocumentService {
                 }
                 throw new ResourceNotFoundException("User not found: " + userId);
             });
+        if (user == null) {
+            return null;
+        }
+        if (!user.isActive()) {
+            throw new DocumentAccessDeniedException("User account is inactive");
+        }
+        if (!caller.isSystemAdmin()
+            && user.getRole() != Role.SYSTEM_ADMIN
+            && !Objects.equals(user.getDepartmentId(), targetDepartmentId)) {
+            throw new DocumentAccessDeniedException("Caller user does not belong to target department");
+        }
+        return user;
     }
 
     private void incrementCacheVersion(AccessLevel accessLevel, UUID departmentId) {
@@ -450,19 +503,14 @@ public class DocumentService {
         return trimmed.length() > MAX_IP_LENGTH ? trimmed.substring(0, MAX_IP_LENGTH) : trimmed;
     }
 
-    private static boolean isCrossDepartmentCaller(DocumentEntity document, CallerContext caller) {
-        return caller.explicitDepartment() && !Objects.equals(caller.departmentId(), document.getDepartmentId());
-    }
-
     private static void requireCaller(CallerContext caller) {
-        if (caller == null) {
-            throw new InvalidDocumentRequestException("Caller context must not be null");
+        if (caller == null || caller.role() == null) {
+            throw new InvalidDocumentRequestException("Caller context and role must not be null");
         }
     }
 
-    private static void requireCallerWithDepartment(CallerContext caller) {
-        requireCaller(caller);
-        if (caller.departmentId() == null) {
+    private static void requireCallerDepartment(CallerContext caller) {
+        if (!caller.isSystemAdmin() && caller.departmentId() == null) {
             throw new InvalidDocumentRequestException("Caller departmentId must not be null");
         }
     }

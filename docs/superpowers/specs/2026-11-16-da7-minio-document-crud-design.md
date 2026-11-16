@@ -41,17 +41,17 @@ Implement zero-Heap-bloat MinIO S3 streaming (`<= 50 MiB`), single-pass `SHA-256
   - Size bounds: `0` bytes -> `400 Bad Request`; `> 52,428,800` bytes (`50 MiB`) -> `413 Payload Too Large`.
   - Extension-to-content rules (using Tika `DefaultDetector` on `headerBytes` **without** filename hints so extension spoofing cannot influence Tika):
     - **`pdf`:** Tika media type must equal `application/pdf` and header must start with `%PDF-`. Stored `mimeType = "application/pdf"`.
-    - **`docx`:** Header must start with `PK\x03\x04`, Tika media type must be `application/zip`, `application/x-tika-ooxml`, or `application/vnd.openxmlformats-officedocument.wordprocessingml.document`, AND iterating local entries via `ZipInputStream(new ByteArrayInputStream(headerBytes))` must encounter at least one OOXML entry (`[Content_Types].xml`, `_rels/.rels`, or prefix `word/`, `docProps/`) with zero `..` path-traversal segments. Stored `mimeType = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"`.
+    - **`docx`:** Header must start with `PK\x03\x04`, Tika media type must be `application/zip`, `application/x-tika-ooxml`, or `application/vnd.openxmlformats-officedocument.wordprocessingml.document`, AND iterating local entries via `ZipInputStream(new ByteArrayInputStream(headerBytes))` must have zero `".."` path-traversal segments, reject any `xl/` or `ppt/` entries (`spreadsheetml`/`presentationml` in `[Content_Types].xml`), and encounter a WordprocessingML marker (`word/` entry or `wordprocessingml.document` / `/word/` in `[Content_Types].xml`). Full-stream ZIP-bomb inflation ratio (`ZipSecureFile`) bounds are enforced downstream in `DA-8`. Stored `mimeType = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"`.
     - **`txt` / `md`:** Header must contain zero `0x00` null bytes, and Tika media type must have `type = "text"` (rejecting `application/pdf`, `image/*`, `application/zip`, `application/x-msdownload`, `application/octet-stream` binary signatures, etc.). Stored `mimeType = "text/plain"` for `txt` and `"text/markdown"` for `md`.
 
-### 2.3 Pre-JWT `CallerContextResolver` Seam (`DA-7` -> `DA-12`/`DA-13`)
-- Defines `CallerContext(UUID departmentId, UUID userId, boolean explicitDepartment, String ipAddress)` and interface `CallerContextResolver`.
-- `DevFallbackCallerContextResolver` (active until `DA-12` introduces `SecurityContextCallerContextResolver`):
-  - **Department resolution priority:** request parameter `departmentId` -> header `X-Department-Id` -> (when active profiles do NOT include `prod`) seeded `V3` `IT` department `11111111-1111-1111-1111-111111111111`. In `prod` with neither parameter nor header, throws `InvalidDocumentRequestException` (`400 Bad Request`).
-  - **User resolution priority:** header `X-User-Id` -> (when non-`prod` and seeded Admin `aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa` exists) seeded Admin UUID, else `null`.
-  - **Ownership guard (`GET /{id}/status` & `DELETE /{id}`):** When caller explicitly passes `X-Department-Id` (or `departmentId`) that differs from `document.getDepartmentId()`:
-    - `DELETE /{id}` -> `403 Forbidden` (`DocumentAccessDeniedException`).
-    - `GET /{id}/status` -> allowed if `document.getAccessLevel() == AccessLevel.PUBLIC`, otherwise `403 Forbidden`.
+### 2.3 Profile-Isolated `CallerContextResolver` Seam (`DA-7` -> `DA-12`/`DA-13`)
+- Defines `CallerContext(UUID userId, UUID departmentId, Role role, String ipAddress)` and interface `CallerContextResolver.resolve(HttpServletRequest)`.
+- **`DevFallbackCallerContextResolver` (`@Profile("!prod")`):** Active strictly outside `prod` until `DA-12` introduces `SecurityContextCallerContextResolver`. Resolves `X-Department-Id`, `X-User-Id` (looking up seeded/DB user's department and role when present), and `X-User-Role`, defaulting to seeded `IT` (`11111111-...`), `admin` (`aaaaaaaa-...` when targeting `IT`), and `Role.DEPARTMENT_MANAGER`.
+- **`ProdCallerContextResolver` (`@Profile("prod")`):** Fail-closed resolver ignoring all untrusted client headers/params and throwing `AuthenticationRequiredException` (`401 Unauthorized`) until `DA-12` wires JWT authentication.
+- **Server-Side RBAC Guards:**
+  - `POST /upload` & `DELETE /{id}`: require `DEPARTMENT_MANAGER` or `SYSTEM_ADMIN` (`STANDARD_EMPLOYEE` -> `403`). Managers cannot upload to or delete another department's documents (`targetDepartmentId` is restricted to `SYSTEM_ADMIN` or caller's own department). Active user & department membership are verified on DB actors.
+  - `GET /api/v1/documents`: non-admin scope is always enforced server-side as `(access_level = 'PUBLIC' OR department_id = <caller.departmentId>)` intersected with optional filters (`filterDepartmentId` can narrow, never widen).
+  - `GET /{id}/status` & `DELETE /{id}`: cross-department access returns `403 Forbidden` with sanitized detail (never exposing UUIDs or department IDs), except `PUBLIC` status reads.
 
 ### 2.4 Post-Commit MinIO Deletion & Presigned Inline URLs
 - **Delete (`DELETE /api/v1/documents/{id}`):** Inside `TransactionTemplate`, verify existence (`404`) and department ownership (`403`), increment `departments.cache_version` (`incrementAllCacheVersions()` if `PUBLIC`, else `incrementCacheVersion(deptId)`), insert `AuditLogEntity(DOC_DELETE)`, delete `DocumentEntity` (`ON DELETE CASCADE` purges `document_chunks`), and register `TransactionSynchronization.afterCommit(() -> minioStorageService.deleteObjectQuietly(storageKey))`. If DB rolls back, the MinIO object stays intact.
@@ -111,17 +111,18 @@ backend/src/main/java/com/documind/
 
 | Method & Path | Query / Multipart / Header Inputs | Success Status & Body |
 | :--- | :--- | :--- |
-| `POST /api/v1/documents/upload` | `multipart/form-data`: `file` (required), `accessLevel` (optional, default `DEPARTMENT`), `departmentId` (optional `UUID`); headers `X-Department-Id`, `X-User-Id` (optional) | `202 Accepted` — `DocumentResponse` (`status = "PENDING"`, `fileHash`, `fileSizeBytes`, `mimeType`, `fileExtension`, `currentVersion = 1`, `chunkCount = 0`) |
-| `GET /api/v1/documents` | Query: `departmentId` (optional `UUID`), `status` (optional `DocumentStatus`), `accessLevel` (optional `AccessLevel`), `page` (default `0`), `size` (default `20`, max `100`); header `X-Department-Id` (optional) | `200 OK` — `PageResponse<DocumentResponse>` sorted by `createdAt DESC` |
-| `GET /api/v1/documents/{id}/status` | Path: `id` (`UUID`); optional header `X-Department-Id` / query `departmentId` | `200 OK` — `DocumentStatusResponse(id, status, chunkCount, currentVersion, errorMessage, updatedAt)` |
-| `DELETE /api/v1/documents/{id}` | Path: `id` (`UUID`); optional header `X-Department-Id` / query `departmentId`, `X-User-Id` | `204 No Content` |
+| `POST /api/v1/documents/upload` | `multipart/form-data`: `file` (required), `accessLevel` (optional, default `DEPARTMENT`), `departmentId` (optional `UUID`, `SYSTEM_ADMIN` or own dept only); dev headers `X-Department-Id`, `X-User-Id`, `X-User-Role` | `202 Accepted` — `DocumentResponse` (`status = "PENDING"`, `fileHash`, `fileSizeBytes`, `mimeType`, `fileExtension`, `currentVersion = 1`, `chunkCount = 0`) |
+| `GET /api/v1/documents` | Query: `departmentId` (optional narrowing `UUID`), `status` (optional `DocumentStatus`), `accessLevel` (optional `AccessLevel`), `page` (default `0`), `size` (default `20`, max `100`); dev headers `X-Department-Id`, `X-User-Id`, `X-User-Role` | `200 OK` — `PageResponse<DocumentResponse>` sorted by `createdAt DESC` (`PUBLIC` or own dept for non-admins) |
+| `GET /api/v1/documents/{id}/status` | Path: `id` (`UUID`); dev headers `X-Department-Id`, `X-User-Id`, `X-User-Role` | `200 OK` — `DocumentStatusResponse(id, status, chunkCount, currentVersion, errorMessage, updatedAt)` |
+| `DELETE /api/v1/documents/{id}` | Path: `id` (`UUID`); dev headers `X-Department-Id`, `X-User-Id`, `X-User-Role` | `204 No Content` |
 
 ### 4.2 RFC 7807 `ProblemDetail` Error Mapping (`GlobalExceptionHandler`)
 
 | Condition | Exception | HTTP Status | Extra `ProblemDetail` Properties |
 | :--- | :--- | :--- | :--- |
-| Missing/blank file, `0`-byte file, invalid UUID/enum/page size, missing `departmentId` in `prod` | `InvalidDocumentRequestException` / `MethodArgumentTypeMismatchException` / `MissingServletRequestPartException` | `400 Bad Request` | `errorCode = "INVALID_DOCUMENT_REQUEST"` |
-| Cross-department delete or non-`PUBLIC` status lookup | `DocumentAccessDeniedException` | `403 Forbidden` | `errorCode = "DOCUMENT_ACCESS_DENIED"` |
+| Missing/blank file, `0`-byte file, invalid UUID/enum/role header/page size | `InvalidDocumentRequestException` / `MethodArgumentTypeMismatchException` / `MissingServletRequestPartException` | `400 Bad Request` | `errorCode = "INVALID_DOCUMENT_REQUEST"` |
+| Unauthenticated request in `prod` (`ProdCallerContextResolver`) | `AuthenticationRequiredException` | `401 Unauthorized` | `errorCode = "AUTHENTICATION_REQUIRED"` |
+| Insufficient role (`STANDARD_EMPLOYEE`), inactive user, cross-dept upload/delete/status | `DocumentAccessDeniedException` | `403 Forbidden` | `errorCode = "DOCUMENT_ACCESS_DENIED"` |
 | Unknown `documentId`, `departmentId`, or `userId` | `DocumentNotFoundException` / `ResourceNotFoundException` | `404 Not Found` | `errorCode = "RESOURCE_NOT_FOUND"` |
 | Duplicate `(department_id, file_hash)` | `DuplicateDocumentException` | `409 Conflict` | `errorCode = "DUPLICATE_DOCUMENT"`, `existingDocumentId`, `fileHash` |
 | File `> 52,428,800` bytes (`50 MiB`) | `DocumentTooLargeException` / `MaxUploadSizeExceededException` | `413 Payload Too Large` | `errorCode = "DOCUMENT_TOO_LARGE"`, `maxSizeBytes = 52428800` |
@@ -143,6 +144,8 @@ documind:
     upload-timeout: 60s
     presigned-expiry: 15m
 ```
+
+- **Multipart Disk-Spooling Trade-Off:** `file-size-threshold: 2MB` lets Tomcat spool multipart payloads `> 2 MiB` to temporary disk storage before controller dispatch so JVM Heap stays bounded under concurrent 40–50 MiB uploads, trading double disk/network I/O on large files instead of raw servlet streaming.
 
 ---
 

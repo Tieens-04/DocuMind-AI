@@ -280,6 +280,106 @@ class FileValidationServiceTest {
             zipSlipDocx.length,
             new ByteArrayInputStream(zipSlipDocx)
         )).isInstanceOf(UnsupportedDocumentTypeException.class);
+
+        byte[] nestedTraversalDocx = createCustomZipBytes(
+            new String[]{"[Content_Types].xml", "word/document.xml", "word/../evil.xml"},
+            new byte[][]{
+                contentTypesXmlBytes(),
+                "<w:document/>".getBytes(StandardCharsets.UTF_8),
+                "<evil/>".getBytes(StandardCharsets.UTF_8)
+            }
+        );
+        assertThatThrownBy(() -> validator.validateAndPrepareStream(
+            "nested-slip.docx",
+            nestedTraversalDocx.length,
+            new ByteArrayInputStream(nestedTraversalDocx)
+        )).isInstanceOf(UnsupportedDocumentTypeException.class);
+
+        byte[] backslashTraversalDocx = createCustomZipBytes(
+            new String[]{"[Content_Types].xml", "word/document.xml", "..\\evil.xml"},
+            new byte[][]{
+                contentTypesXmlBytes(),
+                "<w:document/>".getBytes(StandardCharsets.UTF_8),
+                "<evil/>".getBytes(StandardCharsets.UTF_8)
+            }
+        );
+        assertThatThrownBy(() -> validator.validateAndPrepareStream(
+            "backslash-slip.docx",
+            backslashTraversalDocx.length,
+            new ByteArrayInputStream(backslashTraversalDocx)
+        )).isInstanceOf(UnsupportedDocumentTypeException.class);
+    }
+
+    @Test
+    void acceptsDocxWithDoubleDotInsideAssetFilenameAndRejectsXlsxPptxOrGenericRelsZip() throws IOException {
+        byte[] chartDoubleDotDocx = createCustomZipBytes(
+            new String[]{"[Content_Types].xml", "word/document.xml", "word/media/chart..v2.xml"},
+            new byte[][]{
+                contentTypesXmlBytes(),
+                "<w:document/>".getBytes(StandardCharsets.UTF_8),
+                "<chart/>".getBytes(StandardCharsets.UTF_8)
+            }
+        );
+        FileValidationResult chartResult = validator.validateAndPrepareStream(
+            "chart-report.docx",
+            chartDoubleDotDocx.length,
+            new ByteArrayInputStream(chartDoubleDotDocx)
+        );
+        assertThat(chartResult.fileExtension()).isEqualTo("docx");
+        assertThat(chartResult.canonicalMimeType()).isEqualTo(DOCX_MIME_TYPE);
+
+        String xlsxContentTypes = """
+            <?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+            <Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+              <Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>
+            </Types>
+            """;
+        byte[] renamedXlsx = createCustomZipBytes(
+            new String[]{"[Content_Types].xml", "_rels/.rels", "xl/workbook.xml"},
+            new byte[][]{
+                xlsxContentTypes.getBytes(StandardCharsets.UTF_8),
+                "<Relationships/>".getBytes(StandardCharsets.UTF_8),
+                "<workbook/>".getBytes(StandardCharsets.UTF_8)
+            }
+        );
+        assertThatThrownBy(() -> validator.validateAndPrepareStream(
+            "budget.docx",
+            renamedXlsx.length,
+            new ByteArrayInputStream(renamedXlsx)
+        )).isInstanceOf(UnsupportedDocumentTypeException.class);
+
+        String pptxContentTypes = """
+            <?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+            <Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+              <Override PartName="/ppt/presentation.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.presentation.main+xml"/>
+            </Types>
+            """;
+        byte[] renamedPptx = createCustomZipBytes(
+            new String[]{"[Content_Types].xml", "_rels/.rels", "ppt/presentation.xml"},
+            new byte[][]{
+                pptxContentTypes.getBytes(StandardCharsets.UTF_8),
+                "<Relationships/>".getBytes(StandardCharsets.UTF_8),
+                "<presentation/>".getBytes(StandardCharsets.UTF_8)
+            }
+        );
+        assertThatThrownBy(() -> validator.validateAndPrepareStream(
+            "deck.docx",
+            renamedPptx.length,
+            new ByteArrayInputStream(renamedPptx)
+        )).isInstanceOf(UnsupportedDocumentTypeException.class);
+
+        byte[] relsOnlyZip = createCustomZipBytes(
+            new String[]{"_rels/.rels", "notes.txt"},
+            new byte[][]{
+                "<Relationships/>".getBytes(StandardCharsets.UTF_8),
+                "not a word document".getBytes(StandardCharsets.UTF_8)
+            }
+        );
+        assertThatThrownBy(() -> validator.validateAndPrepareStream(
+            "generic.docx",
+            relsOnlyZip.length,
+            new ByteArrayInputStream(relsOnlyZip)
+        )).isInstanceOf(UnsupportedDocumentTypeException.class);
     }
 
     @Test

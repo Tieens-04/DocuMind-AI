@@ -366,13 +366,13 @@ class Day1InfrastructureAndAiSmokeTest {
         Supplier<InputStream> contentStreamSupplier
     ) throws Exception {
         HttpRequest request = StreamingMultipartTestSupport.buildMultipartUploadRequest(
-            URI.create("http://localhost:" + port + "/api/v1/documents/upload?departmentId="
-                + departmentId + "&accessLevel=DEPARTMENT"),
+            URI.create("http://localhost:" + port + "/api/v1/documents/upload?accessLevel=DEPARTMENT"),
             "----DocuMindSmoke",
             filename,
             contentType,
             contentStreamSupplier,
-            Duration.ofSeconds(120)
+            Duration.ofSeconds(120),
+            departmentId
         );
         return httpClient.send(request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
     }
@@ -392,8 +392,8 @@ class Day1InfrastructureAndAiSmokeTest {
                 );
 
                 HttpRequest deleteRequest = HttpRequest.newBuilder()
-                    .uri(URI.create("http://localhost:" + port + "/api/v1/documents/" + docId
-                        + "?departmentId=" + SMOKE_IT_DEPARTMENT_ID))
+                    .uri(URI.create("http://localhost:" + port + "/api/v1/documents/" + docId))
+                    .header("X-Department-Id", SMOKE_IT_DEPARTMENT_ID.toString())
                     .timeout(Duration.ofSeconds(30))
                     .DELETE()
                     .build();

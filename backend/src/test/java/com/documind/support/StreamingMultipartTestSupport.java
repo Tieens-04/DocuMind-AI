@@ -73,14 +73,37 @@ public final class StreamingMultipartTestSupport {
         Supplier<InputStream> contentStreamSupplier,
         Duration timeout
     ) {
+        return buildMultipartUploadRequest(
+            uri,
+            boundaryPrefix,
+            filename,
+            contentType,
+            contentStreamSupplier,
+            timeout,
+            null
+        );
+    }
+
+    public static HttpRequest buildMultipartUploadRequest(
+        URI uri,
+        String boundaryPrefix,
+        String filename,
+        String contentType,
+        Supplier<InputStream> contentStreamSupplier,
+        Duration timeout,
+        UUID callerDepartmentId
+    ) {
         Objects.requireNonNull(uri, "uri must not be null");
         Objects.requireNonNull(timeout, "timeout must not be null");
         String boundary = newBoundary(boundaryPrefix);
-        return HttpRequest.newBuilder(uri)
+        HttpRequest.Builder builder = HttpRequest.newBuilder(uri)
             .header("Content-Type", "multipart/form-data; boundary=" + boundary)
             .timeout(timeout)
-            .POST(multipartFileBodyPublisher(boundary, filename, contentType, contentStreamSupplier))
-            .build();
+            .POST(multipartFileBodyPublisher(boundary, filename, contentType, contentStreamSupplier));
+        if (callerDepartmentId != null) {
+            builder.header("X-Department-Id", callerDepartmentId.toString());
+        }
+        return builder.build();
     }
 
     /**

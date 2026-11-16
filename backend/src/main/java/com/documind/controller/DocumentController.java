@@ -28,11 +28,11 @@ import java.util.Objects;
 import java.util.UUID;
 
 /**
- * REST API endpoints for streaming document uploads, status polling, filtered listing, and deletion.
+ * REST API endpoints for streaming document uploads, status polling, RBAC-scoped listing, and deletion.
  */
 @RestController
 @RequestMapping("/api/v1/documents")
-@Tag(name = "Documents", description = "Document upload, ingestion status polling, filtered listing, and hard deletion")
+@Tag(name = "Documents", description = "Document upload, ingestion status polling, RBAC-scoped listing, and hard deletion")
 public class DocumentController {
 
     private final DocumentService documentService;
@@ -54,15 +54,15 @@ public class DocumentController {
         @RequestParam(name = "departmentId", required = false) UUID departmentId,
         HttpServletRequest request
     ) {
-        CallerContext caller = callerContextResolver.resolve(departmentId, request);
-        DocumentResponse response = documentService.uploadDocument(file, accessLevel, caller);
+        CallerContext caller = callerContextResolver.resolve(request);
+        DocumentResponse response = documentService.uploadDocument(file, accessLevel, departmentId, caller);
         return ResponseEntity.status(HttpStatus.ACCEPTED).body(response);
     }
 
     @GetMapping
     @Operation(
         summary = "List documents",
-        description = "Returns paginated documents sorted by creation timestamp descending with optional filters"
+        description = "Returns paginated documents visible to the caller sorted by creation timestamp descending with optional filters"
     )
     public PageResponse<DocumentResponse> listDocuments(
         @RequestParam(name = "departmentId", required = false) UUID departmentId,
@@ -72,7 +72,7 @@ public class DocumentController {
         @RequestParam(name = "size", defaultValue = "20") int size,
         HttpServletRequest request
     ) {
-        CallerContext caller = callerContextResolver.resolve(departmentId, request);
+        CallerContext caller = callerContextResolver.resolve(request);
         return documentService.listDocuments(departmentId, status, accessLevel, page, size, caller);
     }
 
@@ -83,10 +83,9 @@ public class DocumentController {
     )
     public DocumentStatusResponse getDocumentStatus(
         @PathVariable("id") UUID id,
-        @RequestParam(name = "departmentId", required = false) UUID departmentId,
         HttpServletRequest request
     ) {
-        CallerContext caller = callerContextResolver.resolve(departmentId, request);
+        CallerContext caller = callerContextResolver.resolve(request);
         return documentService.getDocumentStatus(id, caller);
     }
 
@@ -97,10 +96,9 @@ public class DocumentController {
     )
     public ResponseEntity<Void> deleteDocument(
         @PathVariable("id") UUID id,
-        @RequestParam(name = "departmentId", required = false) UUID departmentId,
         HttpServletRequest request
     ) {
-        CallerContext caller = callerContextResolver.resolve(departmentId, request);
+        CallerContext caller = callerContextResolver.resolve(request);
         documentService.deleteDocument(id, caller);
         return ResponseEntity.noContent().build();
     }

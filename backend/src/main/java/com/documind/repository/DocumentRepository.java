@@ -12,11 +12,12 @@ import org.springframework.data.jpa.repository.JpaSpecificationExecutor;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Objects;
 import java.util.Optional;
 import java.util.UUID;
 
 /**
- * Spring Data JPA repository for {@link DocumentEntity} metadata, deduplication checks, and filtered pagination.
+ * Spring Data JPA repository for {@link DocumentEntity} metadata, deduplication checks, and RBAC-scoped pagination.
  */
 public interface DocumentRepository extends JpaRepository<DocumentEntity, UUID>, JpaSpecificationExecutor<DocumentEntity> {
 
@@ -27,19 +28,30 @@ public interface DocumentRepository extends JpaRepository<DocumentEntity, UUID>,
     List<DocumentEntity> findByDepartmentIdOrderByCreatedAtDesc(UUID departmentId);
 
     /**
-     * Queries documents applying predicates only for non-null filter parameters so PostgreSQL/Hibernate 6
-     * never sees untyped {@code NULL} bind parameters.
+     * Queries documents enforcing server-side visibility ({@code PUBLIC} or caller's department for non-admins)
+     * intersected with optional client filters, avoiding untyped {@code NULL} bind parameters.
      */
-    default Page<DocumentEntity> findAllFiltered(
-        UUID departmentId,
+    default Page<DocumentEntity> findAllVisible(
+        UUID callerDepartmentId,
+        boolean systemAdmin,
+        UUID filterDepartmentId,
         DocumentStatus status,
         AccessLevel accessLevel,
         Pageable pageable
     ) {
+        if (!systemAdmin) {
+            Objects.requireNonNull(callerDepartmentId, "callerDepartmentId must not be null for non-admin query");
+        }
         Specification<DocumentEntity> spec = (root, query, cb) -> {
             List<Predicate> predicates = new ArrayList<>();
-            if (departmentId != null) {
-                predicates.add(cb.equal(root.get("departmentId"), departmentId));
+            if (!systemAdmin) {
+                predicates.add(cb.or(
+                    cb.equal(root.get("accessLevel"), AccessLevel.PUBLIC),
+                    cb.equal(root.get("departmentId"), callerDepartmentId)
+                ));
+            }
+            if (filterDepartmentId != null) {
+                predicates.add(cb.equal(root.get("departmentId"), filterDepartmentId));
             }
             if (status != null) {
                 predicates.add(cb.equal(root.get("status"), status));

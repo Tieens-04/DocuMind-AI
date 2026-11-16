@@ -1,5 +1,6 @@
 package com.documind.controller.advice;
 
+import com.documind.exception.AuthenticationRequiredException;
 import com.documind.exception.DocumentAccessDeniedException;
 import com.documind.exception.DocumentNotFoundException;
 import com.documind.exception.DocumentStorageException;
@@ -97,6 +98,21 @@ public class GlobalExceptionHandler {
             "Invalid Document Request",
             "Malformed multipart request",
             "INVALID_DOCUMENT_REQUEST",
+            request
+        );
+        return ResponseEntity.of(problem).build();
+    }
+
+    @ExceptionHandler(AuthenticationRequiredException.class)
+    public ResponseEntity<ProblemDetail> handleAuthenticationRequired(
+        AuthenticationRequiredException ex,
+        HttpServletRequest request
+    ) {
+        ProblemDetail problem = buildProblem(
+            HttpStatus.UNAUTHORIZED,
+            "Authentication Required",
+            ex.getMessage(),
+            "AUTHENTICATION_REQUIRED",
             request
         );
         return ResponseEntity.of(problem).build();

@@ -63,6 +63,8 @@ import software.amazon.awssdk.services.s3.model.S3Object;
 
 import java.lang.management.ManagementFactory;
 import java.lang.management.MemoryMXBean;
+import java.lang.management.MemoryPoolMXBean;
+import java.lang.management.MemoryType;
 import java.net.URI;
 import java.net.URL;
 import java.net.http.HttpClient;
@@ -92,8 +94,10 @@ class DocumentCrudAndMinioStreamingIntegrationTest {
 
     private static final UUID IT_DEPT_ID = UUID.fromString("11111111-1111-1111-1111-111111111111");
     private static final UUID HR_DEPT_ID = UUID.fromString("22222222-2222-2222-2222-222222222222");
+    private static final UUID HR_MANAGER_USER_ID = UUID.fromString("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb");
+    private static final long ONE_MIB_BYTES = 1024L * 1024L;
     private static final long FORTY_MIB_BYTES = 40L * 1024L * 1024L;
-    private static final long MAX_POST_GC_HEAP_DELTA_BYTES = 35L * 1024L * 1024L;
+    private static final long MAX_BOUNDED_HEAP_DELTA_BYTES = 20L * 1024L * 1024L;
 
     @LocalServerPort
     private int port;
@@ -408,12 +412,13 @@ class DocumentCrudAndMinioStreamingIntegrationTest {
     void rejectsOversizedUploadAbove50MiBWith413ProblemDetail() throws Exception {
         long oversizedBytes = HashingBoundedInputStream.MAX_FILE_SIZE_BYTES + 1L;
         HttpRequest request = StreamingMultipartTestSupport.buildMultipartUploadRequest(
-            URI.create("http://localhost:" + port + "/api/v1/documents/upload?departmentId=" + IT_DEPT_ID),
+            URI.create("http://localhost:" + port + "/api/v1/documents/upload"),
             "----DocuMindTooLarge",
             "oversized-50mib-plus-1.pdf",
             "application/pdf",
             () -> new RepeatingPdfInputStream(oversizedBytes),
-            Duration.ofSeconds(120)
+            Duration.ofSeconds(120),
+            IT_DEPT_ID
         );
 
         HttpResponse<String> response;
@@ -457,26 +462,65 @@ class DocumentCrudAndMinioStreamingIntegrationTest {
             HR_DEPT_ID,
             AccessLevel.PUBLIC
         ).getBody());
+        Thread.sleep(5);
 
-        // 1. All-null filter query on real PostgreSQL 16 (sorted by createdAt DESC)
-        ResponseEntity<PageResponse<DocumentResponse>> unfilteredPage = restTemplate.exchange(
+        DocumentResponse hrConfidentialDoc = Objects.requireNonNull(uploadBytes(
+            "hr-salaries.txt",
+            "text/plain",
+            "HR confidential compensation matrix".getBytes(StandardCharsets.UTF_8),
+            HR_DEPT_ID,
+            AccessLevel.CONFIDENTIAL
+        ).getBody());
+
+        HttpHeaders itHeaders = new HttpHeaders();
+        itHeaders.set("X-Department-Id", IT_DEPT_ID.toString());
+        HttpHeaders hrHeaders = new HttpHeaders();
+        hrHeaders.set("X-Department-Id", HR_DEPT_ID.toString());
+
+        // 1. Default IT caller listing excludes HR CONFIDENTIAL while keeping HR PUBLIC and own IT docs
+        ResponseEntity<PageResponse<DocumentResponse>> itScopePage = restTemplate.exchange(
             "/api/v1/documents?page=0&size=10",
             HttpMethod.GET,
-            HttpEntity.EMPTY,
+            new HttpEntity<>(itHeaders),
             new ParameterizedTypeReference<>() {}
         );
-        assertThat(unfilteredPage.getStatusCode()).isEqualTo(HttpStatus.OK);
-        PageResponse<DocumentResponse> allDocs = Objects.requireNonNull(unfilteredPage.getBody());
-        assertThat(allDocs.totalElements()).isEqualTo(3L);
-        assertThat(allDocs.items())
+        assertThat(itScopePage.getStatusCode()).isEqualTo(HttpStatus.OK);
+        PageResponse<DocumentResponse> itVisibleDocs = Objects.requireNonNull(itScopePage.getBody());
+        assertThat(itVisibleDocs.totalElements()).isEqualTo(3L);
+        assertThat(itVisibleDocs.items())
             .extracting(DocumentResponse::id)
-            .containsExactly(hrPublicDoc.id(), itConfidentialDoc.id(), itDeptDoc.id());
+            .containsExactly(hrPublicDoc.id(), itConfidentialDoc.id(), itDeptDoc.id())
+            .doesNotContain(hrConfidentialDoc.id());
 
-        // 2. Non-null filters (departmentId + status + accessLevel)
+        // 2. HR caller cannot widen scope using ?departmentId=<IT_DEPT_ID>
+        ResponseEntity<PageResponse<DocumentResponse>> hrCrossDeptFilterAttempt = restTemplate.exchange(
+            "/api/v1/documents?departmentId=" + IT_DEPT_ID + "&page=0&size=10",
+            HttpMethod.GET,
+            new HttpEntity<>(hrHeaders),
+            new ParameterizedTypeReference<>() {}
+        );
+        assertThat(hrCrossDeptFilterAttempt.getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertThat(Objects.requireNonNull(hrCrossDeptFilterAttempt.getBody()).totalElements()).isZero();
+        assertThat(hrCrossDeptFilterAttempt.getBody().items()).isEmpty();
+
+        // 3. SYSTEM_ADMIN sees all 4 documents across departments
+        HttpHeaders adminHeaders = new HttpHeaders();
+        adminHeaders.set("X-Department-Id", IT_DEPT_ID.toString());
+        adminHeaders.set("X-User-Role", "SYSTEM_ADMIN");
+        ResponseEntity<PageResponse<DocumentResponse>> adminPage = restTemplate.exchange(
+            "/api/v1/documents?page=0&size=10",
+            HttpMethod.GET,
+            new HttpEntity<>(adminHeaders),
+            new ParameterizedTypeReference<>() {}
+        );
+        assertThat(adminPage.getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertThat(Objects.requireNonNull(adminPage.getBody()).totalElements()).isEqualTo(4L);
+
+        // 4. Non-null filters (departmentId + status + accessLevel) intersected with caller visibility
         ResponseEntity<PageResponse<DocumentResponse>> filteredPage = restTemplate.exchange(
             "/api/v1/documents?departmentId=" + IT_DEPT_ID + "&status=PENDING&accessLevel=DEPARTMENT&page=0&size=10",
             HttpMethod.GET,
-            HttpEntity.EMPTY,
+            new HttpEntity<>(itHeaders),
             new ParameterizedTypeReference<>() {}
         );
         assertThat(filteredPage.getStatusCode()).isEqualTo(HttpStatus.OK);
@@ -484,39 +528,72 @@ class DocumentCrudAndMinioStreamingIntegrationTest {
         assertThat(itFiltered.totalElements()).isEqualTo(1L);
         assertThat(itFiltered.items()).extracting(DocumentResponse::id).containsExactly(itDeptDoc.id());
 
-        // 3. Status endpoint: same department 200 OK; cross-department DEPARTMENT doc -> 403 Forbidden; cross-department PUBLIC -> 200 OK
-        HttpHeaders itHeaders = new HttpHeaders();
-        itHeaders.set("X-Department-Id", IT_DEPT_ID.toString());
-        ResponseEntity<DocumentStatusResponse> statusOk = restTemplate.exchange(
-            "/api/v1/documents/" + itDeptDoc.id() + "/status",
-            HttpMethod.GET,
-            new HttpEntity<>(itHeaders),
-            DocumentStatusResponse.class
-        );
-        assertThat(statusOk.getStatusCode()).isEqualTo(HttpStatus.OK);
-        assertThat(Objects.requireNonNull(statusOk.getBody()).status()).isEqualTo(DocumentStatus.PENDING);
+        // 5. STANDARD_EMPLOYEE RBAC: 403 on upload & delete, 200 on own/PUBLIC status, sanitized 403 on cross-dept CONFIDENTIAL status
+        HttpHeaders itEmployeeHeaders = new HttpHeaders();
+        itEmployeeHeaders.set("X-Department-Id", IT_DEPT_ID.toString());
+        itEmployeeHeaders.set("X-User-Role", "STANDARD_EMPLOYEE");
 
-        HttpHeaders hrHeaders = new HttpHeaders();
-        hrHeaders.set("X-Department-Id", HR_DEPT_ID.toString());
-        ResponseEntity<ProblemDetail> crossDeptForbidden = restTemplate.exchange(
-            "/api/v1/documents/" + itDeptDoc.id() + "/status",
-            HttpMethod.GET,
-            new HttpEntity<>(hrHeaders),
+        ResponseEntity<ProblemDetail> employeeUploadForbidden = restTemplate.postForEntity(
+            "/api/v1/documents/upload",
+            buildMultipartEntity("emp.txt", "text/plain", "Denied".getBytes(StandardCharsets.UTF_8), IT_DEPT_ID, AccessLevel.DEPARTMENT, "STANDARD_EMPLOYEE", null),
             ProblemDetail.class
         );
-        assertThat(crossDeptForbidden.getStatusCode()).isEqualTo(HttpStatus.FORBIDDEN);
-        assertThat(Objects.requireNonNull(crossDeptForbidden.getBody()).getProperties())
-            .containsEntry("errorCode", "DOCUMENT_ACCESS_DENIED");
+        assertThat(employeeUploadForbidden.getStatusCode()).isEqualTo(HttpStatus.FORBIDDEN);
 
-        ResponseEntity<DocumentStatusResponse> crossDeptPublicOk = restTemplate.exchange(
-            "/api/v1/documents/" + hrPublicDoc.id() + "/status",
+        ResponseEntity<ProblemDetail> employeeDeleteForbidden = restTemplate.exchange(
+            "/api/v1/documents/" + itDeptDoc.id(),
+            HttpMethod.DELETE,
+            new HttpEntity<>(itEmployeeHeaders),
+            ProblemDetail.class
+        );
+        assertThat(employeeDeleteForbidden.getStatusCode()).isEqualTo(HttpStatus.FORBIDDEN);
+
+        ResponseEntity<DocumentStatusResponse> employeeOwnStatusOk = restTemplate.exchange(
+            "/api/v1/documents/" + itDeptDoc.id() + "/status",
             HttpMethod.GET,
-            new HttpEntity<>(itHeaders),
+            new HttpEntity<>(itEmployeeHeaders),
             DocumentStatusResponse.class
         );
-        assertThat(crossDeptPublicOk.getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertThat(employeeOwnStatusOk.getStatusCode()).isEqualTo(HttpStatus.OK);
 
-        // Cross-department DELETE is forbidden even on PUBLIC documents
+        ResponseEntity<DocumentStatusResponse> employeePublicStatusOk = restTemplate.exchange(
+            "/api/v1/documents/" + hrPublicDoc.id() + "/status",
+            HttpMethod.GET,
+            new HttpEntity<>(itEmployeeHeaders),
+            DocumentStatusResponse.class
+        );
+        assertThat(employeePublicStatusOk.getStatusCode()).isEqualTo(HttpStatus.OK);
+
+        ResponseEntity<ProblemDetail> employeeCrossConfidentialStatus = restTemplate.exchange(
+            "/api/v1/documents/" + hrConfidentialDoc.id() + "/status",
+            HttpMethod.GET,
+            new HttpEntity<>(itEmployeeHeaders),
+            ProblemDetail.class
+        );
+        assertThat(employeeCrossConfidentialStatus.getStatusCode()).isEqualTo(HttpStatus.FORBIDDEN);
+        ProblemDetail crossStatusProblem = Objects.requireNonNull(employeeCrossConfidentialStatus.getBody());
+        assertThat(crossStatusProblem.getProperties()).containsEntry("errorCode", "DOCUMENT_ACCESS_DENIED");
+        assertThat(crossStatusProblem.getDetail())
+            .doesNotContain(IT_DEPT_ID.toString())
+            .doesNotContain(HR_DEPT_ID.toString())
+            .doesNotContain(hrConfidentialDoc.id().toString());
+
+        // 6. IT manager cannot upload into HR via ?departmentId= or spoof HR manager X-User-Id
+        ResponseEntity<ProblemDetail> crossDeptUploadQueryForbidden = restTemplate.postForEntity(
+            "/api/v1/documents/upload?departmentId=" + HR_DEPT_ID,
+            buildMultipartEntity("cross-target.txt", "text/plain", "Denied".getBytes(StandardCharsets.UTF_8), IT_DEPT_ID, AccessLevel.DEPARTMENT, "DEPARTMENT_MANAGER", null),
+            ProblemDetail.class
+        );
+        assertThat(crossDeptUploadQueryForbidden.getStatusCode()).isEqualTo(HttpStatus.FORBIDDEN);
+
+        ResponseEntity<ProblemDetail> spoofedActorUploadForbidden = restTemplate.postForEntity(
+            "/api/v1/documents/upload",
+            buildMultipartEntity("spoofed-actor.txt", "text/plain", "Denied".getBytes(StandardCharsets.UTF_8), IT_DEPT_ID, AccessLevel.DEPARTMENT, "DEPARTMENT_MANAGER", HR_MANAGER_USER_ID),
+            ProblemDetail.class
+        );
+        assertThat(spoofedActorUploadForbidden.getStatusCode()).isEqualTo(HttpStatus.FORBIDDEN);
+
+        // Cross-department DELETE is forbidden even on PUBLIC documents (and detail leaks no UUIDs)
         ResponseEntity<ProblemDetail> crossDeptDeleteForbidden = restTemplate.exchange(
             "/api/v1/documents/" + hrPublicDoc.id(),
             HttpMethod.DELETE,
@@ -524,8 +601,12 @@ class DocumentCrudAndMinioStreamingIntegrationTest {
             ProblemDetail.class
         );
         assertThat(crossDeptDeleteForbidden.getStatusCode()).isEqualTo(HttpStatus.FORBIDDEN);
+        assertThat(Objects.requireNonNull(crossDeptDeleteForbidden.getBody()).getDetail())
+            .doesNotContain(IT_DEPT_ID.toString())
+            .doesNotContain(HR_DEPT_ID.toString())
+            .doesNotContain(hrPublicDoc.id().toString());
 
-        // 4. Insert pgvector chunk -> DELETE returns 204, cascades chunks to 0, records DOC_DELETE, removes S3 object
+        // 7. Insert pgvector chunk -> DELETE returns 204, cascades chunks to 0, records DOC_DELETE, removes S3 object
         Document chunk = new Document(
             "IT internal runbook vector chunk",
             Map.of(
@@ -595,8 +676,8 @@ class DocumentCrudAndMinioStreamingIntegrationTest {
     }
 
     @Test
-    void streams40MiBPdfWithoutMaterializingHeapBuffer() throws Exception {
-        // Warm up multipart + S3 path before measuring retained JVM heap delta
+    void streams40MiBPdfWithoutMaterializingHeapBufferAndMeetsWarmLatency() throws Exception {
+        // Warm up multipart + S3 path before measuring latency and heap peak
         ResponseEntity<DocumentResponse> warmup = uploadBytes(
             "heap-warmup.pdf",
             "application/pdf",
@@ -606,39 +687,99 @@ class DocumentCrudAndMinioStreamingIntegrationTest {
         );
         assertThat(warmup.getStatusCode()).isEqualTo(HttpStatus.ACCEPTED);
 
-        long heapBefore = settledUsedHeapBytes();
-
-        HttpRequest request = StreamingMultipartTestSupport.buildMultipartUploadRequest(
-            URI.create("http://localhost:" + port + "/api/v1/documents/upload?departmentId="
-                + IT_DEPT_ID + "&accessLevel=DEPARTMENT"),
-            "----DocuMind40MiB",
-            "large-40mib.pdf",
-            "application/pdf",
-            () -> new RepeatingPdfInputStream(FORTY_MIB_BYTES),
-            Duration.ofSeconds(120)
-        );
-
-        HttpResponse<String> response;
+        // Warm 1 MiB PDF streaming upload must complete under 300ms
         try (HttpClient httpClient = StreamingMultipartTestSupport.newHttp11Client()) {
-            response = httpClient.send(request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
+            HttpRequest oneMibRequest = StreamingMultipartTestSupport.buildMultipartUploadRequest(
+                URI.create("http://localhost:" + port + "/api/v1/documents/upload?accessLevel=DEPARTMENT"),
+                "----DocuMind1MiB",
+                "warm-1mib.pdf",
+                "application/pdf",
+                () -> new RepeatingPdfInputStream(ONE_MIB_BYTES, "1mib-warm"),
+                Duration.ofSeconds(30),
+                HR_DEPT_ID
+            );
+            long oneMibStartedNanos = System.nanoTime();
+            HttpResponse<String> oneMibResponse = httpClient.send(
+                oneMibRequest,
+                HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8)
+            );
+            long oneMibElapsedMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - oneMibStartedNanos);
+            assertThat(oneMibResponse.statusCode()).isEqualTo(202);
+            assertThat(oneMibElapsedMs)
+                .as("Warm 1 MiB PDF streaming upload latency (ms)")
+                .isLessThan(300L);
+
+            long heapBefore = settledUsedHeapBytes();
+            List<MemoryPoolMXBean> oldGenPools = oldGenHeapPools();
+            long oldGenUsedBefore = sumUsedHeap(oldGenPools);
+            oldGenPools.forEach(MemoryPoolMXBean::resetPeakUsage);
+
+            HttpRequest fortyMibRequest = StreamingMultipartTestSupport.buildMultipartUploadRequest(
+                URI.create("http://localhost:" + port + "/api/v1/documents/upload?accessLevel=DEPARTMENT"),
+                "----DocuMind40MiB",
+                "large-40mib.pdf",
+                "application/pdf",
+                () -> new RepeatingPdfInputStream(FORTY_MIB_BYTES),
+                Duration.ofSeconds(120),
+                IT_DEPT_ID
+            );
+
+            HttpResponse<String> response = httpClient.send(
+                fortyMibRequest,
+                HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8)
+            );
+            assertThat(response.statusCode()).isEqualTo(202);
+
+            DocumentResponse created = objectMapper.readValue(response.body(), DocumentResponse.class);
+            assertThat(created.fileSizeBytes()).isEqualTo(FORTY_MIB_BYTES);
+            assertThat(created.status()).isEqualTo(DocumentStatus.PENDING);
+            assertThat(created.mimeType()).isEqualTo("application/pdf");
+
+            String storageKey = documentRepository.findById(created.id()).orElseThrow().getStorageKey();
+            HeadObjectResponse headObject = s3Client.headObject(HeadObjectRequest.builder()
+                .bucket(storageProperties.bucket())
+                .key(storageKey)
+                .build());
+            assertThat(headObject.contentLength()).isEqualTo(FORTY_MIB_BYTES);
+
+            long oldGenPeakAfter = sumPeakUsedHeap(oldGenPools);
+            long oldGenPeakDelta = oldGenPeakAfter - oldGenUsedBefore;
+            assertThat(oldGenPeakDelta)
+                .as("Old-Gen peak heap growth during 40 MiB streaming upload")
+                .isLessThan(MAX_BOUNDED_HEAP_DELTA_BYTES);
+
+            long heapAfter = settledUsedHeapBytes();
+            long postGcHeapDelta = heapAfter - heapBefore;
+            assertThat(postGcHeapDelta)
+                .as("Post-GC settled heap growth after 40 MiB streaming upload")
+                .isLessThan(MAX_BOUNDED_HEAP_DELTA_BYTES);
         }
-        assertThat(response.statusCode()).isEqualTo(202);
+    }
 
-        DocumentResponse created = objectMapper.readValue(response.body(), DocumentResponse.class);
-        assertThat(created.fileSizeBytes()).isEqualTo(FORTY_MIB_BYTES);
-        assertThat(created.status()).isEqualTo(DocumentStatus.PENDING);
-        assertThat(created.mimeType()).isEqualTo("application/pdf");
+    private static List<MemoryPoolMXBean> oldGenHeapPools() {
+        return ManagementFactory.getMemoryPoolMXBeans().stream()
+            .filter(pool -> pool.getType() == MemoryType.HEAP)
+            .filter(pool -> {
+                String name = pool.getName();
+                return name != null && (name.contains("Old") || name.contains("Tenured"));
+            })
+            .toList();
+    }
 
-        String storageKey = documentRepository.findById(created.id()).orElseThrow().getStorageKey();
-        HeadObjectResponse headObject = s3Client.headObject(HeadObjectRequest.builder()
-            .bucket(storageProperties.bucket())
-            .key(storageKey)
-            .build());
-        assertThat(headObject.contentLength()).isEqualTo(FORTY_MIB_BYTES);
+    private static long sumUsedHeap(List<MemoryPoolMXBean> pools) {
+        long total = 0L;
+        for (MemoryPoolMXBean pool : pools) {
+            total += Math.max(0L, pool.getUsage().getUsed());
+        }
+        return total;
+    }
 
-        long heapAfter = settledUsedHeapBytes();
-        long postGcHeapDelta = heapAfter - heapBefore;
-        assertThat(postGcHeapDelta).isLessThan(MAX_POST_GC_HEAP_DELTA_BYTES);
+    private static long sumPeakUsedHeap(List<MemoryPoolMXBean> pools) {
+        long total = 0L;
+        for (MemoryPoolMXBean pool : pools) {
+            total += Math.max(0L, pool.getPeakUsage().getUsed());
+        }
+        return total;
     }
 
     private ResponseEntity<DocumentResponse> uploadBytes(
@@ -676,6 +817,18 @@ class DocumentCrudAndMinioStreamingIntegrationTest {
         UUID departmentId,
         AccessLevel accessLevel
     ) {
+        return buildMultipartEntity(filename, contentType, bytes, departmentId, accessLevel, null, null);
+    }
+
+    private static HttpEntity<MultiValueMap<String, Object>> buildMultipartEntity(
+        String filename,
+        String contentType,
+        byte[] bytes,
+        UUID departmentId,
+        AccessLevel accessLevel,
+        String userRole,
+        UUID userId
+    ) {
         HttpHeaders partHeaders = new HttpHeaders();
         partHeaders.setContentType(MediaType.parseMediaType(contentType));
         ByteArrayResource resource = new ByteArrayResource(bytes) {
@@ -687,15 +840,21 @@ class DocumentCrudAndMinioStreamingIntegrationTest {
 
         MultiValueMap<String, Object> body = new LinkedMultiValueMap<>();
         body.add("file", new HttpEntity<>(resource, partHeaders));
-        if (departmentId != null) {
-            body.add("departmentId", departmentId.toString());
-        }
         if (accessLevel != null) {
             body.add("accessLevel", accessLevel.name());
         }
 
         HttpHeaders requestHeaders = new HttpHeaders();
         requestHeaders.setContentType(MediaType.MULTIPART_FORM_DATA);
+        if (departmentId != null) {
+            requestHeaders.set("X-Department-Id", departmentId.toString());
+        }
+        if (userRole != null) {
+            requestHeaders.set("X-User-Role", userRole);
+        }
+        if (userId != null) {
+            requestHeaders.set("X-User-Id", userId.toString());
+        }
         return new HttpEntity<>(body, requestHeaders);
     }
 

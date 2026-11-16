@@ -13,6 +13,7 @@ import org.springframework.stereotype.Service;
 
 import java.io.BufferedInputStream;
 import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
 import java.io.EOFException;
 import java.io.IOException;
 import java.io.InputStream;
@@ -24,10 +25,16 @@ import java.util.zip.ZipEntry;
 import java.util.zip.ZipException;
 import java.util.zip.ZipInputStream;
 
+/**
+ * Validates document filenames, declared sizes, and magic signatures via a bounded {@code 64 KiB} header prefix
+ * so upload streams rewind cleanly without full-file buffering. Full-stream ZIP-bomb inflation ratio limits
+ * ({@code ZipSecureFile}) are enforced downstream when {@code DA-8} parses OOXML content.
+ */
 @Service
 public class FileValidationService {
 
     public static final int HEADER_INSPECTION_BYTES = 65_536;
+    private static final int CONTENT_TYPES_MAX_INSPECTION_BYTES = 32_768;
 
     private static final int MAX_ORIGINAL_NAME_LENGTH = 255;
     private static final int MAX_SANITIZED_NAME_LENGTH = 180;
@@ -289,7 +296,7 @@ public class FileValidationService {
     private static void validateOoxmlContainerHeader(byte[] headerBytes, String baseMimeType) {
         boolean truncatedWindow = headerBytes.length == HEADER_INSPECTION_BYTES;
         ByteArrayInputStream bais = new ByteArrayInputStream(headerBytes);
-        boolean foundOoxmlEntry = false;
+        boolean foundWordDocumentMarker = false;
         int entriesSeen = 0;
 
         try (ZipInputStream zis = new ZipInputStream(bais, StandardCharsets.UTF_8)) {
@@ -297,14 +304,41 @@ public class FileValidationService {
             while ((entry = zis.getNextEntry()) != null) {
                 entriesSeen++;
                 String entryName = entry.getName();
-                if (entryName.contains("..")) {
+                if (hasDotDotPathSegment(entryName)) {
                     throw new UnsupportedDocumentTypeException(
                         baseMimeType,
                         "Rejected ZIP path-traversal entry in DOCX upload: " + entryName
                     );
                 }
-                if (isOoxmlEntryName(entryName)) {
-                    foundOoxmlEntry = true;
+                String normalized = normalizeZipEntryName(entryName);
+                if (normalized.startsWith("xl/") || normalized.startsWith("ppt/")) {
+                    throw new UnsupportedDocumentTypeException(
+                        baseMimeType,
+                        "Non-Word OOXML container rejected for .docx upload"
+                    );
+                }
+                if (normalized.startsWith("word/")) {
+                    foundWordDocumentMarker = true;
+                } else if ("[Content_Types].xml".equals(normalized)) {
+                    byte[] contentTypesPrefix = readBoundedEntryPrefix(
+                        zis,
+                        CONTENT_TYPES_MAX_INSPECTION_BYTES,
+                        truncatedWindow,
+                        bais
+                    );
+                    String xmlLower = new String(contentTypesPrefix, StandardCharsets.UTF_8).toLowerCase(Locale.ROOT);
+                    boolean hasOtherOoxml = xmlLower.contains("spreadsheetml") || xmlLower.contains("presentationml");
+                    boolean hasWordProcessing =
+                        xmlLower.contains("wordprocessingml.document") || xmlLower.contains("/word/");
+                    if (hasOtherOoxml && !hasWordProcessing) {
+                        throw new UnsupportedDocumentTypeException(
+                            baseMimeType,
+                            "Non-Word OOXML container rejected for .docx upload"
+                        );
+                    }
+                    if (hasWordProcessing) {
+                        foundWordDocumentMarker = true;
+                    }
                 }
             }
         } catch (UnsupportedDocumentTypeException ex) {
@@ -323,7 +357,7 @@ public class FileValidationService {
             );
         }
 
-        if (entriesSeen == 0 || !foundOoxmlEntry) {
+        if (entriesSeen == 0 || !foundWordDocumentMarker) {
             throw new UnsupportedDocumentTypeException(
                 baseMimeType,
                 "ZIP container does not contain valid OOXML Word document entries"
@@ -331,14 +365,54 @@ public class FileValidationService {
         }
     }
 
-    private static boolean isOoxmlEntryName(String rawEntryName) {
+    private static byte[] readBoundedEntryPrefix(
+        ZipInputStream zis,
+        int maxBytes,
+        boolean truncatedWindow,
+        ByteArrayInputStream backingStream
+    ) throws IOException {
+        ByteArrayOutputStream out = new ByteArrayOutputStream(Math.min(maxBytes, 4096));
+        byte[] buffer = new byte[4096];
+        int remaining = maxBytes;
+        try {
+            while (remaining > 0) {
+                int read = zis.read(buffer, 0, Math.min(buffer.length, remaining));
+                if (read < 0) {
+                    break;
+                }
+                out.write(buffer, 0, read);
+                remaining -= read;
+            }
+        } catch (EOFException | ZipException ex) {
+            if (!(truncatedWindow && backingStream.available() == 0)) {
+                throw ex;
+            }
+        }
+        return out.toByteArray();
+    }
+
+    private static boolean hasDotDotPathSegment(String rawEntryName) {
         String normalized = rawEntryName.replace('\\', '/');
-        if (normalized.startsWith("/")) {
+        int start = 0;
+        while (start <= normalized.length()) {
+            int slash = normalized.indexOf('/', start);
+            String segment = (slash >= 0) ? normalized.substring(start, slash) : normalized.substring(start);
+            if ("..".equals(segment)) {
+                return true;
+            }
+            if (slash < 0) {
+                break;
+            }
+            start = slash + 1;
+        }
+        return false;
+    }
+
+    private static String normalizeZipEntryName(String rawEntryName) {
+        String normalized = rawEntryName.replace('\\', '/');
+        while (normalized.startsWith("/")) {
             normalized = normalized.substring(1);
         }
-        return "[Content_Types].xml".equals(normalized)
-            || "_rels/.rels".equals(normalized)
-            || normalized.startsWith("word/")
-            || normalized.startsWith("docProps/");
+        return normalized;
     }
 }
