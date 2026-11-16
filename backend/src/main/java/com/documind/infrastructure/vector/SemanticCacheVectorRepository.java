@@ -4,6 +4,7 @@ import com.documind.domain.model.CitationPayload;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import jakarta.annotation.PreDestroy;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.ObjectProvider;
@@ -31,7 +32,6 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
-import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Supplier;
 
 /**
@@ -43,6 +43,8 @@ public class SemanticCacheVectorRepository {
 
     private static final Logger log = LoggerFactory.getLogger(SemanticCacheVectorRepository.class);
     private static final long ASYNC_HIT_FLUSH_WAIT_MS = 50L;
+    private static final int MAX_ASYNC_RETRY_ATTEMPTS = 3;
+    private static final long RETRY_BASE_DELAY_MS = 100L;
     private static final ExecutorService HIT_FLUSH_EXECUTOR = Executors.newVirtualThreadPerTaskExecutor();
     private static final TypeReference<List<CitationPayload>> CITATION_LIST_TYPE = new TypeReference<>() {
     };
@@ -50,8 +52,9 @@ public class SemanticCacheVectorRepository {
     private final Supplier<JdbcClient> jdbcClientSupplier;
     private final Supplier<PlatformTransactionManager> transactionManagerSupplier;
     private final ObjectMapper objectMapper;
-    private final ConcurrentHashMap<UUID, AtomicInteger> pendingHitDeltas = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<UUID, Integer> pendingHitDeltas = new ConcurrentHashMap<>();
     private final Semaphore flushPermit = new Semaphore(1);
+    private volatile boolean shuttingDown;
 
     @Autowired
     public SemanticCacheVectorRepository(
@@ -181,17 +184,18 @@ public class SemanticCacheVectorRepository {
 
         PlatformTransactionManager txManager = transactionManagerSupplier.get();
         Optional<SemanticCacheEntry> match;
-        if (txManager != null && !TransactionSynchronizationManager.isActualTransactionActive()) {
-            // Scope SET LOCAL strictly to a short read-only search tx when no caller tx exists
+        if (txManager != null) {
             TransactionTemplate searchTx = new TransactionTemplate(txManager);
             searchTx.setPropagationBehavior(TransactionDefinition.PROPAGATION_REQUIRED);
-            searchTx.setReadOnly(true);
+            if (!TransactionSynchronizationManager.isActualTransactionActive()) {
+                searchTx.setReadOnly(true);
+            }
             match = searchTx.execute(status -> {
+                // Transaction-local setting ensures PgBouncer transaction-pooling compatibility without leaking outside tx
                 jdbcClient().sql("SET LOCAL hnsw.iterative_scan = 'relaxed_order'").update();
                 return queryBestMatch(rbacScope, scopeVersion, vectorLiteral, minSimilarity);
             });
         } else {
-            // Caller already owns an active tx (Hikari init SQL applies session iterative_scan) or txManager is absent
             match = queryBestMatch(rbacScope, scopeVersion, vectorLiteral, minSimilarity);
         }
 
@@ -290,9 +294,9 @@ public class SemanticCacheVectorRepository {
         if (txManager != null
             && TransactionSynchronizationManager.isActualTransactionActive()
             && TransactionSynchronizationManager.isCurrentTransactionReadOnly()) {
-            pendingHitDeltas.computeIfAbsent(id, ignored -> new AtomicInteger()).incrementAndGet();
+            pendingHitDeltas.merge(id, 1, Integer::sum);
             CompletableFuture<Void> flushFuture = CompletableFuture.runAsync(
-                () -> drainPendingHitDeltas(txManager),
+                () -> drainPendingHitDeltas(txManager, 1),
                 HIT_FLUSH_EXECUTOR
             );
             try {
@@ -309,9 +313,19 @@ public class SemanticCacheVectorRepository {
         executeIncrementHitCount(id, 1);
     }
 
+    @PreDestroy
+    void flushOnShutdown() {
+        shuttingDown = true;
+        flushPendingHitCounts();
+    }
+
+    /**
+     * Completion barrier that acquires {@code flushPermit} at least once so any in-flight
+     * async hit-count commit completes before returning, then drains remaining pending deltas.
+     */
     void flushPendingHitCounts() {
         PlatformTransactionManager txManager = transactionManagerSupplier.get();
-        while (hasPendingDeltas()) {
+        do {
             try {
                 flushPermit.acquire();
             } catch (InterruptedException ex) {
@@ -330,10 +344,10 @@ public class SemanticCacheVectorRepository {
             if (!batchSucceeded) {
                 return;
             }
-        }
+        } while (hasPendingDeltas());
     }
 
-    private void drainPendingHitDeltas(PlatformTransactionManager txManager) {
+    private void drainPendingHitDeltas(PlatformTransactionManager txManager, int attempt) {
         while (hasPendingDeltas()) {
             if (!flushPermit.tryAcquire()) {
                 return;
@@ -345,6 +359,13 @@ public class SemanticCacheVectorRepository {
                 flushPermit.release();
             }
             if (!batchSucceeded) {
+                if (!shuttingDown && attempt < MAX_ASYNC_RETRY_ATTEMPTS) {
+                    CompletableFuture.delayedExecutor(
+                        RETRY_BASE_DELAY_MS * attempt,
+                        TimeUnit.MILLISECONDS,
+                        HIT_FLUSH_EXECUTOR
+                    ).execute(() -> drainPendingHitDeltas(txManager, attempt + 1));
+                }
                 return;
             }
         }
@@ -352,42 +373,43 @@ public class SemanticCacheVectorRepository {
 
     private boolean drainBatch(PlatformTransactionManager txManager) {
         Map<UUID, Integer> snapshot = new LinkedHashMap<>();
-        pendingHitDeltas.forEach((entryId, counter) -> {
-            int delta = counter.getAndSet(0);
-            if (delta > 0) {
+        for (UUID entryId : List.copyOf(pendingHitDeltas.keySet())) {
+            Integer delta = pendingHitDeltas.remove(entryId);
+            if (delta != null && delta > 0) {
                 snapshot.put(entryId, delta);
             }
-        });
+        }
         if (snapshot.isEmpty()) {
             return true;
         }
-        try {
-            Runnable applyDeltas = () -> snapshot.forEach(this::executeIncrementHitCount);
-            if (txManager != null) {
+        if (txManager != null) {
+            try {
                 TransactionTemplate writeTx = new TransactionTemplate(txManager);
                 writeTx.setPropagationBehavior(TransactionDefinition.PROPAGATION_REQUIRES_NEW);
                 writeTx.setReadOnly(false);
-                writeTx.executeWithoutResult(status -> applyDeltas.run());
-            } else {
-                applyDeltas.run();
+                writeTx.executeWithoutResult(status -> snapshot.forEach(this::executeIncrementHitCount));
+                return true;
+            } catch (RuntimeException ex) {
+                snapshot.forEach((entryId, delta) -> pendingHitDeltas.merge(entryId, delta, Integer::sum));
+                log.warn("Deferred semantic cache hit_count flush failed; deltas retained for retry: {}", ex.getMessage());
+                return false;
             }
-            return true;
-        } catch (RuntimeException ex) {
-            snapshot.forEach((entryId, delta) ->
-                pendingHitDeltas.computeIfAbsent(entryId, ignored -> new AtomicInteger()).addAndGet(delta)
-            );
-            log.warn("Deferred semantic cache hit_count flush failed; deltas retained for retry: {}", ex.getMessage());
-            return false;
         }
+        boolean allSucceeded = true;
+        for (Map.Entry<UUID, Integer> entry : snapshot.entrySet()) {
+            try {
+                executeIncrementHitCount(entry.getKey(), entry.getValue());
+            } catch (RuntimeException ex) {
+                pendingHitDeltas.merge(entry.getKey(), entry.getValue(), Integer::sum);
+                log.warn("Deferred semantic cache hit_count update failed without txManager; delta retained: {}", ex.getMessage());
+                allSucceeded = false;
+            }
+        }
+        return allSucceeded;
     }
 
     private boolean hasPendingDeltas() {
-        for (AtomicInteger counter : pendingHitDeltas.values()) {
-            if (counter.get() > 0) {
-                return true;
-            }
-        }
-        return false;
+        return !pendingHitDeltas.isEmpty();
     }
 
     private void executeIncrementHitCount(UUID id, int delta) {
