@@ -24,10 +24,12 @@ import org.springframework.context.annotation.Import;
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.dao.InvalidDataAccessApiUsageException;
 import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.support.TransactionTemplate;
 
 import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -66,6 +68,9 @@ class VectorStoreAndHnswIndexIntegrationTest {
 
     @Autowired
     private TransactionTemplate transactionTemplate;
+
+    @Autowired
+    private PlatformTransactionManager transactionManager;
 
     @AfterEach
     void cleanUpTestRows() {
@@ -227,11 +232,383 @@ class VectorStoreAndHnswIndexIntegrationTest {
 
         Document orphanWithUnknownDocId = new Document(
             "orphan chunk with unknown document_id",
-            Map.of("document_id", UUID.randomUUID().toString(), "access_level", "PUBLIC")
+            Map.of(
+                "document_id", UUID.randomUUID().toString(),
+                "department_id", UUID.randomUUID().toString(),
+                "file_name", "missing.pdf",
+                "access_level", "PUBLIC",
+                "doc_version", 1,
+                "chunk_index", 0
+            )
         );
 
         assertThatThrownBy(() -> vectorStore.add(List.of(orphanWithUnknownDocId)))
             .isInstanceOf(DataIntegrityViolationException.class);
+    }
+
+    @Test
+    void pgVectorStoreUpsertUpdatesColumnsAndEnforcesRbacMetadataConstraints() {
+        DepartmentEntity hr = departmentRepository.findByCodeIgnoreCase("HR").orElseThrow();
+        DepartmentEntity sales = departmentRepository.findByCodeIgnoreCase("SALES").orElseThrow();
+        UserEntity hrManager = userRepository.findByEmailIgnoreCase("manager.hr@documind.ai").orElseThrow();
+        UUID hrId = hr.getId();
+
+        DocumentEntity hrDoc = new DocumentEntity();
+        hrDoc.setDepartment(hr);
+        hrDoc.setUploadedBy(hrManager);
+        hrDoc.setOriginalName("policy-upsert.md");
+        hrDoc.setStorageKey("hr/policy-upsert.md");
+        hrDoc.setFileExtension("md");
+        hrDoc.setMimeType("text/markdown");
+        hrDoc.setFileSizeBytes(1024L);
+        hrDoc.setFileHash("b".repeat(64));
+        hrDoc.setAccessLevel(AccessLevel.DEPARTMENT);
+        hrDoc.setStatus(DocumentStatus.COMPLETED);
+        hrDoc = documentRepository.saveAndFlush(hrDoc);
+        UUID docId = hrDoc.getId();
+
+        UUID chunkUuid = UUID.randomUUID();
+        String chunkId = chunkUuid.toString();
+
+        Document initialChunk = new Document(
+            chunkId,
+            "Nội dung phiên bản 1 có số trang",
+            Map.of(
+                "document_id", docId.toString(),
+                "department_id", hrId.toString(),
+                "access_level", "DEPARTMENT",
+                "file_name", "policy-upsert.md",
+                "page_number", 5,
+                "chunk_index", 2,
+                "doc_version", 1
+            )
+        );
+        vectorStore.add(List.of(initialChunk));
+
+        // Upsert same chunk ID without page_number -> trigger must clear stale page_number to NULL and normalize metadata key
+        Document upsertedChunkWithoutPage = new Document(
+            chunkId,
+            "Nội dung phiên bản 2 định dạng markdown không phân trang",
+            Map.of(
+                "document_id", docId.toString(),
+                "department_id", hrId.toString(),
+                "access_level", "DEPARTMENT",
+                "file_name", "policy-upsert.md",
+                "chunk_index", 0,
+                "doc_version", 2
+            )
+        );
+        vectorStore.add(List.of(upsertedChunkWithoutPage));
+
+        Map<String, Object> row = jdbcTemplate.queryForMap(
+            "SELECT document_id, page_number, doc_version, chunk_index, jsonb_exists(metadata, 'page_number') AS has_page_key FROM document_chunks WHERE id = ?",
+            chunkUuid
+        );
+        assertThat(row.get("document_id")).isEqualTo(docId);
+        assertThat(row.get("page_number")).isNull();
+        assertThat(row.get("doc_version")).isEqualTo(2);
+        assertThat(row.get("chunk_index")).isEqualTo(0);
+        assertThat(row.get("has_page_key")).isEqualTo(Boolean.TRUE);
+
+        // Upsert same chunk ID omitting document_id must fail instead of silently retaining OLD.document_id
+        Document upsertMissingDocId = new Document(
+            chunkId,
+            "Nội dung thiếu document_id khi upsert",
+            Map.of(
+                "department_id", hrId.toString(),
+                "access_level", "DEPARTMENT",
+                "file_name", "policy-upsert.md",
+                "doc_version", 2,
+                "chunk_index", 0
+            )
+        );
+        assertThatThrownBy(() -> vectorStore.add(List.of(upsertMissingDocId)))
+            .isInstanceOf(DataIntegrityViolationException.class);
+
+        // Mandatory metadata CHECK / trigger checks: department_id, file_name, canonical access_level, doc_version, chunk_index
+        Document missingDepartmentId = new Document(
+            "Chunk thiếu department_id",
+            Map.of(
+                "document_id", docId.toString(),
+                "access_level", "DEPARTMENT",
+                "file_name", "policy-upsert.md",
+                "doc_version", 2,
+                "chunk_index", 1
+            )
+        );
+        assertThatThrownBy(() -> vectorStore.add(List.of(missingDepartmentId)))
+            .isInstanceOf(DataIntegrityViolationException.class);
+
+        Document missingFileName = new Document(
+            "Chunk thiếu file_name",
+            Map.of(
+                "document_id", docId.toString(),
+                "department_id", hrId.toString(),
+                "access_level", "DEPARTMENT",
+                "doc_version", 2,
+                "chunk_index", 1
+            )
+        );
+        assertThatThrownBy(() -> vectorStore.add(List.of(missingFileName)))
+            .isInstanceOf(DataIntegrityViolationException.class);
+
+        Document invalidAccessLevel = new Document(
+            "Chunk sai chuẩn chữ hoa access_level",
+            Map.of(
+                "document_id", docId.toString(),
+                "department_id", hrId.toString(),
+                "access_level", "Department",
+                "file_name", "policy-upsert.md",
+                "doc_version", 2,
+                "chunk_index", 1
+            )
+        );
+        assertThatThrownBy(() -> vectorStore.add(List.of(invalidAccessLevel)))
+            .isInstanceOf(DataIntegrityViolationException.class);
+
+        Document missingDocVersion = new Document(
+            "Chunk thiếu doc_version",
+            Map.of(
+                "document_id", docId.toString(),
+                "department_id", hrId.toString(),
+                "access_level", "DEPARTMENT",
+                "file_name", "policy-upsert.md",
+                "chunk_index", 1
+            )
+        );
+        assertThatThrownBy(() -> vectorStore.add(List.of(missingDocVersion)))
+            .isInstanceOf(DataIntegrityViolationException.class);
+
+        Document missingChunkIndex = new Document(
+            "Chunk thiếu chunk_index",
+            Map.of(
+                "document_id", docId.toString(),
+                "department_id", hrId.toString(),
+                "access_level", "DEPARTMENT",
+                "file_name", "policy-upsert.md",
+                "doc_version", 2
+            )
+        );
+        assertThatThrownBy(() -> vectorStore.add(List.of(missingChunkIndex)))
+            .isInstanceOf(DataIntegrityViolationException.class);
+
+        Document mismatchedDepartment = new Document(
+            "Chunk sai department_id so với document cha",
+            Map.of(
+                "document_id", docId.toString(),
+                "department_id", sales.getId().toString(),
+                "access_level", "DEPARTMENT",
+                "file_name", "policy-upsert.md",
+                "doc_version", 2,
+                "chunk_index", 1
+            )
+        );
+        assertThatThrownBy(() -> vectorStore.add(List.of(mismatchedDepartment)))
+            .isInstanceOf(DataIntegrityViolationException.class);
+
+        Document mismatchedAccessLevel = new Document(
+            "Chunk sai access_level so với document cha",
+            Map.of(
+                "document_id", docId.toString(),
+                "department_id", hrId.toString(),
+                "access_level", "PUBLIC",
+                "file_name", "policy-upsert.md",
+                "doc_version", 2,
+                "chunk_index", 1
+            )
+        );
+        assertThatThrownBy(() -> vectorStore.add(List.of(mismatchedAccessLevel)))
+            .isInstanceOf(DataIntegrityViolationException.class);
+
+        Document duplicateDocVersionChunkIndex = new Document(
+            UUID.randomUUID().toString(),
+            "Chunk trùng (document_id, doc_version, chunk_index)",
+            Map.of(
+                "document_id", docId.toString(),
+                "department_id", hrId.toString(),
+                "access_level", "DEPARTMENT",
+                "file_name", "policy-upsert.md",
+                "doc_version", 2,
+                "chunk_index", 0
+            )
+        );
+        assertThatThrownBy(() -> vectorStore.add(List.of(duplicateDocVersionChunkIndex)))
+            .isInstanceOf(DataIntegrityViolationException.class);
+
+        // Parent update on documents.access_level must propagate to existing document_chunks.metadata
+        hrDoc.setAccessLevel(AccessLevel.PUBLIC);
+        documentRepository.saveAndFlush(hrDoc);
+        String propagatedAccess = jdbcTemplate.queryForObject(
+            "SELECT metadata->>'access_level' FROM document_chunks WHERE id = ?",
+            String.class,
+            chunkUuid
+        );
+        assertThat(propagatedAccess).isEqualTo("PUBLIC");
+    }
+
+    @Test
+    void iterativeScanReturnsFullTopKForSmallDepartmentAndFilteredExplainUsesHnsw() {
+        DepartmentEntity hr = departmentRepository.findByCodeIgnoreCase("HR").orElseThrow();
+        DepartmentEntity sales = departmentRepository.findByCodeIgnoreCase("SALES").orElseThrow();
+        UserEntity hrManager = userRepository.findByEmailIgnoreCase("manager.hr@documind.ai").orElseThrow();
+        UUID hrId = hr.getId();
+
+        DocumentEntity salesDoc = new DocumentEntity();
+        salesDoc.setDepartment(sales);
+        salesDoc.setUploadedBy(hrManager);
+        salesDoc.setOriginalName("sales-flood.pdf");
+        salesDoc.setStorageKey("sales/sales-flood.pdf");
+        salesDoc.setFileExtension("pdf");
+        salesDoc.setMimeType("application/pdf");
+        salesDoc.setFileSizeBytes(4096L);
+        salesDoc.setFileHash("e".repeat(64));
+        salesDoc.setAccessLevel(AccessLevel.DEPARTMENT);
+        salesDoc.setStatus(DocumentStatus.COMPLETED);
+        salesDoc = documentRepository.saveAndFlush(salesDoc);
+
+        DocumentEntity hrDoc = new DocumentEntity();
+        hrDoc.setDepartment(hr);
+        hrDoc.setUploadedBy(hrManager);
+        hrDoc.setOriginalName("hr-target.pdf");
+        hrDoc.setStorageKey("hr/hr-target.pdf");
+        hrDoc.setFileExtension("pdf");
+        hrDoc.setMimeType("application/pdf");
+        hrDoc.setFileSizeBytes(2048L);
+        hrDoc.setFileHash("f".repeat(64));
+        hrDoc.setAccessLevel(AccessLevel.DEPARTMENT);
+        hrDoc.setStatus(DocumentStatus.COMPLETED);
+        hrDoc = documentRepository.saveAndFlush(hrDoc);
+
+        float[] queryVector = embeddingModel.embed("nghỉ phép sales");
+        List<String> positiveHrTexts = new ArrayList<>(5);
+        for (int candidate = 0; positiveHrTexts.size() < 5 && candidate < 200; candidate++) {
+            String hrText = "Chính sách nhân sự đặc thù mục " + candidate;
+            float[] vec = embeddingModel.embed(hrText);
+            double dot = 0.0d;
+            for (int d = 0; d < queryVector.length; d++) {
+                dot += (double) queryVector[d] * vec[d];
+            }
+            if (dot > 0.01d && dot < 0.5d) {
+                positiveHrTexts.add(hrText);
+            }
+        }
+        assertThat(positiveHrTexts).hasSize(5);
+
+        List<Document> batch = new ArrayList<>(85);
+        for (int i = 0; i < 80; i++) {
+            batch.add(new Document(
+                "nghỉ phép sales",
+                Map.of(
+                    "document_id", salesDoc.getId().toString(),
+                    "department_id", sales.getId().toString(),
+                    "access_level", "DEPARTMENT",
+                    "file_name", "sales-flood.pdf",
+                    "page_number", 1,
+                    "chunk_index", i,
+                    "doc_version", 1
+                )
+            ));
+        }
+        for (int i = 0; i < positiveHrTexts.size(); i++) {
+            batch.add(new Document(
+                positiveHrTexts.get(i),
+                Map.of(
+                    "document_id", hrDoc.getId().toString(),
+                    "department_id", hrId.toString(),
+                    "access_level", "DEPARTMENT",
+                    "file_name", "hr-target.pdf",
+                    "page_number", i + 1,
+                    "chunk_index", i,
+                    "doc_version", 1
+                )
+            ));
+        }
+        vectorStore.add(batch);
+
+        FilterExpressionBuilder builder = new FilterExpressionBuilder();
+        List<Document> hrHits = vectorStore.similaritySearch(
+            SearchRequest.builder()
+                .query("nghỉ phép sales")
+                .topK(5)
+                .similarityThreshold(0.0)
+                .filterExpression(builder.eq("department_id", hrId.toString()).build())
+                .build()
+        );
+        assertThat(hrHits).hasSize(5);
+        assertThat(hrHits).allSatisfy(hit ->
+            assertThat(hit.getMetadata().get("department_id")).isEqualTo(hrId.toString())
+        );
+
+        transactionTemplate.executeWithoutResult(status -> {
+            status.setRollbackOnly();
+            jdbcTemplate.execute("SET LOCAL enable_seqscan = off");
+            List<String> filteredPlan = chunkVectorRepository.explainFilteredCosineSearch(hrId, queryVector, 5);
+            assertThat(String.join("\n", filteredPlan))
+                .contains("Index Scan using idx_document_chunks_embedding_hnsw");
+        });
+    }
+
+    @Test
+    void semanticCacheUpsertsDuplicateQueryHashAndSupportsReadOnlyCallerTransactions() {
+        UUID hrId = departmentRepository.findByCodeIgnoreCase("HR").orElseThrow().getId();
+        String managerScope = "DEPT:" + hrId + ":MANAGER";
+        String queryHash = "12345678".repeat(8);
+        String queryText = "Chính sách làm việc từ xa Hybrid";
+        float[] queryVector = embeddingModel.embed(queryText);
+        List<CitationPayload> citations = List.of(
+            new CitationPayload(UUID.randomUUID(), "hybrid-work.pdf", 2, 0.9510d, "Tối đa 2 ngày làm việc từ xa mỗi tuần.")
+        );
+
+        UUID firstId = semanticCacheRepository.save(
+            managerScope,
+            1L,
+            queryHash,
+            queryText,
+            queryVector,
+            "Câu trả lời lần đầu.",
+            citations,
+            "groq",
+            OffsetDateTime.now(ZoneOffset.UTC).plusHours(1)
+        );
+
+        UUID upsertedId = semanticCacheRepository.save(
+            managerScope,
+            1L,
+            queryHash,
+            queryText,
+            queryVector,
+            "Câu trả lời đã được làm mới idempotent.",
+            citations,
+            "gemini",
+            OffsetDateTime.now(ZoneOffset.UTC).plusHours(2)
+        );
+        assertThat(upsertedId).isEqualTo(firstId);
+
+        Integer rowCount = jdbcTemplate.queryForObject(
+            "SELECT COUNT(*) FROM semantic_cache WHERE rbac_scope = ? AND scope_version = 1 AND query_hash = ?",
+            Integer.class,
+            managerScope,
+            queryHash
+        );
+        assertThat(rowCount).isEqualTo(1);
+
+        TransactionTemplate readOnlyTx = new TransactionTemplate(transactionManager);
+        readOnlyTx.setReadOnly(true);
+
+        Optional<SemanticCacheEntry> hitInReadOnlyTx = readOnlyTx.execute(
+            status -> semanticCacheRepository.findBestMatch(managerScope, 1L, queryVector, 0.94d)
+        );
+        assertThat(hitInReadOnlyTx).isPresent();
+        assertThat(hitInReadOnlyTx.orElseThrow().responseContent())
+            .isEqualTo("Câu trả lời đã được làm mới idempotent.");
+        assertThat(hitInReadOnlyTx.orElseThrow().modelProvider()).isEqualTo("gemini");
+
+        Integer hitCount = jdbcTemplate.queryForObject(
+            "SELECT hit_count FROM semantic_cache WHERE id = ?",
+            Integer.class,
+            upsertedId
+        );
+        assertThat(hitCount).isEqualTo(1);
     }
 
     @Test
@@ -358,8 +735,9 @@ class VectorStoreAndHnswIndexIntegrationTest {
         float[] negInfVector = new float[PostgresTestcontainersConfig.EMBEDDING_DIMENSIONS];
         negInfVector[0] = 1.0f;
         negInfVector[1] = Float.NEGATIVE_INFINITY;
+        float[] wrongDimensionVector = new float[]{1.0f, 0.0f, 0.0f};
 
-        List<float[]> invalidVectors = List.of(zeroVector, nanVector, posInfVector, negInfVector);
+        List<float[]> invalidVectors = List.of(zeroVector, nanVector, posInfVector, negInfVector, wrongDimensionVector);
 
         assertThatThrownBy(() -> PgVectorLiterals.toNonZeroFiniteVectorLiteral(null, "queryVector"))
             .isInstanceOf(IllegalArgumentException.class);

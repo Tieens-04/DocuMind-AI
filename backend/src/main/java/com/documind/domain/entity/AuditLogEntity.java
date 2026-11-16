@@ -7,14 +7,16 @@ import jakarta.persistence.Entity;
 import jakarta.persistence.EnumType;
 import jakarta.persistence.Enumerated;
 import jakarta.persistence.FetchType;
-import jakarta.persistence.GeneratedValue;
-import jakarta.persistence.GenerationType;
 import jakarta.persistence.Id;
 import jakarta.persistence.JoinColumn;
 import jakarta.persistence.ManyToOne;
+import jakarta.persistence.PostLoad;
+import jakarta.persistence.PostPersist;
 import jakarta.persistence.PrePersist;
 import jakarta.persistence.Table;
-import org.hibernate.Hibernate;
+import jakarta.persistence.Transient;
+import org.hibernate.annotations.Immutable;
+import org.springframework.data.domain.Persistable;
 
 import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
@@ -25,68 +27,72 @@ import java.util.UUID;
  * Immutable audit and cost-governance event log across RAG queries, document operations, auth, and rate limits.
  */
 @Entity
+@Immutable
 @Table(name = "audit_logs")
-public class AuditLogEntity {
+public class AuditLogEntity implements Persistable<UUID> {
 
     @Id
-    @GeneratedValue(strategy = GenerationType.UUID)
+    @AssignedOrRandomUuid
     @Column(name = "id", nullable = false, updatable = false)
     private UUID id;
 
+    @Transient
+    private boolean isNew = true;
+
     @ManyToOne(fetch = FetchType.LAZY)
-    @JoinColumn(name = "user_id")
+    @JoinColumn(name = "user_id", updatable = false)
     private UserEntity user;
 
     @Column(name = "user_id", insertable = false, updatable = false)
     private UUID userId;
 
     @ManyToOne(fetch = FetchType.LAZY)
-    @JoinColumn(name = "department_id")
+    @JoinColumn(name = "department_id", updatable = false)
     private DepartmentEntity department;
 
     @Column(name = "department_id", insertable = false, updatable = false)
     private UUID departmentId;
 
     @ManyToOne(fetch = FetchType.LAZY)
-    @JoinColumn(name = "session_id")
+    @JoinColumn(name = "session_id", updatable = false)
     private ChatSessionEntity session;
 
     @Column(name = "session_id", insertable = false, updatable = false)
     private UUID sessionId;
 
     @Enumerated(EnumType.STRING)
-    @Column(name = "action_type", nullable = false, length = 40)
+    @Column(name = "action_type", nullable = false, updatable = false, length = 40)
     private AuditActionType actionType;
 
-    @Column(name = "query_text", columnDefinition = "TEXT")
+    @Column(name = "query_text", updatable = false, columnDefinition = "TEXT")
     private String queryText;
 
-    @Column(name = "abstained", nullable = false)
+    @Column(name = "abstained", nullable = false, updatable = false)
     private Boolean abstained = Boolean.FALSE;
 
-    @Column(name = "cache_hit", nullable = false)
+    @Column(name = "cache_hit", nullable = false, updatable = false)
     private Boolean cacheHit = Boolean.FALSE;
 
     @Enumerated(EnumType.STRING)
-    @Column(name = "cache_tier", nullable = false, length = 16)
+    @Column(name = "cache_tier", nullable = false, updatable = false, length = 16)
     private CacheTier cacheTier = CacheTier.NONE;
 
-    @Column(name = "prompt_tokens", nullable = false)
+    @Column(name = "prompt_tokens", nullable = false, updatable = false)
     private Integer promptTokens = 0;
 
-    @Column(name = "completion_tokens", nullable = false)
+    @Column(name = "completion_tokens", nullable = false, updatable = false)
     private Integer completionTokens = 0;
 
-    @Column(name = "latency_ms", nullable = false)
+    @Column(name = "latency_ms", nullable = false, updatable = false)
     private Long latencyMs = 0L;
 
-    @Column(name = "provider", length = 64)
+    @Column(name = "provider", updatable = false, length = 64)
     private String provider;
 
-    @Column(name = "status_code", nullable = false)
+    @Column(name = "status_code", nullable = false, updatable = false)
     private Integer statusCode = 200;
 
-    @Column(name = "ip_address", length = 45)
+    @Column(name = "ip_address", updatable = false, length = 45)
     private String ipAddress;
 
     @Column(name = "created_at", nullable = false, updatable = false)
@@ -97,12 +103,10 @@ public class AuditLogEntity {
         if (abstained == null) {
             abstained = Boolean.FALSE;
         }
-        if (cacheHit == null) {
-            cacheHit = Boolean.FALSE;
-        }
         if (cacheTier == null) {
             cacheTier = CacheTier.NONE;
         }
+        cacheHit = (cacheTier != CacheTier.NONE);
         if (promptTokens == null) {
             promptTokens = 0;
         }
@@ -120,6 +124,18 @@ public class AuditLogEntity {
         }
     }
 
+    @PostPersist
+    @PostLoad
+    void markPersisted() {
+        this.isNew = false;
+    }
+
+    @Override
+    public boolean isNew() {
+        return isNew;
+    }
+
+    @Override
     public UUID getId() {
         return id;
     }
@@ -134,11 +150,11 @@ public class AuditLogEntity {
 
     public void setUser(UserEntity user) {
         this.user = user;
-        this.userId = user != null ? user.getId() : null;
+        this.userId = JpaProxyUtils.extractId(user);
     }
 
     public UUID getUserId() {
-        return userId != null ? userId : (user != null ? user.getId() : null);
+        return userId != null ? userId : JpaProxyUtils.extractId(user);
     }
 
     public DepartmentEntity getDepartment() {
@@ -147,11 +163,11 @@ public class AuditLogEntity {
 
     public void setDepartment(DepartmentEntity department) {
         this.department = department;
-        this.departmentId = department != null ? department.getId() : null;
+        this.departmentId = JpaProxyUtils.extractId(department);
     }
 
     public UUID getDepartmentId() {
-        return departmentId != null ? departmentId : (department != null ? department.getId() : null);
+        return departmentId != null ? departmentId : JpaProxyUtils.extractId(department);
     }
 
     public ChatSessionEntity getSession() {
@@ -160,11 +176,11 @@ public class AuditLogEntity {
 
     public void setSession(ChatSessionEntity session) {
         this.session = session;
-        this.sessionId = session != null ? session.getId() : null;
+        this.sessionId = JpaProxyUtils.extractId(session);
     }
 
     public UUID getSessionId() {
-        return sessionId != null ? sessionId : (session != null ? session.getId() : null);
+        return sessionId != null ? sessionId : JpaProxyUtils.extractId(session);
     }
 
     public AuditActionType getActionType() {
@@ -213,6 +229,7 @@ public class AuditLogEntity {
 
     public void setCacheTier(CacheTier cacheTier) {
         this.cacheTier = cacheTier;
+        this.cacheHit = (cacheTier != null && cacheTier != CacheTier.NONE);
     }
 
     public Integer getPromptTokens() {
@@ -276,16 +293,18 @@ public class AuditLogEntity {
         if (this == o) {
             return true;
         }
-        if (o == null || Hibernate.getClass(this) != Hibernate.getClass(o)) {
+        if (o == null || JpaProxyUtils.effectiveClass(this) != JpaProxyUtils.effectiveClass(o)) {
             return false;
         }
         AuditLogEntity that = (AuditLogEntity) o;
-        return id != null && Objects.equals(id, that.getId());
+        UUID thisId = JpaProxyUtils.extractId(this);
+        UUID thatId = JpaProxyUtils.extractId(that);
+        return thisId != null && Objects.equals(thisId, thatId);
     }
 
     @Override
     public int hashCode() {
-        return Hibernate.getClass(this).hashCode();
+        return JpaProxyUtils.effectiveClass(this).hashCode();
     }
 
     @Override

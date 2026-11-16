@@ -23,7 +23,8 @@ Design and initialize all **9 database tables** (`7` relational tables + `2` `10
 ### 2.1 Hybrid Persistence Boundary (JPA for Relational + `PgVectorStore`/`JdbcClient` for Vector)
 - **7 Relational Tables (`V1`):** Mapped via JPA `@Entity` classes (`com.documind.domain.entity`) and Spring Data `JpaRepository` interfaces (`com.documind.repository`). All `@ManyToOne` associations use `FetchType.LAZY` (`open-in-view: false`), and JSONB payloads (`chat_messages.citations`) use Hibernate 6 native `@JdbcTypeCode(SqlTypes.JSON)`.
 - **2 Vector Tables (`V2`):** Accessed via Spring AI `VectorStore` (`PgVectorStore`) and lightweight `JdbcClient` repositories (`com.documind.infrastructure.vector`) without adding `hibernate-vector` or loading `float[1024]` arrays into JPA Persistence Context memory.
-- **Trigger-Synchronized `ON DELETE CASCADE` on `document_chunks`:** Spring AI `1.0.3` `PgVectorStore` executes hardcoded `INSERT INTO public.document_chunks (id, content, metadata, embedding) VALUES (?, ?, ?::jsonb, ?) ON CONFLICT (id) DO UPDATE ...`. To preserve native `PgVectorStore` compatibility *and* guarantee zero orphan vectors at the database level, `document_chunks` defines `document_id UUID NOT NULL REFERENCES documents(id) ON DELETE CASCADE` (plus `doc_version`, `chunk_index`, `page_number`) populated automatically by a `BEFORE INSERT OR UPDATE` trigger (`trg_sync_document_chunk_metadata`) reading `NEW.metadata`.
+- **Trigger-Synchronized `ON DELETE CASCADE` on `document_chunks`:** Spring AI `1.0.3` `PgVectorStore` executes hardcoded `INSERT INTO public.document_chunks (id, content, metadata, embedding) VALUES (?, ?, ?::jsonb, ?) ON CONFLICT (id) DO UPDATE ...`. To preserve native `PgVectorStore` compatibility *and* guarantee zero orphan vectors at the database level, `document_chunks` defines `document_id UUID NOT NULL REFERENCES documents(id) ON DELETE CASCADE` (plus `doc_version`, `chunk_index`, `page_number`) populated automatically by a `BEFORE INSERT OR UPDATE` trigger (`trg_sync_document_chunk_metadata`) reading `NEW.metadata` (`V4` hardens this to reject missing `doc_version`/`chunk_index`, validate parent `department_id`/`access_level` ownership, normalize `page_number`, and propagate `documents` RBAC changes via `trg_propagate_document_rbac_to_chunks`).
+- **HNSW Filtered Search (`iterative_scan`):** `application.yml` configures Hikari `connection-init-sql: SET hnsw.iterative_scan = 'relaxed_order'` (requiring pgvector `>= 0.8.0`, pinned to digest in `docker-compose.yml` and `PostgresTestcontainersConfig`) so RBAC-filtered `PgVectorStore` searches never truncate below `topK` on small departments, while `SemanticCacheVectorRepository` uses pgvector's `MATERIALIZED` CTE re-ranking pattern.
 
 ### 2.2 Canonical Enum & RBAC Semantics
 - Stored in PostgreSQL as `VARCHAR` columns guarded by explicit `CHECK` constraints (`@Enumerated(EnumType.STRING)` in JPA) for clean Flyway evolution and zero PostgreSQL custom-type cast friction:
@@ -76,6 +77,7 @@ Creates the `set_updated_at_timestamp()` trigger function and all **7 relational
    - `cache_version BIGINT NOT NULL DEFAULT 1 CONSTRAINT chk_departments_cache_version CHECK (cache_version >= 1)`
    - `created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP`
    - `updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP`
+   - Case-insensitive unique index: `uq_departments_code_lower (LOWER(code))`
 
 2. **`users`**
    - `id UUID PRIMARY KEY DEFAULT gen_random_uuid()`
@@ -87,7 +89,7 @@ Creates the `set_updated_at_timestamp()` trigger function and all **7 relational
    - `is_active BOOLEAN NOT NULL DEFAULT TRUE`
    - `created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP`
    - `updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP`
-   - Indexes: `idx_users_department_id (department_id)`, `idx_users_role (role)`
+   - Indexes: `uq_users_email_lower (LOWER(email))`, `idx_users_department_id (department_id)`, `idx_users_role (role)`
 
 3. **`refresh_tokens`**
    - `id UUID PRIMARY KEY DEFAULT gen_random_uuid()`
@@ -106,7 +108,7 @@ Creates the `set_updated_at_timestamp()` trigger function and all **7 relational
    - `department_id UUID NOT NULL CONSTRAINT fk_documents_department REFERENCES departments(id) ON DELETE RESTRICT`
    - `uploaded_by UUID CONSTRAINT fk_documents_uploaded_by REFERENCES users(id) ON DELETE SET NULL`
    - `original_name VARCHAR(255) NOT NULL`
-   - `storage_key VARCHAR(512) NOT NULL`
+   - `storage_key VARCHAR(512) NOT NULL CONSTRAINT uq_documents_storage_key UNIQUE`
    - `file_extension VARCHAR(16) NOT NULL CONSTRAINT chk_documents_extension CHECK (file_extension IN ('pdf', 'docx', 'txt', 'md'))`
    - `mime_type VARCHAR(128) NOT NULL`
    - `file_size_bytes BIGINT NOT NULL CONSTRAINT chk_documents_size CHECK (file_size_bytes > 0 AND file_size_bytes <= 52428800)`
@@ -161,6 +163,7 @@ Creates the `set_updated_at_timestamp()` trigger function and all **7 relational
    - `status_code INT NOT NULL DEFAULT 200`
    - `ip_address VARCHAR(45)`
    - `created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP`
+   - Constraint: `chk_audit_logs_cache_consistency CHECK ((cache_hit = FALSE AND cache_tier = 'NONE') OR (cache_hit = TRUE AND cache_tier IN ('L1', 'L2')))`
    - Indexes: `idx_audit_logs_created_at (created_at DESC)`, `idx_audit_logs_dept_created (department_id, created_at DESC)`, `idx_audit_logs_action_created (action_type, created_at DESC)`
 
 ### 3.2 `V2__init_pgvector_and_semantic_cache.sql` (`classpath:db/migration`)
@@ -174,11 +177,11 @@ Enables `CREATE EXTENSION IF NOT EXISTS vector;` and creates the **2 vector tabl
    - `chunk_index INT NOT NULL DEFAULT 0 CONSTRAINT chk_document_chunks_index CHECK (chunk_index >= 0)`
    - `page_number INT CONSTRAINT chk_document_chunks_page CHECK (page_number IS NULL OR page_number >= 1)`
    - `content TEXT NOT NULL`
-   - `metadata JSONB NOT NULL DEFAULT '{}'::jsonb`
+   - `metadata JSONB NOT NULL DEFAULT '{}'::jsonb` (guarded by `chk_document_chunks_rbac_metadata` requiring non-blank `document_id`, `department_id`, `file_name`, and `access_level IN ('PUBLIC', 'DEPARTMENT', 'CONFIDENTIAL')`)
    - `embedding vector(1024) NOT NULL`
    - `created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP`
    - **Trigger `trg_sync_document_chunk_metadata` (`BEFORE INSERT OR UPDATE`):**
-     Extracts `metadata->>'document_id'` (into `NEW.document_id` when present), `metadata->>'doc_version'` (defaulting to `1`), `metadata->>'chunk_index'` (defaulting to `0`), and `metadata->>'page_number'` (nullable `INT`).
+     Synchronizes `metadata->>'document_id'`, `metadata->>'doc_version'` (defaulting to `1`), `metadata->>'chunk_index'` (defaulting to `0`), and `metadata->>'page_number'` (nullable `INT`, cleared to `NULL` if omitted on `ON CONFLICT DO UPDATE`).
    - **Indexes:**
      - `idx_document_chunks_embedding_hnsw`: `USING hnsw (embedding vector_cosine_ops) WITH (m = 16, ef_construction = 64)`
      - `idx_document_chunks_metadata_gin`: `USING gin (metadata)`
@@ -197,8 +200,9 @@ Enables `CREATE EXTENSION IF NOT EXISTS vector;` and creates the **2 vector tabl
    - `hit_count INT NOT NULL DEFAULT 0 CONSTRAINT chk_semantic_cache_hit_count CHECK (hit_count >= 0)`
    - `created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP`
    - `expires_at TIMESTAMPTZ`
-   - **Indexes:**
-     - `idx_semantic_cache_embedding_hnsw`: `USING hnsw (query_embedding vector_cosine_ops) WITH (m = 16, ef_construction = 64)`
+   - **Constraints & Indexes:**
+     - `uq_semantic_cache_scope_hash`: `UNIQUE (rbac_scope, scope_version, query_hash)` (supports idempotent `ON CONFLICT DO UPDATE` writes)
+     - `idx_semantic_cache_embedding_hnsw`: `USING hnsw (query_embedding vector_cosine_ops) WITH (m = 16, ef_construction = 64)` (queried with `SET LOCAL hnsw.iterative_scan = 'relaxed_order'`)
      - `idx_semantic_cache_scope_lookup`: `(rbac_scope, scope_version)`
 
 ### 3.3 `V3__seed_dev_data.sql` (`classpath:db/seed`)
@@ -213,6 +217,14 @@ Idempotent (`ON CONFLICT DO NOTHING`) seed script with deterministic UUIDs and a
 | User (Admin) | `aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa` | `admin@documind.ai` | `SYSTEM_ADMIN` in `IT` |
 | User (Manager) | `bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb` | `manager.hr@documind.ai` | `DEPARTMENT_MANAGER` in `HR` |
 | User (Employee) | `cccccccc-cccc-cccc-cccc-cccccccccccc` | `employee.sales@documind.ai` | `STANDARD_EMPLOYEE` in `SALES` |
+
+### 3.4 `V4__harden_schema_and_rbac_invariants.sql` (`classpath:db/migration`)
+
+Additive post-merge migration (leaving `V1` and `V2` byte-for-byte immutable) enforcing:
+- Case-insensitive unique indexes `uq_departments_code_lower` and `uq_users_email_lower`.
+- `uq_documents_storage_key`, `chk_audit_logs_cache_consistency` (`NOT VALID` -> `VALIDATE CONSTRAINT`), and `uq_semantic_cache_scope_hash`.
+- Hardened `sync_document_chunk_metadata()` requiring `document_id`, `department_id`, `file_name`, `access_level`, `doc_version`, and `chunk_index`, normalizing `page_number` to JSON `null` when omitted, validating parent `documents.department_id` and `documents.access_level` ownership, plus `chk_document_chunks_rbac_metadata` and `uq_document_chunks_doc_version_index`.
+- `trg_propagate_document_rbac_to_chunks` (`AFTER UPDATE OF department_id, access_level ON documents`) propagating RBAC metadata updates to existing `document_chunks`.
 
 ---
 
