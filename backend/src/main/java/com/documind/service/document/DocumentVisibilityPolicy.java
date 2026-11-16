@@ -29,9 +29,11 @@ public final class DocumentVisibilityPolicy {
         return switch (caller.role()) {
             case SYSTEM_ADMIN -> true;
             case DEPARTMENT_MANAGER -> documentAccessLevel == AccessLevel.PUBLIC
-                || Objects.equals(caller.departmentId(), documentDepartmentId);
+                || (caller.departmentId() != null
+                    && Objects.equals(caller.departmentId(), documentDepartmentId));
             case STANDARD_EMPLOYEE -> documentAccessLevel == AccessLevel.PUBLIC
-                || (Objects.equals(caller.departmentId(), documentDepartmentId)
+                || (caller.departmentId() != null
+                    && Objects.equals(caller.departmentId(), documentDepartmentId)
                     && documentAccessLevel == AccessLevel.DEPARTMENT);
         };
     }

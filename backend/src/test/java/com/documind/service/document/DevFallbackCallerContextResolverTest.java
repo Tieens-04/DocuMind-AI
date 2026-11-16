@@ -11,6 +11,7 @@ import org.junit.jupiter.api.Test;
 import org.springframework.context.annotation.ConditionContext;
 import org.springframework.core.type.AnnotatedTypeMetadata;
 import org.springframework.dao.DataIntegrityViolationException;
+import org.springframework.http.HttpMethod;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ProblemDetail;
 import org.springframework.http.ResponseEntity;
@@ -18,6 +19,7 @@ import org.springframework.mock.env.MockEnvironment;
 import org.springframework.mock.web.MockHttpServletRequest;
 import org.springframework.web.HttpRequestMethodNotSupportedException;
 
+import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.UUID;
@@ -193,10 +195,11 @@ class DevFallbackCallerContextResolverTest {
             .doesNotContain("secret_table");
 
         ResponseEntity<ProblemDetail> methodNotAllowedResp = handler.handleUnhandledException(
-            new HttpRequestMethodNotSupportedException("PUT"),
+            new HttpRequestMethodNotSupportedException("PUT", List.of("GET", "POST")),
             request
         );
         assertThat(methodNotAllowedResp.getStatusCode()).isEqualTo(HttpStatus.METHOD_NOT_ALLOWED);
+        assertThat(methodNotAllowedResp.getHeaders().getAllow()).contains(HttpMethod.GET, HttpMethod.POST);
         ProblemDetail methodBody = Objects.requireNonNull(methodNotAllowedResp.getBody());
         assertThat(methodBody.getStatus()).isEqualTo(405);
         assertThat(methodBody.getProperties()).containsEntry("errorCode", "REQUEST_ERROR");

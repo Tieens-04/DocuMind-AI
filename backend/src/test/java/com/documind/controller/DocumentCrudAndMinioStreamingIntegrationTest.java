@@ -426,6 +426,7 @@ class DocumentCrudAndMinioStreamingIntegrationTest {
             ProblemDetail.class
         );
         assertThat(methodNotAllowedResp.getStatusCode()).isEqualTo(HttpStatus.METHOD_NOT_ALLOWED);
+        assertThat(methodNotAllowedResp.getHeaders().getAllow()).contains(HttpMethod.GET);
         ProblemDetail methodProblem = Objects.requireNonNull(methodNotAllowedResp.getBody());
         assertThat(methodProblem.getStatus()).isEqualTo(405);
         assertThat(methodProblem.getProperties()).containsEntry("errorCode", "REQUEST_ERROR");

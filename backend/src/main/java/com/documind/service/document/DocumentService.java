@@ -209,8 +209,9 @@ public class DocumentService {
     }
 
     /**
-     * Returns paginated documents scoped by caller visibility ({@code PUBLIC} or own department for non-admins)
-     * intersected with optional filters.
+     * Returns paginated documents scoped by caller role visibility ({@code SYSTEM_ADMIN}: all;
+     * {@code DEPARTMENT_MANAGER}: {@code PUBLIC} or own department; {@code STANDARD_EMPLOYEE}: {@code PUBLIC}
+     * or own-department {@code DEPARTMENT}, never {@code CONFIDENTIAL}) intersected with optional filters.
      */
     public PageResponse<DocumentResponse> listDocuments(
         UUID filterDepartmentId,
@@ -279,6 +280,7 @@ public class DocumentService {
         requireCallerDepartment(caller);
 
         transactionTemplate().executeWithoutResult(status -> {
+            UserEntity auditUser = resolveVerifiedActor(caller, caller.isSystemAdmin() ? null : caller.departmentId());
             DocumentEntity document = documentRepository().findById(documentId)
                 .orElseThrow(() -> new DocumentNotFoundException(documentId));
             if (!caller.isSystemAdmin() && !Objects.equals(caller.departmentId(), document.getDepartmentId())) {
@@ -290,7 +292,6 @@ public class DocumentService {
             DepartmentEntity department = document.getDepartment();
             AccessLevel accessLevel = document.getAccessLevel();
             String originalName = document.getOriginalName();
-            UserEntity auditUser = resolveVerifiedActor(caller, documentDepartmentId);
 
             documentRepository().delete(document);
             saveAuditLog(

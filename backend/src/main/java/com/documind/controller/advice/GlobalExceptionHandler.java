@@ -254,7 +254,9 @@ public class GlobalExceptionHandler {
             String detail = clientError ? errorResponse.getBody().getDetail() : "An unexpected internal error occurred";
             String errorCode = clientError ? "REQUEST_ERROR" : "INTERNAL_ERROR";
             ProblemDetail problem = buildProblem(status, title, detail, errorCode, request);
-            return ResponseEntity.of(problem).build();
+            return ResponseEntity.status(status)
+                .headers(errorResponse.getHeaders())
+                .body(problem);
         }
         log.error("Unhandled exception on {}", request != null ? request.getRequestURI() : "unknown", ex);
         ProblemDetail problem = buildProblem(
@@ -278,7 +280,11 @@ public class GlobalExceptionHandler {
         ProblemDetail problem = ProblemDetail.forStatusAndDetail(status, safeDetail);
         problem.setTitle(title);
         if (request != null && request.getRequestURI() != null && !request.getRequestURI().isBlank()) {
-            problem.setInstance(URI.create(request.getRequestURI()));
+            try {
+                problem.setInstance(URI.create(request.getRequestURI()));
+            } catch (IllegalArgumentException ignored) {
+                // Ignore malformed request URI when building ProblemDetail instance
+            }
         }
         problem.setProperty(ERROR_CODE_PROPERTY, errorCode);
         return problem;
