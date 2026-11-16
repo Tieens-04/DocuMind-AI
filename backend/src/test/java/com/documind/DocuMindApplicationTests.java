@@ -1,5 +1,8 @@
 package com.documind;
 
+import com.documind.service.document.CallerContextResolver;
+import com.documind.service.document.DevFallbackCallerContextResolver;
+import com.documind.service.document.ProdCallerContextResolver;
 import org.junit.jupiter.api.Test;
 import org.springframework.ai.chat.client.ChatClient;
 import org.springframework.ai.embedding.EmbeddingModel;
@@ -7,6 +10,7 @@ import org.springframework.ai.ollama.OllamaEmbeddingModel;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.context.ApplicationContext;
 import org.springframework.core.env.Environment;
 import org.springframework.test.context.ActiveProfiles;
 
@@ -18,6 +22,12 @@ class DocuMindApplicationTests {
 
     @Autowired
     private Environment environment;
+
+    @Autowired
+    private ApplicationContext applicationContext;
+
+    @Autowired
+    private CallerContextResolver callerContextResolver;
 
     @Autowired
     private ChatClient primaryChatClient;
@@ -34,6 +44,8 @@ class DocuMindApplicationTests {
         assertThat(environment.getProperty("spring.threads.virtual.enabled", Boolean.class)).isTrue();
         assertThat(environment.getProperty("spring.ai.vectorstore.pgvector.initialize-schema", Boolean.class)).isFalse();
         assertThat(environment.getProperty("spring.ai.vectorstore.pgvector.dimensions", Integer.class)).isEqualTo(1024);
+        assertThat(applicationContext.getBeansOfType(DevFallbackCallerContextResolver.class)).isEmpty();
+        assertThat(callerContextResolver).isInstanceOf(ProdCallerContextResolver.class);
 
         assertThat(primaryChatClient).isNotNull();
         assertThat(geminiChatClient).isNotNull().isNotSameAs(primaryChatClient);

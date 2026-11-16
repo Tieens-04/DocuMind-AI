@@ -48,6 +48,7 @@ import org.springframework.http.ProblemDetail;
 import org.springframework.http.ResponseEntity;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.mock.web.MockHttpServletRequest;
+import org.springframework.test.context.ActiveProfiles;
 import org.springframework.transaction.event.TransactionPhase;
 import org.springframework.transaction.event.TransactionalEventListener;
 import org.springframework.util.LinkedMultiValueMap;
@@ -61,6 +62,7 @@ import software.amazon.awssdk.services.s3.model.ListObjectsV2Response;
 import software.amazon.awssdk.services.s3.model.NoSuchKeyException;
 import software.amazon.awssdk.services.s3.model.S3Object;
 
+import java.io.InputStream;
 import java.lang.management.ManagementFactory;
 import java.lang.management.MemoryMXBean;
 import java.lang.management.MemoryPoolMXBean;
@@ -73,18 +75,24 @@ import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.time.Duration;
+import java.util.ArrayList;
 import java.util.HexFormat;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.UUID;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.CyclicBarrier;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
+@ActiveProfiles("dev")
 @Import({
     PostgresTestcontainersConfig.class,
     MinioTestcontainersConfig.class,
@@ -94,7 +102,9 @@ class DocumentCrudAndMinioStreamingIntegrationTest {
 
     private static final UUID IT_DEPT_ID = UUID.fromString("11111111-1111-1111-1111-111111111111");
     private static final UUID HR_DEPT_ID = UUID.fromString("22222222-2222-2222-2222-222222222222");
+    private static final UUID SALES_DEPT_ID = UUID.fromString("33333333-3333-3333-3333-333333333333");
     private static final UUID HR_MANAGER_USER_ID = UUID.fromString("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb");
+    private static final UUID SALES_EMPLOYEE_USER_ID = UUID.fromString("cccccccc-cccc-cccc-cccc-cccccccccccc");
     private static final long ONE_MIB_BYTES = 1024L * 1024L;
     private static final long FORTY_MIB_BYTES = 40L * 1024L * 1024L;
     private static final long MAX_BOUNDED_HEAP_DELTA_BYTES = 20L * 1024L * 1024L;
@@ -269,6 +279,7 @@ class DocumentCrudAndMinioStreamingIntegrationTest {
         assertThat(duplicateProblem.getProperties().get("existingDocumentId").toString())
             .isEqualTo(firstDocId.toString());
         assertThat(duplicateProblem.getProperties()).containsEntry("fileHash", expectedHash);
+        assertThat(duplicateProblem.getDetail()).doesNotContain(IT_DEPT_ID.toString());
 
         ListObjectsV2Response itObjects = s3Client.listObjectsV2(ListObjectsV2Request.builder()
             .bucket(storageProperties.bucket())
@@ -406,6 +417,18 @@ class DocumentCrudAndMinioStreamingIntegrationTest {
             .contains("/api/v1/documents/upload")
             .contains("/api/v1/documents/{id}/status")
             .contains("Documents");
+
+        // Unsupported HTTP method returns 405 RFC 7807 ProblemDetail instead of unformatted framework error
+        ResponseEntity<ProblemDetail> methodNotAllowedResp = restTemplate.exchange(
+            "/api/v1/documents",
+            HttpMethod.PUT,
+            HttpEntity.EMPTY,
+            ProblemDetail.class
+        );
+        assertThat(methodNotAllowedResp.getStatusCode()).isEqualTo(HttpStatus.METHOD_NOT_ALLOWED);
+        ProblemDetail methodProblem = Objects.requireNonNull(methodNotAllowedResp.getBody());
+        assertThat(methodProblem.getStatus()).isEqualTo(405);
+        assertThat(methodProblem.getProperties()).containsEntry("errorCode", "REQUEST_ERROR");
     }
 
     @Test
@@ -528,10 +551,47 @@ class DocumentCrudAndMinioStreamingIntegrationTest {
         assertThat(itFiltered.totalElements()).isEqualTo(1L);
         assertThat(itFiltered.items()).extracting(DocumentResponse::id).containsExactly(itDeptDoc.id());
 
-        // 5. STANDARD_EMPLOYEE RBAC: 403 on upload & delete, 200 on own/PUBLIC status, sanitized 403 on cross-dept CONFIDENTIAL status
+        // 5. STANDARD_EMPLOYEE RBAC: excludes own-dept CONFIDENTIAL from list & status (403), 403 on upload/delete, 200 on DEPARTMENT/PUBLIC
         HttpHeaders itEmployeeHeaders = new HttpHeaders();
         itEmployeeHeaders.set("X-Department-Id", IT_DEPT_ID.toString());
         itEmployeeHeaders.set("X-User-Role", "STANDARD_EMPLOYEE");
+
+        ResponseEntity<PageResponse<DocumentResponse>> itEmployeeList = restTemplate.exchange(
+            "/api/v1/documents?page=0&size=10",
+            HttpMethod.GET,
+            new HttpEntity<>(itEmployeeHeaders),
+            new ParameterizedTypeReference<>() {}
+        );
+        assertThat(itEmployeeList.getStatusCode()).isEqualTo(HttpStatus.OK);
+        PageResponse<DocumentResponse> employeeVisibleDocs = Objects.requireNonNull(itEmployeeList.getBody());
+        assertThat(employeeVisibleDocs.totalElements()).isEqualTo(2L);
+        assertThat(employeeVisibleDocs.items())
+            .extracting(DocumentResponse::id)
+            .containsExactly(hrPublicDoc.id(), itDeptDoc.id())
+            .doesNotContain(itConfidentialDoc.id(), hrConfidentialDoc.id());
+
+        ResponseEntity<PageResponse<DocumentResponse>> employeeConfidentialFilter = restTemplate.exchange(
+            "/api/v1/documents?accessLevel=CONFIDENTIAL&page=0&size=10",
+            HttpMethod.GET,
+            new HttpEntity<>(itEmployeeHeaders),
+            new ParameterizedTypeReference<>() {}
+        );
+        assertThat(employeeConfidentialFilter.getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertThat(Objects.requireNonNull(employeeConfidentialFilter.getBody()).totalElements()).isZero();
+        assertThat(employeeConfidentialFilter.getBody().items()).isEmpty();
+
+        ResponseEntity<ProblemDetail> employeeOwnConfidentialStatus = restTemplate.exchange(
+            "/api/v1/documents/" + itConfidentialDoc.id() + "/status",
+            HttpMethod.GET,
+            new HttpEntity<>(itEmployeeHeaders),
+            ProblemDetail.class
+        );
+        assertThat(employeeOwnConfidentialStatus.getStatusCode()).isEqualTo(HttpStatus.FORBIDDEN);
+        ProblemDetail ownConfidentialProblem = Objects.requireNonNull(employeeOwnConfidentialStatus.getBody());
+        assertThat(ownConfidentialProblem.getProperties()).containsEntry("errorCode", "DOCUMENT_ACCESS_DENIED");
+        assertThat(ownConfidentialProblem.getDetail())
+            .doesNotContain(IT_DEPT_ID.toString())
+            .doesNotContain(itConfidentialDoc.id().toString());
 
         ResponseEntity<ProblemDetail> employeeUploadForbidden = restTemplate.postForEntity(
             "/api/v1/documents/upload",
@@ -577,6 +637,34 @@ class DocumentCrudAndMinioStreamingIntegrationTest {
             .doesNotContain(IT_DEPT_ID.toString())
             .doesNotContain(HR_DEPT_ID.toString())
             .doesNotContain(hrConfidentialDoc.id().toString());
+
+        // 5b. Privilege escalation via X-User-Role header above DB user role is rejected (403) on upload and list
+        ResponseEntity<ProblemDetail> roleEscalatedUploadForbidden = restTemplate.postForEntity(
+            "/api/v1/documents/upload",
+            buildMultipartEntity(
+                "escalated.txt",
+                "text/plain",
+                "Denied".getBytes(StandardCharsets.UTF_8),
+                SALES_DEPT_ID,
+                AccessLevel.DEPARTMENT,
+                "DEPARTMENT_MANAGER",
+                SALES_EMPLOYEE_USER_ID
+            ),
+            ProblemDetail.class
+        );
+        assertThat(roleEscalatedUploadForbidden.getStatusCode()).isEqualTo(HttpStatus.FORBIDDEN);
+
+        HttpHeaders escalatedListHeaders = new HttpHeaders();
+        escalatedListHeaders.set("X-Department-Id", SALES_DEPT_ID.toString());
+        escalatedListHeaders.set("X-User-Id", SALES_EMPLOYEE_USER_ID.toString());
+        escalatedListHeaders.set("X-User-Role", "SYSTEM_ADMIN");
+        ResponseEntity<ProblemDetail> roleEscalatedListForbidden = restTemplate.exchange(
+            "/api/v1/documents?page=0&size=10",
+            HttpMethod.GET,
+            new HttpEntity<>(escalatedListHeaders),
+            ProblemDetail.class
+        );
+        assertThat(roleEscalatedListForbidden.getStatusCode()).isEqualTo(HttpStatus.FORBIDDEN);
 
         // 6. IT manager cannot upload into HR via ?departmentId= or spoof HR manager X-User-Id
         ResponseEntity<ProblemDetail> crossDeptUploadQueryForbidden = restTemplate.postForEntity(
@@ -754,6 +842,91 @@ class DocumentCrudAndMinioStreamingIntegrationTest {
                 .as("Post-GC settled heap growth after 40 MiB streaming upload")
                 .isLessThan(MAX_BOUNDED_HEAP_DELTA_BYTES);
         }
+    }
+
+    @Test
+    void concurrentDuplicateUploadsResolveCleanlyWithSingleWinner409LosersAndZeroOrphanObjects() throws Exception {
+        final int concurrency = 4;
+        final long payloadSizeBytes = 512L * 1024L;
+        final String marker = "concurrent-race-" + UUID.randomUUID();
+        String expectedSha256;
+        try (InputStream stream = new RepeatingPdfInputStream(payloadSizeBytes, marker)) {
+            expectedSha256 = HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256").digest(stream.readAllBytes()));
+        }
+
+        // Warm servlet + S3 client before barrier race so all threads hit Phase 2 DB uniqueness concurrently
+        ResponseEntity<DocumentResponse> warmup = uploadBytes(
+            "race-warmup.txt",
+            "text/plain",
+            "Warmup".getBytes(StandardCharsets.UTF_8),
+            HR_DEPT_ID,
+            AccessLevel.DEPARTMENT
+        );
+        assertThat(warmup.getStatusCode()).isEqualTo(HttpStatus.ACCEPTED);
+        eventCollector.clear();
+
+        CyclicBarrier startGate = new CyclicBarrier(concurrency);
+        List<HttpResponse<String>> responses = new ArrayList<>(concurrency);
+        try (HttpClient httpClient = StreamingMultipartTestSupport.newHttp11Client();
+             ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor()) {
+            List<Future<HttpResponse<String>>> futures = new ArrayList<>(concurrency);
+            for (int i = 0; i < concurrency; i++) {
+                final int attempt = i;
+                futures.add(executor.submit(() -> {
+                    HttpRequest request = StreamingMultipartTestSupport.buildMultipartUploadRequest(
+                        URI.create("http://localhost:" + port + "/api/v1/documents/upload?accessLevel=DEPARTMENT"),
+                        "----DocuMindRace" + attempt,
+                        "concurrent-policy-" + attempt + ".pdf",
+                        "application/pdf",
+                        () -> new RepeatingPdfInputStream(payloadSizeBytes, marker),
+                        Duration.ofSeconds(60),
+                        IT_DEPT_ID
+                    );
+                    startGate.await(10, TimeUnit.SECONDS);
+                    return httpClient.send(request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
+                }));
+            }
+            for (Future<HttpResponse<String>> future : futures) {
+                responses.add(future.get(60, TimeUnit.SECONDS));
+            }
+        }
+
+        List<HttpResponse<String>> accepted = responses.stream()
+            .filter(resp -> resp.statusCode() == HttpStatus.ACCEPTED.value())
+            .toList();
+        List<HttpResponse<String>> conflicts = responses.stream()
+            .filter(resp -> resp.statusCode() == HttpStatus.CONFLICT.value())
+            .toList();
+
+        assertThat(accepted).hasSize(1);
+        assertThat(conflicts).hasSize(concurrency - 1);
+
+        DocumentResponse winner = objectMapper.readValue(accepted.getFirst().body(), DocumentResponse.class);
+        assertThat(winner.id()).isNotNull();
+        assertThat(winner.fileHash()).isEqualTo(expectedSha256);
+
+        for (HttpResponse<String> conflict : conflicts) {
+            ProblemDetail problem = objectMapper.readValue(conflict.body(), ProblemDetail.class);
+            assertThat(problem.getStatus()).isEqualTo(409);
+            assertThat(problem.getProperties()).containsEntry("errorCode", "DUPLICATE_DOCUMENT");
+            assertThat(problem.getProperties().get("existingDocumentId").toString())
+                .isEqualTo(winner.id().toString());
+            assertThat(problem.getProperties()).containsEntry("fileHash", expectedSha256);
+            assertThat(problem.getDetail()).doesNotContain(IT_DEPT_ID.toString());
+        }
+
+        assertThat(documentRepository.findByDepartmentIdOrderByCreatedAtDesc(IT_DEPT_ID))
+            .extracting(DocumentEntity::getId)
+            .containsExactly(winner.id());
+
+        ListObjectsV2Response itObjects = s3Client.listObjectsV2(ListObjectsV2Request.builder()
+            .bucket(storageProperties.bucket())
+            .prefix("departments/" + IT_DEPT_ID + "/")
+            .build());
+        assertThat(itObjects.contents()).hasSize(1);
+
+        assertThat(eventCollector.events()).hasSize(1);
+        assertThat(eventCollector.events().getFirst().documentId()).isEqualTo(winner.id());
     }
 
     private static List<MemoryPoolMXBean> oldGenHeapPools() {

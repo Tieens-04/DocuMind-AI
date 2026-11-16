@@ -1,5 +1,6 @@
 package com.documind.service.document;
 
+import com.documind.controller.advice.GlobalExceptionHandler;
 import com.documind.domain.entity.DepartmentEntity;
 import com.documind.domain.entity.UserEntity;
 import com.documind.domain.enums.Role;
@@ -7,8 +8,17 @@ import com.documind.exception.AuthenticationRequiredException;
 import com.documind.exception.InvalidDocumentRequestException;
 import com.documind.repository.UserRepository;
 import org.junit.jupiter.api.Test;
+import org.springframework.context.annotation.ConditionContext;
+import org.springframework.core.type.AnnotatedTypeMetadata;
+import org.springframework.dao.DataIntegrityViolationException;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.ProblemDetail;
+import org.springframework.http.ResponseEntity;
+import org.springframework.mock.env.MockEnvironment;
 import org.springframework.mock.web.MockHttpServletRequest;
+import org.springframework.web.HttpRequestMethodNotSupportedException;
 
+import java.util.Objects;
 import java.util.Optional;
 import java.util.UUID;
 
@@ -147,5 +157,68 @@ class DevFallbackCallerContextResolverTest {
         assertThat(resolver.resolve(directRequest).ipAddress()).isEqualTo("10.20.30.40");
 
         assertThat(resolver.resolve(null).ipAddress()).isNull();
+    }
+
+    @Test
+    void callerContextConditionsFailClosedByDefaultAndEnableOnlyWhenDevOrLocalOptsIn() {
+        var devCondition = new DevCallerFallbackEnabledCondition();
+        var failClosedCondition = new FailClosedCallerContextCondition();
+        AnnotatedTypeMetadata metadata = mock(AnnotatedTypeMetadata.class);
+
+        assertConditionState(devCondition, failClosedCondition, metadata, new MockEnvironment(), false);
+        assertConditionState(devCondition, failClosedCondition, metadata, env(new String[]{"staging"}, true), false);
+        assertConditionState(devCondition, failClosedCondition, metadata, env(new String[]{"test"}, true), false);
+        assertConditionState(devCondition, failClosedCondition, metadata, env(new String[]{"prod"}, true), false);
+        assertConditionState(devCondition, failClosedCondition, metadata, env(new String[]{"dev", "prod"}, true), false);
+        assertConditionState(devCondition, failClosedCondition, metadata, env(new String[]{"dev"}, false), false);
+        assertConditionState(devCondition, failClosedCondition, metadata, env(new String[]{"dev"}, true), true);
+        assertConditionState(devCondition, failClosedCondition, metadata, env(new String[]{"local"}, true), true);
+    }
+
+    @Test
+    void globalExceptionHandlerSanitizesUnhandledExceptionsAndPreservesFrameworkErrorResponses() {
+        var handler = new GlobalExceptionHandler();
+        var request = new MockHttpServletRequest("PUT", "/api/v1/documents");
+
+        ResponseEntity<ProblemDetail> unhandledResp = handler.handleUnhandledException(
+            new DataIntegrityViolationException("duplicate key violates uq_internal_constraint on table secret_table"),
+            request
+        );
+        assertThat(unhandledResp.getStatusCode()).isEqualTo(HttpStatus.INTERNAL_SERVER_ERROR);
+        ProblemDetail unhandledBody = Objects.requireNonNull(unhandledResp.getBody());
+        assertThat(unhandledBody.getStatus()).isEqualTo(500);
+        assertThat(unhandledBody.getProperties()).containsEntry("errorCode", "INTERNAL_ERROR");
+        assertThat(unhandledBody.getDetail())
+            .doesNotContain("uq_internal_constraint")
+            .doesNotContain("secret_table");
+
+        ResponseEntity<ProblemDetail> methodNotAllowedResp = handler.handleUnhandledException(
+            new HttpRequestMethodNotSupportedException("PUT"),
+            request
+        );
+        assertThat(methodNotAllowedResp.getStatusCode()).isEqualTo(HttpStatus.METHOD_NOT_ALLOWED);
+        ProblemDetail methodBody = Objects.requireNonNull(methodNotAllowedResp.getBody());
+        assertThat(methodBody.getStatus()).isEqualTo(405);
+        assertThat(methodBody.getProperties()).containsEntry("errorCode", "REQUEST_ERROR");
+    }
+
+    private static MockEnvironment env(String[] profiles, boolean enabled) {
+        MockEnvironment env = new MockEnvironment();
+        env.setActiveProfiles(profiles);
+        env.setProperty(DevCallerFallbackEnabledCondition.PROPERTY_ENABLED, Boolean.toString(enabled));
+        return env;
+    }
+
+    private static void assertConditionState(
+        DevCallerFallbackEnabledCondition devCondition,
+        FailClosedCallerContextCondition failClosedCondition,
+        AnnotatedTypeMetadata metadata,
+        MockEnvironment env,
+        boolean expectDevActive
+    ) {
+        ConditionContext ctx = mock(ConditionContext.class);
+        when(ctx.getEnvironment()).thenReturn(env);
+        assertThat(devCondition.matches(ctx, metadata)).isEqualTo(expectDevActive);
+        assertThat(failClosedCondition.matches(ctx, metadata)).isEqualTo(!expectDevActive);
     }
 }

@@ -54,6 +54,7 @@ import org.springframework.transaction.support.DefaultTransactionStatus;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
 import org.springframework.transaction.support.TransactionTemplate;
 
+import java.io.IOException;
 import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
@@ -68,7 +69,6 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
-import static org.mockito.ArgumentMatchers.anyBoolean;
 import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.anyString;
@@ -117,6 +117,8 @@ class DocumentServiceTest {
         transactionTemplate = spy(new TransactionTemplate(transactionManager));
         eventPublisher = mock(ApplicationEventPublisher.class);
         environment = new MockEnvironment();
+        environment.setActiveProfiles("dev");
+        environment.setProperty("documind.security.dev-caller-fallback.enabled", "true");
 
         when(minioStorageService.buildStorageKey(any(UUID.class), any(UUID.class), anyInt(), anyString()))
             .thenAnswer(inv -> "departments/" + inv.getArgument(0) + "/" + inv.getArgument(1)
@@ -346,7 +348,7 @@ class DocumentServiceTest {
         );
         assertThat(response.uploadedBy()).isNull();
 
-        // In prod profile, missing user must throw ResourceNotFoundException even for default dev UUID
+        // In prod profile or unconfigured staging profile, missing user must throw ResourceNotFoundException even for default dev UUID
         DocumentService prodService = new DocumentService(
             documentRepository,
             departmentRepository,
@@ -359,6 +361,23 @@ class DocumentServiceTest {
             new MockEnvironment().withProperty("spring.profiles.active", "prod")
         );
         assertThatThrownBy(() -> prodService.uploadDocument(
+            file, AccessLevel.DEPARTMENT, new CallerContext(ADMIN_USER_ID, IT_DEPT_ID, Role.DEPARTMENT_MANAGER, "127.0.0.1")
+        )).isInstanceOf(ResourceNotFoundException.class);
+
+        MockEnvironment stagingEnv = new MockEnvironment();
+        stagingEnv.setActiveProfiles("staging");
+        DocumentService stagingService = new DocumentService(
+            documentRepository,
+            departmentRepository,
+            userRepository,
+            auditLogRepository,
+            fileValidationService,
+            minioStorageService,
+            transactionTemplate,
+            eventPublisher,
+            stagingEnv
+        );
+        assertThatThrownBy(() -> stagingService.uploadDocument(
             file, AccessLevel.DEPARTMENT, new CallerContext(ADMIN_USER_ID, IT_DEPT_ID, Role.DEPARTMENT_MANAGER, "127.0.0.1")
         )).isInstanceOf(ResourceNotFoundException.class);
     }
@@ -417,6 +436,7 @@ class DocumentServiceTest {
                 DuplicateDocumentException dup = (DuplicateDocumentException) ex;
                 assertThat(dup.existingDocumentId()).isEqualTo(existingId);
                 assertThat(dup.fileHash()).isEqualTo(expectedHash);
+                assertThat(dup.getMessage()).doesNotContain(IT_DEPT_ID.toString());
             });
 
         verify(minioStorageService).deleteObjectQuietly(anyString());
@@ -455,6 +475,7 @@ class DocumentServiceTest {
                 DuplicateDocumentException dup = (DuplicateDocumentException) ex;
                 assertThat(dup.existingDocumentId()).isEqualTo(winnerId);
                 assertThat(dup.fileHash()).isEqualTo(expectedHash);
+                assertThat(dup.getMessage()).doesNotContain(IT_DEPT_ID.toString());
             });
 
         verify(minioStorageService).uploadStream(stagedKeyCaptor.capture(), any(), anyLong(), anyString());
@@ -539,10 +560,10 @@ class DocumentServiceTest {
             PageRequest.of(0, 10, Sort.by(Sort.Direction.DESC, "createdAt")),
             1L
         );
-        when(documentRepository.findAllVisible(any(), anyBoolean(), any(), any(), any(), any(Pageable.class)))
+        when(documentRepository.findAllVisible(any(), any(Role.class), any(), any(), any(), any(Pageable.class)))
             .thenReturn(pageResult);
 
-        // 1. Non-admin passing filterDepartmentId keeps systemAdmin=false and callerDepartmentId=IT_DEPT_ID
+        // 1. DEPARTMENT_MANAGER passing filterDepartmentId keeps Role.DEPARTMENT_MANAGER and callerDepartmentId=IT_DEPT_ID
         PageResponse<DocumentResponse> narrowed = documentService.listDocuments(
             HR_DEPT_ID, DocumentStatus.PENDING, AccessLevel.DEPARTMENT, 0, 10, itManager
         );
@@ -550,29 +571,29 @@ class DocumentServiceTest {
         assertThat(narrowed.items().getFirst().id()).isEqualTo(DOC_ID);
         verify(documentRepository).findAllVisible(
             eq(IT_DEPT_ID),
-            eq(false),
+            eq(Role.DEPARTMENT_MANAGER),
             eq(HR_DEPT_ID),
             eq(DocumentStatus.PENDING),
             eq(AccessLevel.DEPARTMENT),
             eq(PageRequest.of(0, 10, Sort.by(Sort.Direction.DESC, "createdAt")))
         );
 
-        // 2. STANDARD_EMPLOYEE also passes systemAdmin=false with callerDepartmentId=IT_DEPT_ID
+        // 2. STANDARD_EMPLOYEE passes Role.STANDARD_EMPLOYEE with callerDepartmentId=IT_DEPT_ID
         documentService.listDocuments(null, DocumentStatus.COMPLETED, null, 1, 100, employee);
         verify(documentRepository).findAllVisible(
             eq(IT_DEPT_ID),
-            eq(false),
+            eq(Role.STANDARD_EMPLOYEE),
             eq(null),
             eq(DocumentStatus.COMPLETED),
             eq(null),
             eq(PageRequest.of(1, 100, Sort.by(Sort.Direction.DESC, "createdAt")))
         );
 
-        // 3. SYSTEM_ADMIN passes systemAdmin=true
+        // 3. SYSTEM_ADMIN passes Role.SYSTEM_ADMIN
         documentService.listDocuments(null, null, null, 0, 20, sysAdmin);
         verify(documentRepository).findAllVisible(
             eq(IT_DEPT_ID),
-            eq(true),
+            eq(Role.SYSTEM_ADMIN),
             eq(null),
             eq(null),
             eq(null),
@@ -582,43 +603,66 @@ class DocumentServiceTest {
 
     @Test
     @SuppressWarnings("unchecked")
-    void documentRepositoryFindAllVisibleEnforcesPublicOrCallerDeptForNonAdmins() {
+    void documentRepositoryFindAllVisibleEnforcesRoleScopedPredicates() {
         DocumentRepository repo = mock(DocumentRepository.class, CALLS_REAL_METHODS);
         when(repo.findAll(any(Specification.class), any(Pageable.class))).thenReturn(Page.empty());
 
         Pageable pageable = PageRequest.of(0, 20);
-        assertThatThrownBy(() -> repo.findAllVisible(null, false, null, null, null, pageable))
+        assertThatThrownBy(() -> repo.findAllVisible(null, Role.DEPARTMENT_MANAGER, null, null, null, pageable))
+            .isInstanceOf(NullPointerException.class);
+        assertThatThrownBy(() -> repo.findAllVisible(IT_DEPT_ID, null, null, null, null, pageable))
             .isInstanceOf(NullPointerException.class);
 
-        repo.findAllVisible(IT_DEPT_ID, false, null, null, null, pageable);
-        repo.findAllVisible(IT_DEPT_ID, true, HR_DEPT_ID, DocumentStatus.PENDING, AccessLevel.CONFIDENTIAL, pageable);
+        repo.findAllVisible(IT_DEPT_ID, Role.STANDARD_EMPLOYEE, null, null, null, pageable);
+        repo.findAllVisible(IT_DEPT_ID, Role.DEPARTMENT_MANAGER, null, null, null, pageable);
+        repo.findAllVisible(IT_DEPT_ID, Role.SYSTEM_ADMIN, HR_DEPT_ID, DocumentStatus.PENDING, AccessLevel.CONFIDENTIAL, pageable);
 
         ArgumentCaptor<Specification<DocumentEntity>> specCaptor = ArgumentCaptor.forClass(Specification.class);
-        verify(repo, org.mockito.Mockito.times(2)).findAll(specCaptor.capture(), eq(pageable));
+        verify(repo, org.mockito.Mockito.times(3)).findAll(specCaptor.capture(), eq(pageable));
 
-        Root<DocumentEntity> nonAdminRoot = mock(Root.class);
         CriteriaQuery<?> query = mock(CriteriaQuery.class);
-        CriteriaBuilder nonAdminCb = mock(CriteriaBuilder.class);
-        when(nonAdminRoot.get(anyString())).thenReturn(mock(Path.class));
-        when(nonAdminCb.equal(any(Expression.class), (Object) any())).thenReturn(mock(Predicate.class));
-        when(nonAdminCb.or(any(Predicate.class), any(Predicate.class))).thenReturn(mock(Predicate.class));
-        when(nonAdminCb.and(any(Predicate[].class))).thenReturn(mock(Predicate.class));
 
-        Predicate nonAdminPredicate = specCaptor.getAllValues().get(0).toPredicate(nonAdminRoot, query, nonAdminCb);
-        assertThat(nonAdminPredicate).isNotNull();
-        verify(nonAdminRoot).get("accessLevel");
-        verify(nonAdminRoot).get("departmentId");
-        verify(nonAdminCb).equal(any(Expression.class), eq(AccessLevel.PUBLIC));
-        verify(nonAdminCb).equal(any(Expression.class), eq(IT_DEPT_ID));
-        verify(nonAdminCb).or(any(Predicate.class), any(Predicate.class));
+        // 1. STANDARD_EMPLOYEE: PUBLIC OR (departmentId == caller && accessLevel == DEPARTMENT)
+        Root<DocumentEntity> employeeRoot = mock(Root.class);
+        CriteriaBuilder employeeCb = mock(CriteriaBuilder.class);
+        when(employeeRoot.get(anyString())).thenReturn(mock(Path.class));
+        when(employeeCb.equal(any(Expression.class), (Object) any())).thenReturn(mock(Predicate.class));
+        when(employeeCb.and(any(Predicate.class), any(Predicate.class))).thenReturn(mock(Predicate.class));
+        when(employeeCb.or(any(Predicate.class), any(Predicate.class))).thenReturn(mock(Predicate.class));
+        when(employeeCb.and(any(Predicate[].class))).thenReturn(mock(Predicate.class));
 
+        Predicate employeePredicate = specCaptor.getAllValues().get(0).toPredicate(employeeRoot, query, employeeCb);
+        assertThat(employeePredicate).isNotNull();
+        verify(employeeCb).equal(any(Expression.class), eq(AccessLevel.PUBLIC));
+        verify(employeeCb).equal(any(Expression.class), eq(IT_DEPT_ID));
+        verify(employeeCb).equal(any(Expression.class), eq(AccessLevel.DEPARTMENT));
+        verify(employeeCb).and(any(Predicate.class), any(Predicate.class));
+        verify(employeeCb).or(any(Predicate.class), any(Predicate.class));
+
+        // 2. DEPARTMENT_MANAGER: PUBLIC OR departmentId == caller
+        Root<DocumentEntity> managerRoot = mock(Root.class);
+        CriteriaBuilder managerCb = mock(CriteriaBuilder.class);
+        when(managerRoot.get(anyString())).thenReturn(mock(Path.class));
+        when(managerCb.equal(any(Expression.class), (Object) any())).thenReturn(mock(Predicate.class));
+        when(managerCb.or(any(Predicate.class), any(Predicate.class))).thenReturn(mock(Predicate.class));
+        when(managerCb.and(any(Predicate[].class))).thenReturn(mock(Predicate.class));
+
+        Predicate managerPredicate = specCaptor.getAllValues().get(1).toPredicate(managerRoot, query, managerCb);
+        assertThat(managerPredicate).isNotNull();
+        verify(managerRoot).get("accessLevel");
+        verify(managerRoot).get("departmentId");
+        verify(managerCb).equal(any(Expression.class), eq(AccessLevel.PUBLIC));
+        verify(managerCb).equal(any(Expression.class), eq(IT_DEPT_ID));
+        verify(managerCb).or(any(Predicate.class), any(Predicate.class));
+
+        // 3. SYSTEM_ADMIN: no visibility OR predicate; optional filters applied
         Root<DocumentEntity> adminRoot = mock(Root.class);
         CriteriaBuilder adminCb = mock(CriteriaBuilder.class);
         when(adminRoot.get(anyString())).thenReturn(mock(Path.class));
         when(adminCb.equal(any(Expression.class), (Object) any())).thenReturn(mock(Predicate.class));
         when(adminCb.and(any(Predicate[].class))).thenReturn(mock(Predicate.class));
 
-        Predicate adminPredicate = specCaptor.getAllValues().get(1).toPredicate(adminRoot, query, adminCb);
+        Predicate adminPredicate = specCaptor.getAllValues().get(2).toPredicate(adminRoot, query, adminCb);
         assertThat(adminPredicate).isNotNull();
         verify(adminCb, never()).or(any(Predicate.class), any(Predicate.class));
         verify(adminCb).equal(any(Expression.class), eq(HR_DEPT_ID));
@@ -656,6 +700,19 @@ class DocumentServiceTest {
                 .doesNotContain(DOC_ID.toString()));
 
         when(documentRepository.findById(DOC_ID)).thenReturn(Optional.of(confidentialDoc));
+        // Same-department STANDARD_EMPLOYEE must NEVER see CONFIDENTIAL status
+        CallerContext sameDeptEmployeeCaller = new CallerContext(null, IT_DEPT_ID, Role.STANDARD_EMPLOYEE, "127.0.0.1");
+        assertThatThrownBy(() -> documentService.getDocumentStatus(DOC_ID, sameDeptEmployeeCaller))
+            .isInstanceOf(DocumentAccessDeniedException.class)
+            .satisfies(ex -> assertThat(ex.getMessage())
+                .doesNotContain(IT_DEPT_ID.toString())
+                .doesNotContain(DOC_ID.toString()));
+
+        // Same-department DEPARTMENT_MANAGER CAN inspect own-department CONFIDENTIAL status
+        assertThat(documentService.getDocumentStatus(
+            DOC_ID, new CallerContext(null, IT_DEPT_ID, Role.DEPARTMENT_MANAGER, "127.0.0.1")
+        ).status()).isEqualTo(DocumentStatus.COMPLETED);
+
         assertThatThrownBy(() -> documentService.getDocumentStatus(DOC_ID, crossDeptCaller))
             .isInstanceOf(DocumentAccessDeniedException.class)
             .satisfies(ex -> assertThat(ex.getMessage())
@@ -829,6 +886,60 @@ class DocumentServiceTest {
         verify(minioStorageService, never()).deleteObjectQuietly(anyString());
         assertThat(transactionManager.commitCount).isZero();
         assertThat(transactionManager.rollbackCount).isEqualTo(2);
+    }
+
+    @Test
+    void rejectsRoleEscalationAndSanitizesUploadStreamIoExceptionMessages() throws Exception {
+        DepartmentEntity itDept = department(IT_DEPT_ID, "IT");
+        DepartmentEntity hrDept = department(HR_DEPT_ID, "HR");
+        UUID itEmployeeId = UUID.fromString("eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee");
+        UserEntity itEmployee = user(itEmployeeId, itDept, Role.STANDARD_EMPLOYEE, true);
+        UserEntity hrManager = user(HR_USER_ID, hrDept, Role.DEPARTMENT_MANAGER, true);
+        DocumentEntity doc = document(DOC_ID, itDept, AccessLevel.DEPARTMENT, DocumentStatus.COMPLETED);
+
+        when(departmentRepository.findById(IT_DEPT_ID)).thenReturn(Optional.of(itDept));
+        when(departmentRepository.findById(HR_DEPT_ID)).thenReturn(Optional.of(hrDept));
+        when(userRepository.findById(itEmployeeId)).thenReturn(Optional.of(itEmployee));
+        when(userRepository.findById(HR_USER_ID)).thenReturn(Optional.of(hrManager));
+        when(documentRepository.findById(DOC_ID)).thenReturn(Optional.of(doc));
+
+        MockMultipartFile txtFile = new MockMultipartFile("file", "notes.txt", "text/plain", "Safe content".getBytes(StandardCharsets.UTF_8));
+
+        // 1. STANDARD_EMPLOYEE claiming DEPARTMENT_MANAGER or SYSTEM_ADMIN is rejected across upload, list, status, delete
+        CallerContext escalatedToManager = new CallerContext(itEmployeeId, IT_DEPT_ID, Role.DEPARTMENT_MANAGER, "127.0.0.1");
+        CallerContext escalatedToAdmin = new CallerContext(itEmployeeId, IT_DEPT_ID, Role.SYSTEM_ADMIN, "127.0.0.1");
+        assertThatThrownBy(() -> documentService.uploadDocument(txtFile, AccessLevel.DEPARTMENT, escalatedToManager))
+            .isInstanceOf(DocumentAccessDeniedException.class);
+        assertThatThrownBy(() -> documentService.listDocuments(null, null, null, 0, 20, escalatedToAdmin))
+            .isInstanceOf(DocumentAccessDeniedException.class);
+        assertThatThrownBy(() -> documentService.getDocumentStatus(DOC_ID, escalatedToAdmin))
+            .isInstanceOf(DocumentAccessDeniedException.class);
+        assertThatThrownBy(() -> documentService.deleteDocument(DOC_ID, escalatedToManager))
+            .isInstanceOf(DocumentAccessDeniedException.class);
+
+        // 2. DEPARTMENT_MANAGER claiming SYSTEM_ADMIN is rejected
+        CallerContext managerEscalatedToAdmin = new CallerContext(HR_USER_ID, HR_DEPT_ID, Role.SYSTEM_ADMIN, "127.0.0.1");
+        assertThatThrownBy(() -> documentService.uploadDocument(txtFile, AccessLevel.DEPARTMENT, HR_DEPT_ID, managerEscalatedToAdmin))
+            .isInstanceOf(DocumentAccessDeniedException.class);
+        assertThatThrownBy(() -> documentService.listDocuments(null, null, null, 0, 20, managerEscalatedToAdmin))
+            .isInstanceOf(DocumentAccessDeniedException.class);
+
+        verifyNoInteractions(minioStorageService);
+
+        // 3. Failing MultipartFile.getInputStream() with sensitive local path must NOT leak path in 400 message
+        MockMultipartFile brokenFile = new MockMultipartFile("file", "broken.txt", "text/plain", "ok".getBytes(StandardCharsets.UTF_8)) {
+            @Override
+            public InputStream getInputStream() throws IOException {
+                throw new IOException("/tmp/tomcat-secret/upload_123.tmp (Permission denied)");
+            }
+        };
+        assertThatThrownBy(() -> documentService.uploadDocument(
+            brokenFile, AccessLevel.DEPARTMENT, new CallerContext(null, IT_DEPT_ID, Role.DEPARTMENT_MANAGER, "127.0.0.1")
+        ))
+            .isInstanceOf(InvalidDocumentRequestException.class)
+            .satisfies(ex -> assertThat(ex.getMessage())
+                .doesNotContain("/tmp/tomcat-secret")
+                .doesNotContain("upload_123.tmp"));
     }
 
     private void drainUploadStream() {

@@ -9,6 +9,8 @@ import org.apache.tika.detect.Detector;
 import org.apache.tika.io.TikaInputStream;
 import org.apache.tika.metadata.Metadata;
 import org.apache.tika.mime.MediaType;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
 
 import java.io.BufferedInputStream;
@@ -33,6 +35,7 @@ import java.util.zip.ZipInputStream;
 @Service
 public class FileValidationService {
 
+    private static final Logger log = LoggerFactory.getLogger(FileValidationService.class);
     public static final int HEADER_INSPECTION_BYTES = 65_536;
     private static final int CONTENT_TYPES_MAX_INSPECTION_BYTES = 32_768;
 
@@ -52,6 +55,20 @@ public class FileValidationService {
         "application/zip",
         "application/x-tika-ooxml",
         MIME_DOCX
+    );
+    private static final Set<String> ALLOWED_TEXTUAL_APPLICATION_MIMES = Set.of(
+        "application/xml",
+        "application/xhtml+xml",
+        "application/json",
+        "application/ld+json",
+        "application/x-sh",
+        "application/x-csh",
+        "application/javascript",
+        "application/ecmascript",
+        "application/sql",
+        "application/yaml",
+        "application/x-yaml",
+        "application/toml"
     );
 
     private static final Pattern UNSAFE_FILENAME_CHARS = Pattern.compile("[\\p{Cntrl}/\\\\#?%\\s]+");
@@ -199,7 +216,8 @@ public class FileValidationService {
         } catch (DocumentTooLargeException | InvalidDocumentRequestException ex) {
             throw ex;
         } catch (IOException ex) {
-            throw new InvalidDocumentRequestException("Failed to read document header bytes: " + ex.getMessage());
+            log.warn("Failed to read uploaded document header bytes", ex);
+            throw new InvalidDocumentRequestException("Failed to read uploaded document header");
         }
     }
 
@@ -207,9 +225,10 @@ public class FileValidationService {
         try (TikaInputStream tikaStream = TikaInputStream.get(headerBytes)) {
             return detector.detect(tikaStream, new Metadata());
         } catch (IOException ex) {
+            log.warn("Failed to detect MIME type from uploaded document header", ex);
             throw new UnsupportedDocumentTypeException(
                 MIME_OCTET_STREAM,
-                "Failed to detect MIME type from document header: " + ex.getMessage()
+                "Failed to detect MIME type from document header"
             );
         }
     }
@@ -285,7 +304,7 @@ public class FileValidationService {
                 );
             }
         }
-        if (!"text".equals(detectedMediaType.getType())) {
+        if (!"text".equals(detectedMediaType.getType()) && !ALLOWED_TEXTUAL_APPLICATION_MIMES.contains(baseMimeType)) {
             throw new UnsupportedDocumentTypeException(
                 baseMimeType,
                 "Non-text MIME type detected for text/markdown upload: " + baseMimeType
@@ -305,9 +324,10 @@ public class FileValidationService {
                 entriesSeen++;
                 String entryName = entry.getName();
                 if (hasDotDotPathSegment(entryName)) {
+                    log.warn("Rejected ZIP path-traversal entry '{}' in DOCX upload", entryName);
                     throw new UnsupportedDocumentTypeException(
                         baseMimeType,
-                        "Rejected ZIP path-traversal entry in DOCX upload: " + entryName
+                        "Rejected ZIP path-traversal entry in DOCX upload"
                     );
                 }
                 String normalized = normalizeZipEntryName(entryName);
@@ -345,15 +365,17 @@ public class FileValidationService {
             throw ex;
         } catch (EOFException | ZipException ex) {
             if (!(truncatedWindow && entriesSeen > 0 && bais.available() == 0)) {
+                log.warn("Corrupt ZIP container in DOCX upload", ex);
                 throw new UnsupportedDocumentTypeException(
                     baseMimeType,
-                    "Corrupt ZIP container in DOCX upload: " + ex.getMessage()
+                    "Corrupt ZIP container in DOCX upload"
                 );
             }
         } catch (IOException | IllegalArgumentException ex) {
+            log.warn("Invalid ZIP container in DOCX upload", ex);
             throw new UnsupportedDocumentTypeException(
                 baseMimeType,
-                "Invalid ZIP container in DOCX upload: " + ex.getMessage()
+                "Invalid ZIP container in DOCX upload"
             );
         }
 

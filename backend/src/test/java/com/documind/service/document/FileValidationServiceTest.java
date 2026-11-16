@@ -12,6 +12,7 @@ import org.junit.jupiter.params.provider.ValueSource;
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
+import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
 import java.util.Random;
 import java.util.zip.ZipEntry;
@@ -427,6 +428,48 @@ class FileValidationServiceTest {
             .isInstanceOf(UnsupportedDocumentTypeException.class)
             .satisfies(ex -> assertThat(((UnsupportedDocumentTypeException) ex).detectedMimeType())
                 .isEqualTo("application/pdf"));
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<doc><title>Config</title></doc>",
+        "{\"service\":\"documind\",\"threshold\":0.75}",
+        "#!/usr/bin/env bash\necho 'DocuMind health check'"
+    })
+    void allowsValidXmlJsonAndShellTextUploadsAsTxtAndMarkdownWithoutNullBytes(String textPayload) throws IOException {
+        byte[] bytes = textPayload.getBytes(StandardCharsets.UTF_8);
+
+        FileValidationResult txtResult = validator.validateAndPrepareStream(
+            "snippet.txt",
+            bytes.length,
+            new ByteArrayInputStream(bytes)
+        );
+        assertThat(txtResult.canonicalMimeType()).isEqualTo("text/plain");
+        assertThat(txtResult.rewindedStream().readAllBytes()).isEqualTo(bytes);
+
+        FileValidationResult mdResult = validator.validateAndPrepareStream(
+            "snippet.md",
+            bytes.length,
+            new ByteArrayInputStream(bytes)
+        );
+        assertThat(mdResult.canonicalMimeType()).isEqualTo("text/markdown");
+        assertThat(mdResult.rewindedStream().readAllBytes()).isEqualTo(bytes);
+    }
+
+    @Test
+    void sanitizesStreamIoExceptionWithoutLeakingFilesystemPaths() {
+        InputStream brokenStream = new InputStream() {
+            @Override
+            public int read() throws IOException {
+                throw new IOException("D:\\internal\\tomcat-work\\part-999.tmp (Access is denied)");
+            }
+        };
+
+        assertThatThrownBy(() -> validator.validateAndPrepareStream("notes.txt", 128L, brokenStream))
+            .isInstanceOf(InvalidDocumentRequestException.class)
+            .satisfies(ex -> assertThat(ex.getMessage())
+                .doesNotContain("tomcat-work")
+                .doesNotContain("part-999.tmp"));
     }
 
     private static byte[] createValidDocxBytes(String documentXml) throws IOException {

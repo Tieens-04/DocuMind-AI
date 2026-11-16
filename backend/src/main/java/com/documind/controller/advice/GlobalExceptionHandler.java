@@ -16,6 +16,7 @@ import org.slf4j.LoggerFactory;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ProblemDetail;
 import org.springframework.http.ResponseEntity;
+import org.springframework.web.ErrorResponse;
 import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
 import org.springframework.web.method.annotation.MethodArgumentTypeMismatchException;
@@ -231,6 +232,36 @@ public class GlobalExceptionHandler {
             "Storage Unavailable",
             "Document storage service is temporarily unavailable",
             "STORAGE_UNAVAILABLE",
+            request
+        );
+        return ResponseEntity.of(problem).build();
+    }
+
+    @ExceptionHandler(Exception.class)
+    public ResponseEntity<ProblemDetail> handleUnhandledException(
+        Exception ex,
+        HttpServletRequest request
+    ) {
+        if (ex instanceof ErrorResponse errorResponse) {
+            int rawStatus = errorResponse.getStatusCode().value();
+            HttpStatus resolved = HttpStatus.resolve(rawStatus);
+            HttpStatus status = resolved != null ? resolved : HttpStatus.INTERNAL_SERVER_ERROR;
+            boolean clientError = status.is4xxClientError();
+            if (!clientError) {
+                log.error("Framework error ({}) on {}", rawStatus, request != null ? request.getRequestURI() : "unknown", ex);
+            }
+            String title = status.getReasonPhrase();
+            String detail = clientError ? errorResponse.getBody().getDetail() : "An unexpected internal error occurred";
+            String errorCode = clientError ? "REQUEST_ERROR" : "INTERNAL_ERROR";
+            ProblemDetail problem = buildProblem(status, title, detail, errorCode, request);
+            return ResponseEntity.of(problem).build();
+        }
+        log.error("Unhandled exception on {}", request != null ? request.getRequestURI() : "unknown", ex);
+        ProblemDetail problem = buildProblem(
+            HttpStatus.INTERNAL_SERVER_ERROR,
+            "Internal Server Error",
+            "An unexpected internal error occurred",
+            "INTERNAL_ERROR",
             request
         );
         return ResponseEntity.of(problem).build();

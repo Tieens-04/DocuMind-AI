@@ -4,10 +4,13 @@ import com.documind.domain.entity.UserEntity;
 import com.documind.domain.enums.Role;
 import com.documind.exception.InvalidDocumentRequestException;
 import com.documind.repository.UserRepository;
+import jakarta.annotation.PostConstruct;
 import jakarta.servlet.http.HttpServletRequest;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.context.annotation.Profile;
+import org.springframework.context.annotation.Conditional;
 import org.springframework.stereotype.Component;
 
 import java.util.Locale;
@@ -16,13 +19,16 @@ import java.util.UUID;
 import java.util.function.Supplier;
 
 /**
- * Pre-JWT {@link CallerContextResolver} active strictly outside the {@code prod} profile,
+ * Pre-JWT {@link CallerContextResolver} active strictly when {@code dev}/{@code local} opts in via
+ * {@code documind.security.dev-caller-fallback.enabled=true} and {@code prod} is inactive,
  * simulating caller identity via optional {@code X-Department-Id}, {@code X-User-Id}, and {@code X-User-Role} headers
  * with seeded dev defaults.
  */
 @Component
-@Profile("!prod")
+@Conditional(DevCallerFallbackEnabledCondition.class)
 public class DevFallbackCallerContextResolver implements CallerContextResolver {
+
+    private static final Logger log = LoggerFactory.getLogger(DevFallbackCallerContextResolver.class);
 
     public static final UUID DEFAULT_DEV_DEPARTMENT_ID =
         UUID.fromString("11111111-1111-1111-1111-111111111111");
@@ -54,6 +60,14 @@ public class DevFallbackCallerContextResolver implements CallerContextResolver {
         this.userRepositorySupplier = Objects.requireNonNull(
             userRepositorySupplier,
             "userRepositorySupplier must not be null"
+        );
+    }
+
+    @PostConstruct
+    void logDevFallbackWarning() {
+        log.warn(
+            "SECURITY WARNING: DevFallbackCallerContextResolver is ACTIVE (accepting X-User-*/X-Department-Id headers). "
+                + "Must NEVER be enabled outside local dev."
         );
     }
 

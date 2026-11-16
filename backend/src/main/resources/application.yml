@@ -1,5 +1,7 @@
 server:
   port: ${SERVER_PORT:8081}
+  tomcat:
+    max-swallow-size: 64MB
 
 spring:
   application:
@@ -83,6 +85,9 @@ springdoc:
     path: /swagger-ui.html
 
 documind:
+  security:
+    dev-caller-fallback:
+      enabled: false
   ai:
     gemini:
       base-url: ${GEMINI_BASE_URL:https://generativelanguage.googleapis.com/v1beta/openai}

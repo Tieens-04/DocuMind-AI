@@ -23,11 +23,12 @@ import com.documind.repository.AuditLogRepository;
 import com.documind.repository.DepartmentRepository;
 import com.documind.repository.DocumentRepository;
 import com.documind.repository.UserRepository;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.context.ApplicationEventPublisher;
 import org.springframework.core.env.Environment;
-import org.springframework.core.env.Profiles;
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.PageRequest;
@@ -53,6 +54,7 @@ import java.util.function.Supplier;
 @Service
 public class DocumentService {
 
+    private static final Logger log = LoggerFactory.getLogger(DocumentService.class);
     private static final int INITIAL_DOCUMENT_VERSION = 1;
     private static final int MAX_PAGE_SIZE = 100;
     private static final int MAX_IP_LENGTH = 45;
@@ -196,7 +198,7 @@ public class DocumentService {
                 throw new DuplicateDocumentException(
                     winner.get().getId(),
                     stagedUpload.fileHash(),
-                    "Duplicate document already exists in department " + department.getId()
+                    "A document with identical content already exists in this department"
                 );
             }
             throw ex;
@@ -226,12 +228,13 @@ public class DocumentService {
         if (size < 1 || size > MAX_PAGE_SIZE) {
             throw new InvalidDocumentRequestException("Page size must be between 1 and " + MAX_PAGE_SIZE);
         }
+        resolveVerifiedActor(caller, caller.isSystemAdmin() ? null : caller.departmentId());
 
         PageRequest pageable = PageRequest.of(page, size, Sort.by(Sort.Direction.DESC, "createdAt"));
         Page<DocumentResponse> mapped = documentRepository()
             .findAllVisible(
                 caller.departmentId(),
-                caller.isSystemAdmin(),
+                caller.role(),
                 filterDepartmentId,
                 status,
                 accessLevel,
@@ -242,7 +245,7 @@ public class DocumentService {
     }
 
     /**
-     * Returns ingestion status for a document, enforcing cross-department isolation for non-{@code PUBLIC} files.
+     * Returns ingestion status for a document, enforcing role and classification isolation via {@link DocumentVisibilityPolicy}.
      */
     public DocumentStatusResponse getDocumentStatus(UUID documentId, CallerContext caller) {
         if (documentId == null) {
@@ -250,12 +253,11 @@ public class DocumentService {
         }
         requireCaller(caller);
         requireCallerDepartment(caller);
+        resolveVerifiedActor(caller, caller.isSystemAdmin() ? null : caller.departmentId());
 
         DocumentEntity document = documentRepository().findById(documentId)
             .orElseThrow(() -> new DocumentNotFoundException(documentId));
-        if (!caller.isSystemAdmin()
-            && !Objects.equals(caller.departmentId(), document.getDepartmentId())
-            && document.getAccessLevel() != AccessLevel.PUBLIC) {
+        if (!DocumentVisibilityPolicy.canRead(caller, document.getDepartmentId(), document.getAccessLevel())) {
             throw new DocumentAccessDeniedException("You do not have permission to access this document");
         }
         return DocumentStatusResponse.from(document);
@@ -372,7 +374,8 @@ public class DocumentService {
                     );
                 }
             } catch (IOException ex) {
-                throw new InvalidDocumentRequestException("Failed to read uploaded file stream: " + ex.getMessage());
+                log.warn("Failed to read uploaded multipart stream", ex);
+                throw new InvalidDocumentRequestException("Failed to read uploaded document stream");
             }
         } catch (RuntimeException ex) {
             if (uploadedToStorage && storageKey != null) {
@@ -396,7 +399,7 @@ public class DocumentService {
             throw new DuplicateDocumentException(
                 existing.get().getId(),
                 stagedUpload.fileHash(),
-                "Duplicate document already exists in department " + department.getId()
+                "A document with identical content already exists in this department"
             );
         }
 
@@ -444,7 +447,7 @@ public class DocumentService {
         }
         UserEntity user = userRepository().findById(userId)
             .orElseGet(() -> {
-                if (!environment.acceptsProfiles(Profiles.of("prod"))
+                if (DevCallerFallbackEnabledCondition.isDevFallbackActive(environment)
                     && DevFallbackCallerContextResolver.DEFAULT_DEV_USER_ID.equals(userId)) {
                     return null;
                 }
@@ -456,8 +459,12 @@ public class DocumentService {
         if (!user.isActive()) {
             throw new DocumentAccessDeniedException("User account is inactive");
         }
+        if (!user.getRole().canAssume(caller.role())) {
+            throw new DocumentAccessDeniedException("Caller role exceeds authenticated user privileges");
+        }
         if (!caller.isSystemAdmin()
             && user.getRole() != Role.SYSTEM_ADMIN
+            && targetDepartmentId != null
             && !Objects.equals(user.getDepartmentId(), targetDepartmentId)) {
             throw new DocumentAccessDeniedException("Caller user does not belong to target department");
         }
