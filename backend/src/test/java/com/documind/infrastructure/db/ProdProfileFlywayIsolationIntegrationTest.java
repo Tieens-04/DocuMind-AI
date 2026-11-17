@@ -81,7 +81,7 @@ class ProdProfileFlywayIsolationIntegrationTest {
             "SELECT version FROM flyway_schema_history WHERE success = true AND version IS NOT NULL AND version <> '0' ORDER BY installed_rank",
             String.class
         );
-        assertThat(prodVersions).containsExactly("1", "2", "4", "5", "6");
+        assertThat(prodVersions).containsExactly("1", "2", "4", "5", "6", "7");
 
         Integer prodUsers = jdbcTemplate.queryForObject("SELECT COUNT(*) FROM users", Integer.class);
         Integer prodDepartments = jdbcTemplate.queryForObject("SELECT COUNT(*) FROM departments", Integer.class);

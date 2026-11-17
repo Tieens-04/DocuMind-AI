@@ -103,3 +103,14 @@ documind:
     region: ${MINIO_REGION:us-east-1}
     upload-timeout: 60s
     presigned-expiry: 15m
+  ingestion:
+    extraction:
+      max-spool-bytes: 52428800
+      max-extracted-chars: 5000000
+      zip-min-inflate-ratio: 0.01
+      zip-max-entry-size-bytes: 104857600
+      zip-max-file-count: 1000
+    chunking:
+      chunk-size: 800
+      chunk-overlap: 150
+      max-chunks-per-document: 10000

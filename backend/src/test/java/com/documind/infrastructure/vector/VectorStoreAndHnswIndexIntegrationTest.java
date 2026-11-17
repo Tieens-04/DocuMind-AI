@@ -309,7 +309,7 @@ class VectorStoreAndHnswIndexIntegrationTest {
         );
         vectorStore.add(List.of(initialChunk));
 
-        // Upsert same chunk ID without page_number -> trigger must clear stale page_number to NULL and normalize metadata key
+        // Upsert same chunk ID without page_number -> V7 trigger must clear stale page_number to SQL NULL and omit null key
         Document upsertedChunkWithoutPage = new Document(
             chunkId,
             "Nội dung phiên bản 2 định dạng markdown không phân trang",
@@ -332,7 +332,18 @@ class VectorStoreAndHnswIndexIntegrationTest {
         assertThat(row.get("page_number")).isNull();
         assertThat(row.get("doc_version")).isEqualTo(2);
         assertThat(row.get("chunk_index")).isEqualTo(0);
-        assertThat(row.get("has_page_key")).isEqualTo(Boolean.TRUE);
+        assertThat(row.get("has_page_key")).isEqualTo(Boolean.FALSE);
+
+        List<Document> nonPdfHits = vectorStore.similaritySearch(
+            SearchRequest.builder()
+                .query("Nội dung phiên bản 2 định dạng markdown không phân trang")
+                .topK(3)
+                .similarityThreshold(0.95)
+                .filterExpression(new FilterExpressionBuilder().eq("document_id", docId.toString()).build())
+                .build()
+        );
+        assertThat(nonPdfHits).hasSize(1);
+        assertThat(nonPdfHits.getFirst().getMetadata()).doesNotContainKey("page_number");
 
         // Upsert same chunk ID omitting document_id must fail instead of silently retaining OLD.document_id
         Document upsertMissingDocId = new Document(

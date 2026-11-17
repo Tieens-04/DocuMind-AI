@@ -3,8 +3,11 @@
 .env.*
 !.env.example
 
-# Superpowers SDD scratch
+# Superpowers SDD scratch & AI Workflow per-ticket artifacts
 .superpowers/
+.ai-workflow/tasks/*
+!.ai-workflow/tasks/.gitkeep
+.ai-workflow/_archive/
 
 # Backend (Maven / Java)
 backend/target/

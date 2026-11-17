@@ -26,6 +26,7 @@
         <springdoc.version>2.8.5</springdoc.version>
         <testcontainers.version>1.21.4</testcontainers.version>
         <commons-compress.version>1.27.1</commons-compress.version>
+        <pdfbox.version>3.0.4</pdfbox.version>
         <smoke>false</smoke>
     </properties>
 
@@ -49,6 +50,21 @@
                 <groupId>org.apache.commons</groupId>
                 <artifactId>commons-compress</artifactId>
                 <version>${commons-compress.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>org.apache.pdfbox</groupId>
+                <artifactId>pdfbox</artifactId>
+                <version>${pdfbox.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>org.apache.pdfbox</groupId>
+                <artifactId>pdfbox-io</artifactId>
+                <version>${pdfbox.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>org.apache.pdfbox</groupId>
+                <artifactId>fontbox</artifactId>
+                <version>${pdfbox.version}</version>
             </dependency>
         </dependencies>
     </dependencyManagement>
@@ -159,7 +175,7 @@
                 <groupId>org.apache.maven.plugins</groupId>
                 <artifactId>maven-surefire-plugin</artifactId>
                 <configuration>
-                    <argLine>-Dfile.encoding=UTF-8</argLine>
+                    <argLine>-Dfile.encoding=UTF-8 -Xmx768m</argLine>
                     <useManifestOnlyJar>false</useManifestOnlyJar>
                     <systemPropertyVariables>
                         <smoke>${smoke}</smoke>
