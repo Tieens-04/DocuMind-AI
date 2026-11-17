@@ -67,6 +67,47 @@ public class DocumentChunkVectorRepository {
     }
 
     /**
+     * Deletes all chunks belonging to {@code documentId} and {@code docVersion} for clean retry or failure cleanup.
+     */
+    public int deleteByDocumentIdAndVersion(UUID documentId, int docVersion) {
+        Objects.requireNonNull(documentId, "documentId must not be null");
+        if (docVersion < 1) {
+            throw new IllegalArgumentException("docVersion must be >= 1");
+        }
+        return jdbcClient().sql("""
+                DELETE FROM document_chunks
+                WHERE document_id = :documentId
+                  AND doc_version = :docVersion
+                """)
+            .param("documentId", documentId)
+            .param("docVersion", docVersion)
+            .update();
+    }
+
+    /**
+     * Deletes trailing stale chunks for {@code (documentId, docVersion)} starting from {@code fromChunkIndex}.
+     */
+    public int deleteByDocumentIdAndVersionFromIndex(UUID documentId, int docVersion, int fromChunkIndex) {
+        Objects.requireNonNull(documentId, "documentId must not be null");
+        if (docVersion < 1) {
+            throw new IllegalArgumentException("docVersion must be >= 1");
+        }
+        if (fromChunkIndex < 0) {
+            throw new IllegalArgumentException("fromChunkIndex must be >= 0");
+        }
+        return jdbcClient().sql("""
+                DELETE FROM document_chunks
+                WHERE document_id = :documentId
+                  AND doc_version = :docVersion
+                  AND chunk_index >= :fromChunkIndex
+                """)
+            .param("documentId", documentId)
+            .param("docVersion", docVersion)
+            .param("fromChunkIndex", fromChunkIndex)
+            .update();
+    }
+
+    /**
      * Runs PostgreSQL {@code EXPLAIN} on a cosine-distance top-K query against {@code document_chunks}.
      */
     public List<String> explainCosineSearch(float[] queryVector, int limit) {
