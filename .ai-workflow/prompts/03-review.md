@@ -37,8 +37,9 @@ Agent chính **bắt buộc khởi chạy các Subagents độc lập** (`TypeNa
 
 *(Có thể chạy song song 2 subagents trước rồi chạy subagent thứ 3 để tối ưu tải).*
 
-### Bước 3.3 — Kiểm chứng Thực thi của Agent Chính & Tổng hợp Báo cáo
+### Bước 3.3 — Kiểm chứng Thực thi, Chuyển Trạng Thái Jira & Tổng hợp Báo cáo
 - Agent chính trực tiếp mở file xác minh từng bằng chứng `file:line` do subagents gửi về (loại bỏ các nhận định sai thực tế hoặc đã được DB constraint/framework bảo vệ) và tự chạy lại các bài test trọng tâm (`Set-Location backend; .\mvnw.cmd test -Dtest=...`, hoặc lệnh frontend tương ứng) để chứng thực trạng thái hiện tại.
+- **Tự động chuyển trạng thái Jira sang `Verify / Test`**: Đọc schema `jira_transition_issue.json` của MCP **`jira-cwb`** và gọi **`jira_transition_issue`** (`ServerName: "jira-cwb"`, `issue_key: "<TICKET_ID>"`, `transition_id: "Verify / Test"` — hoặc ID `"31"` lấy qua `jira_get_transitions`) để cập nhật cột của ticket trên bảng `DA` sang **`Verify / Test`**.
 - Ghi báo cáo đầy đủ vào `.ai-workflow/tasks/<TICKET_ID>/review-01.md`.
 
 ---
@@ -52,6 +53,7 @@ Agent chính **bắt buộc khởi chạy các Subagents độc lập** (`TypeNa
 - **Subagents đã khởi chạy**: `Standards & Domain Reviewer`, `Spec & Test Reviewer`, `Ponytail Reviewer`.
 - **Phạm vi kiểm tra**: `git diff <BASE_SHA>` + `<N>` tệp untracked mới tạo trên nhánh `<branch-name>`.
 - **Lệnh kiểm thử Agent chính đã trực tiếp chạy xác thực**: ...
+- **Đồng bộ trạng thái Jira (`jira-cwb`)**: Đã chuyển sang **`Verify / Test`**.
 
 ## 2. Đánh giá Độ Tinh Gọn, Chịu Tải & Luồng Kết Nối (`ponytail-review`)
 - **What this change does**: ...

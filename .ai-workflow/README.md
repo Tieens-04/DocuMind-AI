@@ -29,7 +29,7 @@ Từ đó về sau, **ở cuối mỗi bước Agent sẽ tự động in ra m�
        │
        ▼
 [Bước 1: Plan (01-plan.md)]
-  • Kéo Jira `DA-XX` (issue + comments) ➔ lưu jira.md
+  • Kéo Jira `DA-XX` qua `jira-cwb` ➔ tự động chuyển Jira sang **`In Progress`** + lưu jira.md
   • Kiểm tra working tree sạch ➔ tạo nhánh từ `main` (feat/ | bugfix/ | chore/ | docs/)
   • Khảo sát code + Flyway SQL + chọn Skills chuyên ngành ➔ xuất plan.md
        │
@@ -43,7 +43,7 @@ Từ đó về sau, **ở cuối mỗi bước Agent sẽ tự động in ra m�
 [Bước 3: Independent Review (03-review.md + domain-review.md)]
   • Quét trọn vẹn `git diff $(git merge-base main HEAD)` + toàn bộ file mới untracked (`??`)
   • Chạy 3 Subagents độc lập: Standards & Domain + Spec & Test + Ponytail
-  • Xuất review-01.md (KHÔNG sửa code)
+  • Tự động chuyển Jira sang **`Verify / Test`** + xuất review-01.md (KHÔNG sửa code)
        │
        ▼ ──► [GATE 3]: Xem kết quả review-01.md
    ┌───┴──────────────────────────────────────┐
@@ -61,8 +61,8 @@ Từ đó về sau, **ở cuối mỗi bước Agent sẽ tự động in ra m�
                             ▼ ──► [GATE 4]: Đạt `READY FOR PRE-COMMIT` ➔ chuyển sang Model nhẹ (Hydrogen/Flash)
                     [Bước 6: Pre-Commit & Release (06-precommit.md)]
                       • Quét sạch git status / API keys / dev-caller-fallback / ports / debug logs
-                      • Soạn PR bằng skill `pr` + đăng comment Jira (`addOrEditJiraIssueComment`)
-                      • Xuất precommit.md + in khối lệnh Git để BẠN tự commit & push
+                      • Soạn PR bằng skill `pr` + đăng comment Jira (`jira_add_comment`)
+                      • Tự động chuyển Jira sang **`Done`** + xuất precommit.md + in lệnh Git cho BẠN
 ```
 
 ---
@@ -149,4 +149,4 @@ DocuMind-AI/
 | **Chạy Bước 3 (Review độc lập)** | `Thực hiện Bước 3 (Independent Review) cho task DA-XX theo .ai-workflow/prompts/03-review.md. Khởi chạy các subagents độc lập (Standards, Spec, Ponytail) đối chiếu jira.md, AGENTS.md và domain-review.md, lưu kết quả vào review-01.md.` |
 | **Chạy Bước 4 (Fix lỗi review)** | `Thực hiện Bước 4 (Fix) cho task DA-XX theo .ai-workflow/prompts/04-fix.md. Xử lý tận gốc các findings trong .ai-workflow/tasks/DA-XX/review-01.md, bổ sung regression tests và lưu báo cáo vào fix-report.md.` |
 | **Chạy Bước 5 (Final Review)** | `Thực hiện Bước 5 (Final Review) cho task DA-XX theo .ai-workflow/prompts/05-final-review.md. Kiểm tra lại toàn bộ findings từ review-01.md và fix-report.md, chạy các Quality Gates và lưu kết quả vào final-review.md.` |
-| **Chạy Bước 6 (Pre-Commit & PR)** | `Thực hiện Bước 6 (Pre-Commit) cho task DA-XX theo .ai-workflow/prompts/06-precommit.md. Dùng skill pr soạn nội dung PR, đồng bộ kết quả lên Jira qua atlassian-mcp-server và lưu báo cáo vào precommit.md.` |
+| **Chạy Bước 6 (Pre-Commit & PR)** | `Thực hiện Bước 6 (Pre-Commit) cho task DA-XX theo .ai-workflow/prompts/06-precommit.md. Dùng skill pr soạn nội dung PR, đăng comment tổng kết và chuyển trạng thái ticket sang Done trên Jira qua jira-cwb, sau đó lưu báo cáo vào precommit.md.` |

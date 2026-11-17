@@ -7,25 +7,25 @@ Quy tắc kỷ luật bắt buộc áp dụng xuyên suốt 6 bước trong `.ai
 ## 1. Thứ Tự Ưu Tiên Source of Truth
 
 Khi có xung đột thông tin, luôn ưu tiên theo thứ tự từ cao xuống thấp:
-1. **Jira Issue Description + Comments / Product Decisions** (lấy qua `atlassian-mcp-server`, lưu tại `.ai-workflow/tasks/<TICKET_ID>/jira.md`).
+1. **Jira Issue Description + Comments / Product Decisions** (lấy qua MCP **`jira-cwb`** kết nối tới `nguyentien191004.atlassian.net`, lưu tại `.ai-workflow/tasks/<TICKET_ID>/jira.md`).
 2. **Non-Negotiable Invariants trong `AGENTS.md`**: Java 21 + Spring Boot 3.3+ + Spring AI 1.0+ GA, Mandatory Vector RBAC (`SecurityContextHolder` -> `Filter.Expression`), Deterministic Refusal (`"Không tìm thấy thông tin trong tài liệu nội bộ"`), Citations + SSE, Async Virtual Threads Ingestion (`<= 50MB`), Redis Cache scoping theo quyền hạn + Bucket4j Rate Limit + Audit Logs, Testcontainers coverage `>= 75%`, Playwright `--headed`, và dải cổng né `flintflow-*`.
 3. **Approved Implementation Plan** (`.ai-workflow/tasks/<TICKET_ID>/plan.md`, cùng tài liệu thiết kế liên quan trong `docs/superpowers/specs/` nếu ticket có sẵn).
 4. **Agent Assumptions**: Mức ưu tiên thấp nhất; bắt buộc phải ghi tường minh trong báo cáo để Human kiểm soát.
 
 ---
 
-## 2. Kỷ Luật 1 Lượt = 1 Bước (Single-Step Execution Gate)
+## 2. Kỷ Luật 1 Lượt = 1 Bước & Vòng Đời Trạng Thái Jira Tự Động
 
-Mỗi lượt trả lời của Agent chỉ thực hiện **đúng 1 bước** mà người dùng vừa gọi, lưu đúng file báo cáo của bước đó vào `.ai-workflow/tasks/<TICKET_ID>/`, in hộp câu lệnh chuyển tiếp rồi **kết thúc lượt ngay lập tức (END TURN)**:
+Mỗi lượt trả lời của Agent chỉ thực hiện **đúng 1 bước** mà người dùng vừa gọi, đồng bộ đúng trạng thái Jira trên bảng `DA` (`To Do` ➔ `In Progress` ➔ `Verify / Test` ➔ `Done` qua MCP **`jira-cwb`**), lưu file báo cáo vào `.ai-workflow/tasks/<TICKET_ID>/`, in hộp câu lệnh chuyển tiếp rồi **kết thúc lượt ngay lập tức (END TURN)**:
 
-| Bước | Hành động được phép | File xuất bắt buộc trong `.ai-workflow/tasks/<TICKET_ID>/` | Ranh giới dừng (Hard Stop) |
-|---|---|---|---|
-| **Bước 1: Plan** | Kéo Jira `DA-*`, tạo nhánh Git sạch từ `main`, khảo sát code, lập kế hoạch | `jira.md`, `plan.md` | Không sửa source/test/migration; dừng chờ duyệt Gate 1 |
-| **Bước 2: Implement** | Viết tests (TDD) + code theo `plan.md`, chạy thực tế bộ kiểm tra chất lượng | `implementation-report.md` | Không commit/push, không tự viết `review-01.md`; dừng chờ Gate 2 |
-| **Bước 3: Review** | Khởi chạy 3 Subagents độc lập kiểm tra toàn bộ diff + untracked files | `review-01.md` | Không sửa bất kỳ file code/test/migration/docs nào; dừng chờ Gate 3 |
-| **Bước 4: Fix** | Sửa tận gốc các findings đã xác nhận + bổ sung regression tests thực chất | `fix-report.md` | Không mở rộng scope, không commit, không tự viết `final-review.md` |
-| **Bước 5: Final Review** | Đối chiếu findings cũ, chạy thực tế Quality Gates & quét độ tinh gọn | `final-review.md` | Không sửa code, không commit; dừng chờ Gate 4 |
-| **Bước 6: Pre-Commit** | Kiểm tra working tree, soạn PR bằng skill `pr`, bình luận tổng kết lên Jira | `precommit.md` | Không tự `git commit` / `git push`; xuất khối lệnh để Human tự chạy |
+| Bước | Hành động được phép | Tự động đổi Jira Status (`jira-cwb`) | File xuất bắt buộc | Ranh giới dừng (Hard Stop) |
+|---|---|---|---|---|
+| **Bước 1: Plan** | Kéo Jira `DA-*`, tạo nhánh Git sạch từ `main`, khảo sát code, lập kế hoạch | **`In Progress`** (`id: "21"`) | `jira.md`, `plan.md` | Không sửa source/test/migration; dừng chờ duyệt Gate 1 |
+| **Bước 2: Implement** | Viết tests (TDD) + code theo `plan.md`, chạy thực tế bộ kiểm tra chất lượng | *(Giữ `In Progress`)* | `implementation-report.md` | Không commit/push, không tự viết `review-01.md`; dừng chờ Gate 2 |
+| **Bước 3: Review** | Khởi chạy 3 Subagents độc lập kiểm tra toàn bộ diff + untracked files | **`Verify / Test`** (`id: "31"`) | `review-01.md` | Không sửa bất kỳ file code/test/migration/docs nào; dừng chờ Gate 3 |
+| **Bước 4: Fix** | Sửa tận gốc các findings đã xác nhận + bổ sung regression tests thực chất | *(Giữ `Verify / Test`)* | `fix-report.md` | Không mở rộng scope, không commit, không tự viết `final-review.md` |
+| **Bước 5: Final Review** | Đối chiếu findings cũ, chạy thực tế Quality Gates & quét độ tinh gọn | *(Đảm bảo `Verify / Test`)* | `final-review.md` | Không sửa code, không commit; dừng chờ Gate 4 |
+| **Bước 6: Pre-Commit** | Kiểm tra working tree, soạn PR bằng skill `pr`, đăng comment & chốt Jira | **`Done`** (`id: "41"`, khi `SAFE TO COMMIT`) | `precommit.md` | Không tự `git commit` / `git push`; xuất khối lệnh để Human tự chạy |
 
 ---
 
@@ -58,7 +58,7 @@ Trong `.ai-workflow`, Bước 2 và Bước 4 **không chạy `git commit`**, ho
 
 Khi khởi động một ticket `DA-*` mới ở Bước 1:
 1. **Kiểm tra working tree sạch**: Chạy `git status --porcelain`. Nếu phát hiện có thay đổi chưa commit thuộc về một ticket khác ➔ **DỪNG LẠI & BÁO NGƯỜI DÙNG NGAY**, tuyệt đối không tự ý `git stash`, `git reset` hay `git checkout` làm hỏng bài đang làm dở.
-2. **Đọc Jira Issue** qua `atlassian-mcp-server` (`getJiraIssue` với `view: "full"`, kèm `listJiraIssueComments` nếu `comments` > 0) để xác định `issueType`, `summary` và các chốt nghiệp vụ.
+2. **Đọc Jira Issue & Chuyển sang `In Progress`** qua MCP **`jira-cwb`** (`jira_get_issue` với `fields: "*all"`, `include: "comments,transitions"`, `use_display_names: true`; sau đó gọi `jira_transition_issue` sang `"In Progress"` nếu ticket đang ở `"To Do"`). *(Lưu ý: `atlassian-mcp-server` chỉ dùng dự phòng nếu `jira-cwb` không phản hồi, vì dự án `DA` nằm trên `nguyentien191004.atlassian.net` do `jira-cwb` quản lý)*.
 3. **Chọn tiền tố nhánh chuẩn**:
    - `feat/<ticket-viết-thường>-<slug>`: Khi `issueType` là `Story`, `Feature`, `New Feature`, hoặc xây dựng module mới (vd: `feat/da-9-async-ingestion-worker`).
    - `bugfix/<ticket-viết-thường>-<slug>`: Khi `issueType` là `Bug` hoặc vá lỗi hồi quy.

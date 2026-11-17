@@ -22,8 +22,9 @@ Bạn là **Independent Final Reviewer** của dự án **DocuMind AI**. Nhiệm
    - Backend: `Set-Location backend; .\mvnw.cmd verify` *(chạy toàn bộ Unit + Testcontainers Integration + build JAR)*.
    - Frontend *(nếu `frontend/package.json` tồn tại và ticket chạm `frontend/`)*: `Set-Location frontend; npm run lint; npm run typecheck; npm test; npm run build` và Playwright E2E `--headed` (nếu có).
    - Kiểm tra định dạng diff: `git diff --check`.
-4. **Ghi Báo cáo Cuối cùng**:
-   - Lưu vào `.ai-workflow/tasks/<TICKET_ID>/final-review.md`.
+4. **Đảm bảo Trạng thái Jira & Ghi Báo cáo Cuối cùng**:
+   - Nếu ticket trên Jira chưa ở cột **`Verify / Test`**, gọi `jira_transition_issue` (`ServerName: "jira-cwb"`, `issue_key: "<TICKET_ID>"`, `transition_id: "Verify / Test"`) để đồng bộ đúng cột.
+   - Lưu báo cáo vào `.ai-workflow/tasks/<TICKET_ID>/final-review.md`.
 
 ---
 
@@ -72,7 +73,7 @@ Chọn **đúng 1 trong 2 hộp** dưới đây theo kết luận thực tế tr
 - **💡 Mẹo ngữ cảnh**: Đổi sang Model nhẹ ngay tại ô chat hiện tại rồi dán câu lệnh dưới.
 
 Copy câu lệnh dưới đây và gửi vào ô chat:
-> `Thực hiện Bước 6 (Pre-Commit) cho task <TICKET_ID> theo .ai-workflow/prompts/06-precommit.md. Dùng skill pr soạn nội dung PR, đồng bộ kết quả lên Jira qua atlassian-mcp-server và lưu báo cáo vào precommit.md.`
+> `Thực hiện Bước 6 (Pre-Commit) cho task <TICKET_ID> theo .ai-workflow/prompts/06-precommit.md. Dùng skill pr soạn nội dung PR, đăng comment tổng kết và chuyển trạng thái ticket sang Done trên Jira qua jira-cwb, sau đó lưu báo cáo vào precommit.md.`
 ```
 
 * **Trường hợp 2 — Còn lỗi cần sửa tiếp (`CHANGES REQUESTED`)**:

@@ -25,12 +25,12 @@ Xác định bước người dùng đang gọi dựa trên câu lệnh (hoặc 
 
 | Tín hiệu từ người dùng / Trạng thái file | Bước cần chạy | File hướng dẫn bắt buộc đọc | Output duy nhất của lượt |
 |---|---|---|---|
-| Khởi động ticket mới (`/ai-workflow DA-XX`, `"Làm task DA-XX"`, chưa có `plan.md`) | **Bước 1: Plan** | [`.ai-workflow/prompts/01-plan.md`](../../../.ai-workflow/prompts/01-plan.md) | `jira.md` + nhánh Git mới từ `main` + `plan.md` |
+| Khởi động ticket mới (`/ai-workflow DA-XX`, `"Làm task DA-XX"`, chưa có `plan.md`) | **Bước 1: Plan** | [`.ai-workflow/prompts/01-plan.md`](../../../.ai-workflow/prompts/01-plan.md) | `jira.md` + chuyển Jira sang **`In Progress`** + nhánh Git mới từ `main` + `plan.md` |
 | Duyệt plan / Yêu cầu code (`"Duyệt plan..."`, `02-implement.md`) | **Bước 2: Implement** | [`.ai-workflow/prompts/02-implement.md`](../../../.ai-workflow/prompts/02-implement.md) | Code + Tests (Testcontainers/Unit) + `implementation-report.md` |
-| Yêu cầu review độc lập (`"Thực hiện Bước 3..."`, `03-review.md`) | **Bước 3: Review** | [`.ai-workflow/prompts/03-review.md`](../../../.ai-workflow/prompts/03-review.md) + [`domain-review.md`](../../../.ai-workflow/rules/domain-review.md) | `review-01.md` (tuyệt đối không sửa code) |
+| Yêu cầu review độc lập (`"Thực hiện Bước 3..."`, `03-review.md`) | **Bước 3: Review** | [`.ai-workflow/prompts/03-review.md`](../../../.ai-workflow/prompts/03-review.md) + [`domain-review.md`](../../../.ai-workflow/rules/domain-review.md) | Chuyển Jira sang **`Verify / Test`** + `review-01.md` (tuyệt đối không sửa code) |
 | Yêu cầu sửa findings (`"Thực hiện Bước 4..."`, `"Fix các findings..."`, `04-fix.md`) | **Bước 4: Fix** | [`.ai-workflow/prompts/04-fix.md`](../../../.ai-workflow/prompts/04-fix.md) | Code vá lỗi + Regression tests + `fix-report.md` |
 | Yêu cầu tái thẩm định (`"Thực hiện Bước 5..."`, `05-final-review.md`) | **Bước 5: Final Review** | [`.ai-workflow/prompts/05-final-review.md`](../../../.ai-workflow/prompts/05-final-review.md) + [`domain-review.md`](../../../.ai-workflow/rules/domain-review.md) | `final-review.md` (tuyệt đối không sửa code) |
-| Yêu cầu pre-commit / tạo PR (`"Thực hiện Bước 6..."`, `06-precommit.md`) | **Bước 6: Pre-Commit** | [`.ai-workflow/prompts/06-precommit.md`](../../../.ai-workflow/prompts/06-precommit.md) | `precommit.md` + Jira comment + khối lệnh Git cho Human |
+| Yêu cầu pre-commit / tạo PR (`"Thực hiện Bước 6..."`, `06-precommit.md`) | **Bước 6: Pre-Commit** | [`.ai-workflow/prompts/06-precommit.md`](../../../.ai-workflow/prompts/06-precommit.md) | `precommit.md` + Jira comment + chuyển Jira sang **`Done`** + khối lệnh Git cho Human |
 
 ## 3. Tiêu chuẩn hoàn tất lượt (Completion Criterion)
 

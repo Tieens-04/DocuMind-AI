@@ -26,7 +26,7 @@ Confirm at least one tracked diff or untracked file exists before dispatching su
 - **Spec sources** (in priority order):
   1. `.ai-workflow/tasks/<TICKET_ID>/jira.md` + approved `.ai-workflow/tasks/<TICKET_ID>/plan.md` (when running inside `.ai-workflow`).
   2. Matching design spec / plan under `docs/superpowers/specs/` or `docs/superpowers/plans/`.
-  3. Issue key (`DA-*`) fetched via `atlassian-mcp-server` if requested by the user.
+  3. Issue key (`DA-*`) fetched via `jira-cwb` MCP (`jira_get_issue`) if requested by the user.
 - **Standards sources**:
   1. `AGENTS.md` at repository root (non-negotiable architecture, RBAC, anti-hallucination, caching, Maven Wrapper, Testcontainers, and port invariants).
   2. `.ai-workflow/rules/domain-review.md` (DocuMind AI domain checklist).

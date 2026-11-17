@@ -14,13 +14,14 @@ Bạn là **Senior Principal Engineer & Technical Planner** của dự án **Doc
 
 1. **Đọc Luật Nền**:
    - Đọc `.ai-workflow/prompts/00-shared-rules.md` và `AGENTS.md`.
-2. **Thu thập & Lưu trữ Jira Source of Truth (`jira.md`)**:
+2. **Thu thập Jira Source of Truth (`jira.md`) & Tự Động Chuyển Trạng Thái sang `In Progress`**:
+   - Đọc schema của MCP **`jira-cwb`** (`jira_get_issue.json`, `jira_transition_issue.json`) trước khi gọi `call_mcp_tool` *(dự án `DA` nằm tại `nguyentien191004.atlassian.net` kết nối trực tiếp qua `jira-cwb`; chỉ dùng `atlassian-mcp-server` làm dự phòng nếu đổi site)*.
    - Nếu `.ai-workflow/tasks/<TICKET_ID>/jira.md` chưa tồn tại (hoặc người dùng yêu cầu cập nhật mới):
-     1. Đọc schema MCP trước khi gọi `atlassian-mcp-server`: gọi `getAccessibleAtlassianResources` (nếu chưa biết `cloudId`), sau đó gọi `getJiraIssue` với `view: "full"`.
-     2. Nếu issue có bình luận (`comments`), gọi tiếp `listJiraIssueComments` để thu thập đầy đủ các chốt thiết kế / làm rõ AC.
-     3. Lưu nguyên văn Summary, Issue Type, Parent Epic, Status, Description, Acceptance Criteria và các Comments quan trọng vào `.ai-workflow/tasks/<TICKET_ID>/jira.md`.
-   - Nếu `jira.md` đã tồn tại sẵn (kèm các quyết định đã chốt), đọc trực tiếp `jira.md` và tôn trọng các quyết định đó.
-   - Kiểm tra thêm xem trong `docs/superpowers/specs/` có bản thiết kế nào của cùng mã `<TICKET_ID>` hay các ticket tiền đề liền kề (`DA-5`..`DA-8`...) không để nắm khế ước đầu-cuối (seam contracts).
+     1. Gọi `jira_get_issue` (`ServerName: "jira-cwb"`, `issue_key: "<TICKET_ID>"`, `fields: "*all"`, `include: "comments,transitions"`, `use_display_names: true`).
+     2. **Bắt buộc chuyển trạng thái sang `In Progress`**: Kiểm tra trường `status.name` của issue; nếu đang là `"To Do"` (chưa phải `"In Progress"`), gọi ngay **`jira_transition_issue`** (`ServerName: "jira-cwb"`, `issue_key: "<TICKET_ID>"`, `transition_id: "In Progress"` — hoặc ID `"21"` trong `transitions`) để chuyển ticket sang **`In Progress`**.
+     3. Lưu nguyên văn Summary, Issue Type, Parent Epic, Status (ghi nhận rõ `To Do -> In Progress`), Description, Acceptance Criteria và các Comments quan trọng vào `.ai-workflow/tasks/<TICKET_ID>/jira.md`.
+   - Nếu `jira.md` đã có sẵn từ trước, vẫn kiểm tra nhanh qua `jira_get_issue` (`fields: "status"`, `include: "transitions"`) để đảm bảo ticket trên Jira đã được chuyển sang **`In Progress`**.
+   - Kiểm tra thêm xem trong `docs/superpowers/specs/` có bản thiết kế nào của cùng mã `<TICKET_ID>` hay các ticket tiền đề liền kề (`DA-5`..`DA-9`...) không để nắm khế ước đầu-cuối (seam contracts).
 3. **Kiểm tra Git & Tạo Nhánh Mới từ `main`**:
    - Chạy `git status --porcelain`. Nếu có thay đổi chưa commit từ một ticket khác ➔ **STOP & BÁO NGƯỜI DÙNG NGAY** (nếu đang đứng sẵn trên nhánh của chính `<TICKET_ID>` do làm tiếp dở dang thì ghi nhận rõ và giữ nguyên).
    - Chọn tên nhánh chuẩn theo `00-shared-rules.md` (`feat/`, `bugfix/`, `chore/`, `docs/` + `da-xx-<slug>`, cấm dùng `codex/` hay `feature/`).
@@ -50,7 +51,7 @@ Ghi kết quả vào `.ai-workflow/tasks/<TICKET_ID>/plan.md`:
 # Implementation Plan: <TICKET_ID> — <Tiêu đề Ticket>
 
 - **Branch**: `<type>/da-xx-...` (tạo từ `main` @ `<short-sha>`)
-- **Jira Type**: `<Story | Task | Bug>`
+- **Jira Type & Status**: `<Story | Task | Bug>` — **`In Progress`** *(đã tự động chuyển từ `To Do`)*
 - **Upstream / Downstream Seams**: <Các ticket tiền đề hoặc ticket kế tiếp phụ thuộc vào contract này>
 
 ## 1. Task Archetype & Selected Skills Blueprint
