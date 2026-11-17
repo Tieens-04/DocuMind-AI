@@ -2,16 +2,20 @@ package com.documind.service.ingestion;
 
 import org.springframework.boot.context.properties.ConfigurationProperties;
 import org.springframework.boot.context.properties.bind.ConstructorBinding;
+import org.springframework.boot.context.properties.bind.DefaultValue;
 import org.springframework.validation.annotation.Validated;
 
+import java.time.Duration;
+
 /**
- * Configuration properties governing extraction safety bounds and token chunking behavior.
+ * Configuration properties governing extraction safety bounds, token chunking behavior, and async worker retries.
  */
 @Validated
 @ConfigurationProperties(prefix = "documind.ingestion")
 public record IngestionProperties(
     ExtractionProperties extraction,
-    ChunkingProperties chunking
+    ChunkingProperties chunking,
+    WorkerProperties worker
 ) {
 
     public static final long DEFAULT_MAX_SPOOL_BYTES = 52_428_800L;
@@ -24,14 +28,33 @@ public record IngestionProperties(
     public static final int DEFAULT_CHUNK_OVERLAP = 150;
     public static final int DEFAULT_MAX_CHUNKS_PER_DOCUMENT = 10_000;
 
+    public static final boolean DEFAULT_WORKER_ENABLED = true;
+    public static final int DEFAULT_MAX_CONCURRENT_DOCUMENTS = 10;
+    public static final int DEFAULT_BATCH_SIZE = 50;
+    public static final int DEFAULT_MAX_CONCURRENT_BATCHES = 10;
+    public static final int DEFAULT_MAX_ATTEMPTS = 3;
+    public static final Duration DEFAULT_INITIAL_BACKOFF = Duration.ofMillis(500);
+    public static final double DEFAULT_BACKOFF_MULTIPLIER = 2.0d;
+    public static final Duration DEFAULT_MAX_BACKOFF = Duration.ofSeconds(5);
+    public static final Duration DEFAULT_RECOVERY_STALE_AFTER = Duration.ofMinutes(15);
+
     @ConstructorBinding
     public IngestionProperties {
         extraction = extraction != null ? extraction : ExtractionProperties.defaults();
         chunking = chunking != null ? chunking : ChunkingProperties.defaults();
+        worker = worker != null ? worker : WorkerProperties.defaults();
+    }
+
+    public IngestionProperties(ExtractionProperties extraction, ChunkingProperties chunking) {
+        this(extraction, chunking, WorkerProperties.defaults());
     }
 
     public static IngestionProperties defaults() {
-        return new IngestionProperties(ExtractionProperties.defaults(), ChunkingProperties.defaults());
+        return new IngestionProperties(
+            ExtractionProperties.defaults(),
+            ChunkingProperties.defaults(),
+            WorkerProperties.defaults()
+        );
     }
 
     public record ExtractionProperties(
@@ -94,6 +117,83 @@ public record IngestionProperties(
                 DEFAULT_CHUNK_SIZE,
                 DEFAULT_CHUNK_OVERLAP,
                 DEFAULT_MAX_CHUNKS_PER_DOCUMENT
+            );
+        }
+    }
+
+    public record WorkerProperties(
+        @DefaultValue("true") boolean enabled,
+        @DefaultValue("10") int maxConcurrentDocuments,
+        @DefaultValue("50") int batchSize,
+        @DefaultValue("10") int maxConcurrentBatches,
+        @DefaultValue("3") int maxAttempts,
+        @DefaultValue("500ms") Duration initialBackoff,
+        @DefaultValue("2.0") double backoffMultiplier,
+        @DefaultValue("5s") Duration maxBackoff,
+        @DefaultValue("15m") Duration recoveryStaleAfter
+    ) {
+
+        @ConstructorBinding
+        public WorkerProperties {
+            if (maxConcurrentDocuments < 1) {
+                throw new IllegalArgumentException("maxConcurrentDocuments must be >= 1");
+            }
+            if (batchSize < 1) {
+                throw new IllegalArgumentException("batchSize must be >= 1");
+            }
+            if (maxConcurrentBatches < 1) {
+                throw new IllegalArgumentException("maxConcurrentBatches must be >= 1");
+            }
+            if (maxAttempts < 1) {
+                throw new IllegalArgumentException("maxAttempts must be >= 1");
+            }
+            if (initialBackoff == null || initialBackoff.isNegative() || initialBackoff.isZero()) {
+                throw new IllegalArgumentException("initialBackoff must be > 0");
+            }
+            if (Double.isNaN(backoffMultiplier) || Double.isInfinite(backoffMultiplier) || backoffMultiplier < 1.0d) {
+                throw new IllegalArgumentException("backoffMultiplier must be finite and >= 1.0");
+            }
+            if (maxBackoff == null || maxBackoff.compareTo(initialBackoff) < 0) {
+                throw new IllegalArgumentException("maxBackoff must be >= initialBackoff");
+            }
+            if (recoveryStaleAfter == null || recoveryStaleAfter.isNegative() || recoveryStaleAfter.isZero()) {
+                throw new IllegalArgumentException("recoveryStaleAfter must be > 0");
+            }
+        }
+
+        public WorkerProperties(
+            boolean enabled,
+            int batchSize,
+            int maxConcurrentBatches,
+            int maxAttempts,
+            Duration initialBackoff,
+            double backoffMultiplier,
+            Duration maxBackoff
+        ) {
+            this(
+                enabled,
+                DEFAULT_MAX_CONCURRENT_DOCUMENTS,
+                batchSize,
+                maxConcurrentBatches,
+                maxAttempts,
+                initialBackoff,
+                backoffMultiplier,
+                maxBackoff,
+                DEFAULT_RECOVERY_STALE_AFTER
+            );
+        }
+
+        public static WorkerProperties defaults() {
+            return new WorkerProperties(
+                DEFAULT_WORKER_ENABLED,
+                DEFAULT_MAX_CONCURRENT_DOCUMENTS,
+                DEFAULT_BATCH_SIZE,
+                DEFAULT_MAX_CONCURRENT_BATCHES,
+                DEFAULT_MAX_ATTEMPTS,
+                DEFAULT_INITIAL_BACKOFF,
+                DEFAULT_BACKOFF_MULTIPLIER,
+                DEFAULT_MAX_BACKOFF,
+                DEFAULT_RECOVERY_STALE_AFTER
             );
         }
     }
