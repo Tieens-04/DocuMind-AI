@@ -7,6 +7,7 @@ import com.documind.exception.DocumentExtractionException;
 import org.junit.jupiter.api.Test;
 
 import java.nio.charset.StandardCharsets;
+import java.time.Duration;
 import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -25,9 +26,20 @@ class IngestionContractsAndChunkIdTest {
         assertThat(defaults.chunking().chunkSize()).isEqualTo(800);
         assertThat(defaults.chunking().chunkOverlap()).isEqualTo(150);
         assertThat(defaults.chunking().maxChunksPerDocument()).isEqualTo(10_000);
+        assertThat(defaults.worker().enabled()).isTrue();
+        assertThat(defaults.worker().maxConcurrentDocuments()).isEqualTo(10);
+        assertThat(defaults.worker().batchSize()).isEqualTo(50);
+        assertThat(defaults.worker().maxConcurrentBatches()).isEqualTo(10);
+        assertThat(defaults.worker().maxAttempts()).isEqualTo(3);
+        assertThat(defaults.worker().initialBackoff()).isEqualTo(Duration.ofMillis(500));
+        assertThat(defaults.worker().backoffMultiplier()).isEqualTo(2.0d);
+        assertThat(defaults.worker().maxBackoff()).isEqualTo(Duration.ofSeconds(5));
+        assertThat(defaults.worker().recoveryStaleAfter()).isEqualTo(Duration.ofMinutes(15));
 
-        IngestionProperties nullNested = new IngestionProperties(null, null);
-        assertThat(nullNested).isEqualTo(defaults);
+        IngestionProperties nullNestedLegacy = new IngestionProperties(null, null);
+        assertThat(nullNestedLegacy).isEqualTo(defaults);
+        IngestionProperties nullNestedFull = new IngestionProperties(null, null, null);
+        assertThat(nullNestedFull).isEqualTo(defaults);
 
         assertThatThrownBy(() -> new IngestionProperties.ChunkingProperties(800, 800, 10_000))
             .isInstanceOf(IllegalArgumentException.class);
@@ -48,6 +60,52 @@ class IngestionContractsAndChunkIdTest {
             .isInstanceOf(IllegalArgumentException.class);
         assertThatThrownBy(() -> new IngestionProperties.ExtractionProperties(1024L, 1000, 0.01d, 100L, 0L))
             .isInstanceOf(IllegalArgumentException.class);
+
+        assertThatThrownBy(() -> new IngestionProperties.WorkerProperties(
+            true, 0, 10, 3, Duration.ofMillis(500), 2.0d, Duration.ofSeconds(5)
+        )).isInstanceOf(IllegalArgumentException.class);
+        assertThatThrownBy(() -> new IngestionProperties.WorkerProperties(
+            true, 50, 0, 3, Duration.ofMillis(500), 2.0d, Duration.ofSeconds(5)
+        )).isInstanceOf(IllegalArgumentException.class);
+        assertThatThrownBy(() -> new IngestionProperties.WorkerProperties(
+            true, 50, 10, 0, Duration.ofMillis(500), 2.0d, Duration.ofSeconds(5)
+        )).isInstanceOf(IllegalArgumentException.class);
+        assertThatThrownBy(() -> new IngestionProperties.WorkerProperties(
+            true, 50, 10, 3, Duration.ZERO, 2.0d, Duration.ofSeconds(5)
+        )).isInstanceOf(IllegalArgumentException.class);
+        assertThatThrownBy(() -> new IngestionProperties.WorkerProperties(
+            true, 50, 10, 3, Duration.ofMillis(-10), 2.0d, Duration.ofSeconds(5)
+        )).isInstanceOf(IllegalArgumentException.class);
+        assertThatThrownBy(() -> new IngestionProperties.WorkerProperties(
+            true, 50, 10, 3, null, 2.0d, Duration.ofSeconds(5)
+        )).isInstanceOf(IllegalArgumentException.class);
+        assertThatThrownBy(() -> new IngestionProperties.WorkerProperties(
+            true, 50, 10, 3, Duration.ofMillis(500), 0.99d, Duration.ofSeconds(5)
+        )).isInstanceOf(IllegalArgumentException.class);
+        assertThatThrownBy(() -> new IngestionProperties.WorkerProperties(
+            true, 50, 10, 3, Duration.ofMillis(500), Double.NaN, Duration.ofSeconds(5)
+        )).isInstanceOf(IllegalArgumentException.class);
+        assertThatThrownBy(() -> new IngestionProperties.WorkerProperties(
+            true, 50, 10, 3, Duration.ofMillis(500), Double.POSITIVE_INFINITY, Duration.ofSeconds(5)
+        )).isInstanceOf(IllegalArgumentException.class);
+        assertThatThrownBy(() -> new IngestionProperties.WorkerProperties(
+            true, 50, 10, 3, Duration.ofMillis(500), 2.0d, Duration.ofMillis(400)
+        )).isInstanceOf(IllegalArgumentException.class);
+        assertThatThrownBy(() -> new IngestionProperties.WorkerProperties(
+            true, 50, 10, 3, Duration.ofMillis(500), 2.0d, null
+        )).isInstanceOf(IllegalArgumentException.class);
+        assertThatThrownBy(() -> new IngestionProperties.WorkerProperties(
+            true, 0, 50, 10, 3, Duration.ofMillis(500), 2.0d, Duration.ofSeconds(5), Duration.ofMinutes(15)
+        )).isInstanceOf(IllegalArgumentException.class);
+        assertThatThrownBy(() -> new IngestionProperties.WorkerProperties(
+            true, 10, 50, 10, 3, Duration.ofMillis(500), 2.0d, Duration.ofSeconds(5), Duration.ZERO
+        )).isInstanceOf(IllegalArgumentException.class);
+        assertThatThrownBy(() -> new IngestionProperties.WorkerProperties(
+            true, 10, 50, 10, 3, Duration.ofMillis(500), 2.0d, Duration.ofSeconds(5), Duration.ofSeconds(-1)
+        )).isInstanceOf(IllegalArgumentException.class);
+        assertThatThrownBy(() -> new IngestionProperties.WorkerProperties(
+            true, 10, 50, 10, 3, Duration.ofMillis(500), 2.0d, Duration.ofSeconds(5), null
+        )).isInstanceOf(IllegalArgumentException.class);
     }
 
     @Test

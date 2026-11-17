@@ -9,6 +9,10 @@ spring:
   threads:
     virtual:
       enabled: true
+  http:
+    client:
+      connect-timeout: ${HTTP_CLIENT_CONNECT_TIMEOUT:10s}
+      read-timeout: ${HTTP_CLIENT_READ_TIMEOUT:90s}
   servlet:
     multipart:
       max-file-size: 50MB
@@ -114,3 +118,13 @@ documind:
       chunk-size: 800
       chunk-overlap: 150
       max-chunks-per-document: 10000
+    worker:
+      enabled: true
+      max-concurrent-documents: 10
+      batch-size: 50
+      max-concurrent-batches: 10
+      max-attempts: 3
+      initial-backoff: 500ms
+      backoff-multiplier: 2.0
+      max-backoff: 5s
+      recovery-stale-after: 15m
