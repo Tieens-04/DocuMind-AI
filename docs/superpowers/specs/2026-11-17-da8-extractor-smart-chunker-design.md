@@ -82,7 +82,7 @@ Build the multi-format document extraction engine (`CompositeDocumentExtractor`)
   - `access_level`: `context.accessLevel().name()` (`PUBLIC` | `DEPARTMENT` | `CONFIDENTIAL`)
   - `doc_version`: `context.docVersion()` (`int >= 1`)
   - `chunk_index`: document-global `0..K-1` (`int`)
-  - `page_number`: `Integer >= 1` for PDF; omitted when `null` on non-PDFs (normalized to `NULL` column + `'null'::jsonb` by `V4`/`V5` trigger)
+  - `page_number`: `Integer >= 1` for PDF; omitted when `null` on non-PDFs (kept SQL `NULL` and stripped from JSONB by `V7` `sync_document_chunk_metadata()` so Spring AI `PgVectorStore$DocumentRowMapper` never encounters JSON `null` values)
   - `section_heading`: `String` when non-blank on `.docx`/`.md`/`.txt`; omitted when `null`
 
 ---
