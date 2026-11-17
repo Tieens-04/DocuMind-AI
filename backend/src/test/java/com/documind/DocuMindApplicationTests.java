@@ -50,5 +50,21 @@ class DocuMindApplicationTests {
         assertThat(primaryChatClient).isNotNull();
         assertThat(geminiChatClient).isNotNull().isNotSameAs(primaryChatClient);
         assertThat(embeddingModel).isInstanceOf(OllamaEmbeddingModel.class);
+
+        assertThat(applicationContext.containsBean("applicationTaskExecutor")).isTrue();
+        assertThat(applicationContext.containsBean("taskExecutor")).isTrue();
+        assertThat(applicationContext.containsBean("documentIngestionExecutor")).isTrue();
+        Object primaryExecutor = applicationContext.getBean(org.springframework.core.task.TaskExecutor.class);
+        assertThat(primaryExecutor)
+            .isSameAs(applicationContext.getBean("applicationTaskExecutor"))
+            .isNotSameAs(applicationContext.getBean("documentIngestionExecutor"));
+
+        assertThat(environment.getProperty("spring.http.client.connect-timeout")).isEqualTo("10s");
+        assertThat(environment.getProperty("spring.http.client.read-timeout")).isEqualTo("90s");
+        var httpClientProps = applicationContext.getBean(
+            org.springframework.boot.autoconfigure.http.client.HttpClientProperties.class
+        );
+        assertThat(httpClientProps.getConnectTimeout()).isEqualTo(java.time.Duration.ofSeconds(10));
+        assertThat(httpClientProps.getReadTimeout()).isEqualTo(java.time.Duration.ofSeconds(90));
     }
 }
