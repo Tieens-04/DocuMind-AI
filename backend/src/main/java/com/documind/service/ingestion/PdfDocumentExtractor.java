@@ -37,30 +37,69 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
+import java.util.concurrent.Semaphore;
 import java.util.function.Function;
+import java.util.function.Supplier;
 import java.util.regex.Pattern;
 
 /**
- * Extracts text from spooled PDF files using a 3-tier page-preserving pipeline while closing all PDFBox/file handles
- * cleanly for Windows temp-file deletion safety.
+ * Extracts text from spooled PDF files using a bounded-concurrency, sequential 3-tier page-preserving pipeline while
+ * closing all PDFBox/file handles cleanly for Windows temp-file deletion safety.
  */
 @Component
 public class PdfDocumentExtractor {
 
+    public static final int DEFAULT_MAX_CONCURRENT_EXTRACTIONS = 8;
+
     private static final Logger log = LoggerFactory.getLogger(PdfDocumentExtractor.class);
     private static final Pattern MULTI_HORIZONTAL_SPACE = Pattern.compile("[ \\t]{2,}");
+    private static final long RAW_PAGE_CHAR_MULTIPLIER = 4L;
 
     private final IngestionProperties properties;
     private final Function<Path, Map<Integer, String>> tier1Extractor;
+    private final Semaphore concurrencyLimiter;
+    private final Supplier<PageStripper> pageStripperFactory;
 
     @Autowired
     public PdfDocumentExtractor(IngestionProperties properties) {
-        this(properties, PdfDocumentExtractor::extractViaPagePdfReader);
+        this(
+            properties,
+            PdfDocumentExtractor::extractViaPagePdfReader,
+            DEFAULT_MAX_CONCURRENT_EXTRACTIONS,
+            defaultPageStripperFactory()
+        );
     }
 
     PdfDocumentExtractor(IngestionProperties properties, Function<Path, Map<Integer, String>> tier1Extractor) {
+        this(
+            properties,
+            tier1Extractor,
+            DEFAULT_MAX_CONCURRENT_EXTRACTIONS,
+            defaultPageStripperFactory()
+        );
+    }
+
+    PdfDocumentExtractor(
+        IngestionProperties properties,
+        Function<Path, Map<Integer, String>> tier1Extractor,
+        int maxConcurrentExtractions
+    ) {
+        this(properties, tier1Extractor, maxConcurrentExtractions, defaultPageStripperFactory());
+    }
+
+    PdfDocumentExtractor(
+        IngestionProperties properties,
+        Function<Path, Map<Integer, String>> tier1Extractor,
+        int maxConcurrentExtractions,
+        Supplier<PageStripper> pageStripperFactory
+    ) {
         this.properties = Objects.requireNonNull(properties, "properties must not be null");
+        if (maxConcurrentExtractions < 1) {
+            throw new IllegalArgumentException("maxConcurrentExtractions must be >= 1");
+        }
         this.tier1Extractor = tier1Extractor != null ? tier1Extractor : PdfDocumentExtractor::extractViaPagePdfReader;
+        this.concurrencyLimiter = new Semaphore(maxConcurrentExtractions);
+        this.pageStripperFactory = Objects.requireNonNull(pageStripperFactory, "pageStripperFactory must not be null");
     }
 
     public List<ExtractedSegment> extract(Path pdfTempFile, String originalName) {
@@ -68,20 +107,84 @@ public class PdfDocumentExtractor {
         String displayName = safeDisplayName(originalName);
         verifyNonEmptyFile(pdfTempFile, displayName);
 
-        int totalPages;
+        try {
+            concurrencyLimiter.acquire();
+        } catch (InterruptedException ex) {
+            Thread.currentThread().interrupt();
+            throw new DocumentExtractionException(
+                DocumentExtractionErrorCode.CORRUPT_DOCUMENT,
+                "Interrupted while waiting to extract PDF: " + displayName,
+                ex
+            );
+        }
+
+        try {
+            return extractInternal(pdfTempFile, displayName);
+        } catch (DocumentExtractionException ex) {
+            throw ex;
+        } catch (RuntimeException ex) {
+            throw new DocumentExtractionException(
+                DocumentExtractionErrorCode.CORRUPT_DOCUMENT,
+                "Unexpected error parsing PDF document: " + displayName,
+                ex
+            );
+        } finally {
+            concurrencyLimiter.release();
+        }
+    }
+
+    private List<ExtractedSegment> extractInternal(Path pdfTempFile, String displayName) {
+        int totalPages = inspectTotalPagesAndEncryption(pdfTempFile, displayName);
+        int maxChars = properties.extraction().maxExtractedChars();
         Map<Integer, String> resolvedPages = new LinkedHashMap<>();
 
-        try (PDDocument pdDoc = Loader.loadPDF(pdfTempFile.toFile())) {
-            totalPages = pdDoc.getNumberOfPages();
+        int cumulativeChars = collectTier1Pages(pdfTempFile, displayName, totalPages, maxChars, resolvedPages);
+
+        if (hasMissingPages(resolvedPages, totalPages)) {
+            cumulativeChars = rescueMissingPages(
+                pdfTempFile,
+                totalPages,
+                displayName,
+                maxChars,
+                resolvedPages,
+                cumulativeChars
+            );
+        }
+
+        if (resolvedPages.isEmpty()) {
+            Map<Integer, String> tier3Pages = extractViaTikaPageSax(pdfTempFile, displayName);
+            for (Map.Entry<Integer, String> entry : tier3Pages.entrySet()) {
+                Integer pageNum = entry.getKey();
+                String raw = entry.getValue();
+                if (pageNum != null && pageNum >= 1 && pageNum <= totalPages && raw != null && !raw.isBlank()) {
+                    checkRawPageLength(raw, maxChars, displayName);
+                    String normalized = normalizePageText(raw);
+                    if (!normalized.isEmpty()) {
+                        cumulativeChars = addAndCheckCharBudget(
+                            cumulativeChars,
+                            normalized.length(),
+                            maxChars,
+                            displayName
+                        );
+                        resolvedPages.put(pageNum, normalized);
+                    }
+                }
+            }
+        }
+
+        return buildSegments(resolvedPages, totalPages, displayName);
+    }
+
+    private static int inspectTotalPagesAndEncryption(Path pdfTempFile, String displayName) {
+        try (PDDocument preflightDoc = Loader.loadPDF(pdfTempFile.toFile())) {
+            int totalPages = preflightDoc.getNumberOfPages();
             if (totalPages == 0) {
                 throw new DocumentExtractionException(
                     DocumentExtractionErrorCode.EMPTY_DOCUMENT,
                     "PDF document contains 0 pages: " + displayName
                 );
             }
-
-            collectTier1Pages(pdfTempFile, displayName, totalPages, resolvedPages);
-            rescueMissingPagesWithStripper(pdDoc, totalPages, displayName, resolvedPages);
+            return totalPages;
         } catch (DocumentExtractionException ex) {
             throw ex;
         } catch (InvalidPasswordException ex) {
@@ -90,7 +193,7 @@ public class PdfDocumentExtractor {
                 "PDF document is password-protected or encrypted: " + displayName,
                 ex
             );
-        } catch (IOException ex) {
+        } catch (IOException | RuntimeException ex) {
             if (hasCause(ex, InvalidPasswordException.class)) {
                 throw new DocumentExtractionException(
                     DocumentExtractionErrorCode.ENCRYPTED_DOCUMENT,
@@ -104,80 +207,120 @@ public class PdfDocumentExtractor {
                 ex
             );
         }
-
-        if (allPagesBlank(resolvedPages)) {
-            Map<Integer, String> tier3Pages = extractViaTikaPageSax(pdfTempFile, displayName);
-            for (Map.Entry<Integer, String> entry : tier3Pages.entrySet()) {
-                if (entry.getValue() != null && !entry.getValue().isBlank()) {
-                    resolvedPages.put(entry.getKey(), collapseLayoutPadding(entry.getValue()));
-                }
-            }
-        }
-
-        return buildSegments(resolvedPages, totalPages, displayName);
     }
 
-    private void collectTier1Pages(
+    private int collectTier1Pages(
         Path pdfTempFile,
         String displayName,
         int totalPages,
+        int maxChars,
         Map<Integer, String> resolvedPages
     ) {
+        int cumulativeChars = 0;
         try {
             Map<Integer, String> tier1Pages = tier1Extractor.apply(pdfTempFile);
-            if (tier1Pages == null) {
-                return;
+            if (tier1Pages == null || tier1Pages.isEmpty()) {
+                return 0;
             }
-            for (Map.Entry<Integer, String> entry : tier1Pages.entrySet()) {
-                Integer pageNum = entry.getKey();
-                String text = entry.getValue();
-                if (pageNum != null && pageNum >= 1 && pageNum <= totalPages && text != null && !text.isBlank()) {
-                    resolvedPages.put(pageNum, text);
+            for (int pageNum = 1; pageNum <= totalPages; pageNum++) {
+                String raw = tier1Pages.get(pageNum);
+                if (raw == null || raw.isBlank()) {
+                    continue;
+                }
+                checkRawPageLength(raw, maxChars, displayName);
+                String normalized = normalizePageText(raw);
+                if (!normalized.isEmpty()) {
+                    cumulativeChars = addAndCheckCharBudget(cumulativeChars, normalized.length(), maxChars, displayName);
+                    resolvedPages.put(pageNum, normalized);
                 }
             }
+        } catch (DocumentExtractionException ex) {
+            throw ex;
         } catch (RuntimeException ex) {
             log.warn("Tier-1 PagePdfDocumentReader failed for '{}'; falling back to PDFTextStripper: {}",
                 displayName, ex.getMessage());
         }
+        return cumulativeChars;
     }
 
-    private static void rescueMissingPagesWithStripper(
+    private int rescueMissingPages(
+        Path pdfTempFile,
+        int totalPages,
+        String displayName,
+        int maxChars,
+        Map<Integer, String> resolvedPages,
+        int initialCumulativeChars
+    ) {
+        try (PDDocument rescueDoc = Loader.loadPDF(pdfTempFile.toFile())) {
+            return rescueMissingPagesWithStripper(
+                rescueDoc,
+                totalPages,
+                displayName,
+                maxChars,
+                resolvedPages,
+                initialCumulativeChars
+            );
+        } catch (DocumentExtractionException ex) {
+            throw ex;
+        } catch (InvalidPasswordException ex) {
+            throw new DocumentExtractionException(
+                DocumentExtractionErrorCode.ENCRYPTED_DOCUMENT,
+                "PDF document is password-protected or encrypted: " + displayName,
+                ex
+            );
+        } catch (IOException | RuntimeException ex) {
+            if (hasCause(ex, InvalidPasswordException.class)) {
+                throw new DocumentExtractionException(
+                    DocumentExtractionErrorCode.ENCRYPTED_DOCUMENT,
+                    "PDF document is password-protected or encrypted: " + displayName,
+                    ex
+                );
+            }
+            throw new DocumentExtractionException(
+                DocumentExtractionErrorCode.CORRUPT_DOCUMENT,
+                "Failed to load PDF document for Tier-2 text rescue: " + displayName,
+                ex
+            );
+        }
+    }
+
+    private int rescueMissingPagesWithStripper(
         PDDocument pdDoc,
         int totalPages,
         String displayName,
-        Map<Integer, String> resolvedPages
+        int maxChars,
+        Map<Integer, String> resolvedPages,
+        int initialCumulativeChars
     ) {
-        boolean needsRescue = false;
+        int cumulativeChars = initialCumulativeChars;
+        PageStripper stripper = pageStripperFactory.get();
         for (int pageNum = 1; pageNum <= totalPages; pageNum++) {
             String existing = resolvedPages.get(pageNum);
-            if (existing == null || existing.isBlank()) {
-                needsRescue = true;
-                break;
+            if (existing != null && !existing.isBlank()) {
+                continue;
+            }
+            String rescued;
+            try {
+                rescued = stripper.extractPage(pdDoc, pageNum);
+            } catch (DocumentExtractionException ex) {
+                throw ex;
+            } catch (IOException | RuntimeException ex) {
+                log.warn("Tier-2 PDFTextStripper rescue failed on page {} of '{}': {}",
+                    pageNum, displayName, ex.getMessage());
+                stripper = pageStripperFactory.get();
+                continue;
+            }
+            if (rescued == null || rescued.isBlank()) {
+                continue;
+            }
+            checkRawPageLength(rescued, maxChars, displayName);
+            String normalized = normalizePageText(rescued);
+            if (!normalized.isEmpty()) {
+                cumulativeChars = addAndCheckCharBudget(cumulativeChars, normalized.length(), maxChars, displayName);
+                resolvedPages.put(pageNum, normalized);
             }
         }
-        if (!needsRescue) {
-            return;
-        }
-
-        try {
-            PDFTextStripper stripper = new PDFTextStripper();
-            stripper.setSortByPosition(true);
-            for (int pageNum = 1; pageNum <= totalPages; pageNum++) {
-                String existing = resolvedPages.get(pageNum);
-                if (existing != null && !existing.isBlank()) {
-                    continue;
-                }
-                stripper.setStartPage(pageNum);
-                stripper.setEndPage(pageNum);
-                String rescued = stripper.getText(pdDoc);
-                if (rescued != null && !rescued.isBlank()) {
-                    resolvedPages.put(pageNum, rescued);
-                }
-            }
-        } catch (IOException ex) {
-            log.warn("Tier-2 PDFTextStripper rescue encountered an I/O error for '{}': {}",
-                displayName, ex.getMessage());
-        }
+        return cumulativeChars;
     }
 
     Map<Integer, String> extractViaTikaPageSax(Path pdfTempFile, String originalName) {
@@ -224,32 +367,19 @@ public class PdfDocumentExtractor {
         }
     }
 
-    private List<ExtractedSegment> buildSegments(
+    private static List<ExtractedSegment> buildSegments(
         Map<Integer, String> resolvedPages,
         int totalPages,
         String displayName
     ) {
-        int maxChars = properties.extraction().maxExtractedChars();
-        int cumulativeChars = 0;
         List<ExtractedSegment> segments = new ArrayList<>();
 
         for (int pageNum = 1; pageNum <= totalPages; pageNum++) {
-            String rawPage = resolvedPages.get(pageNum);
-            if (rawPage == null || rawPage.isBlank()) {
+            String pageText = resolvedPages.get(pageNum);
+            if (pageText == null || pageText.isBlank()) {
                 continue;
             }
-            String normalized = IngestionTextNormalizer.normalizeText(collapseLayoutPadding(rawPage));
-            if (normalized.isEmpty()) {
-                continue;
-            }
-            cumulativeChars += normalized.length();
-            if (cumulativeChars > maxChars) {
-                throw new DocumentExtractionException(
-                    DocumentExtractionErrorCode.EXTRACTION_LIMIT_EXCEEDED,
-                    "Extracted PDF character count exceeded limit of " + maxChars + " for " + displayName
-                );
-            }
-            segments.add(new ExtractedSegment(normalized, pageNum, null));
+            segments.add(new ExtractedSegment(pageText, pageNum, null));
         }
 
         if (segments.isEmpty()) {
@@ -259,6 +389,57 @@ public class PdfDocumentExtractor {
             );
         }
         return List.copyOf(segments);
+    }
+
+    private static boolean hasMissingPages(Map<Integer, String> resolvedPages, int totalPages) {
+        for (int pageNum = 1; pageNum <= totalPages; pageNum++) {
+            String existing = resolvedPages.get(pageNum);
+            if (existing == null || existing.isBlank()) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static void checkRawPageLength(String rawPage, int maxChars, String displayName) {
+        if (rawPage.length() > (long) maxChars * RAW_PAGE_CHAR_MULTIPLIER) {
+            throw new DocumentExtractionException(
+                DocumentExtractionErrorCode.EXTRACTION_LIMIT_EXCEEDED,
+                "Extracted PDF character count exceeded limit of " + maxChars + " for " + displayName
+            );
+        }
+    }
+
+    private static int addAndCheckCharBudget(int currentTotal, int addition, int maxChars, String displayName) {
+        long nextTotal = (long) currentTotal + addition;
+        if (nextTotal > maxChars) {
+            throw new DocumentExtractionException(
+                DocumentExtractionErrorCode.EXTRACTION_LIMIT_EXCEEDED,
+                "Extracted PDF character count exceeded limit of " + maxChars + " for " + displayName
+            );
+        }
+        return (int) nextTotal;
+    }
+
+    private static String normalizePageText(String rawPage) {
+        return IngestionTextNormalizer.normalizeText(collapseLayoutPadding(rawPage));
+    }
+
+    private static Supplier<PageStripper> defaultPageStripperFactory() {
+        return () -> {
+            PDFTextStripper stripper = new PDFTextStripper();
+            stripper.setSortByPosition(true);
+            return (doc, pageNum) -> {
+                stripper.setStartPage(pageNum);
+                stripper.setEndPage(pageNum);
+                return stripper.getText(doc);
+            };
+        };
+    }
+
+    @FunctionalInterface
+    interface PageStripper {
+        String extractPage(PDDocument document, int pageNumber) throws IOException;
     }
 
     private static Map<Integer, String> extractViaPagePdfReader(Path pdfTempFile) {
@@ -284,10 +465,6 @@ public class PdfDocumentExtractor {
             }
         }
         return pages;
-    }
-
-    private static boolean allPagesBlank(Map<Integer, String> pages) {
-        return pages.values().stream().noneMatch(text -> text != null && !text.isBlank());
     }
 
     private static void verifyNonEmptyFile(Path pdfTempFile, String displayName) {

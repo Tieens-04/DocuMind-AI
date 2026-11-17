@@ -4,18 +4,20 @@ import com.documind.exception.DocumentExtractionErrorCode;
 import com.documind.exception.DocumentExtractionException;
 import org.apache.poi.openxml4j.exceptions.OpenXML4JException;
 import org.apache.poi.openxml4j.opc.OPCPackage;
+import org.apache.poi.openxml4j.opc.PackageRelationship;
 import org.apache.poi.openxml4j.util.ZipFileZipEntrySource;
 import org.apache.poi.openxml4j.util.ZipSecureFile;
+import org.apache.poi.poifs.filesystem.DirectoryNode;
+import org.apache.poi.poifs.filesystem.POIFSFileSystem;
 import org.apache.tika.exception.EncryptedDocumentException;
 import org.apache.tika.exception.TikaException;
 import org.apache.tika.io.TikaInputStream;
 import org.apache.tika.metadata.Metadata;
 import org.apache.tika.metadata.TikaCoreProperties;
-import org.apache.tika.parser.AutoDetectParser;
 import org.apache.tika.parser.ParseContext;
 import org.apache.tika.parser.microsoft.OfficeParserConfig;
-import org.apache.tika.parser.microsoft.ooxml.OPCPackageWrapper;
 import org.apache.tika.parser.microsoft.ooxml.OOXMLParser;
+import org.apache.tika.parser.microsoft.ooxml.OPCPackageWrapper;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Component;
 import org.xml.sax.Attributes;
@@ -24,27 +26,45 @@ import org.xml.sax.helpers.DefaultHandler;
 
 import java.io.IOException;
 import java.io.InputStream;
+import java.net.URI;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Deque;
 import java.util.List;
 import java.util.Locale;
 import java.util.Objects;
 
 /**
- * Extracts {@code .docx} files using Apache POI {@link ZipSecureFile} ZIP-bomb limits and a heading-aware Tika XHTML
- * handler that preserves Word heading breadcrumbs and pipe-delimited tables.
+ * Extracts {@code .docx} files using Apache POI {@link ZipSecureFile} ZIP-bomb limits, strict container validation,
+ * and a heading-aware Tika XHTML handler that preserves Word heading breadcrumbs and nested/pipe-delimited tables.
+ *
+ * <p><strong>JVM-global state note:</strong> {@link ZipSecureFile} stores {@code minInflateRatio}, {@code maxEntrySize},
+ * {@code maxFileCount}, and {@code maxTextSize} in static JVM-wide globals, which affects every Apache POI OOXML
+ * consumer running in the same JVM process.
  */
 @Component
 public class DocxDocumentExtractor {
 
     private static final int MAX_HEADING_LEVELS = 6;
+    private static final int HEADER_PROBE_BYTES = 64;
     private static final long MIN_TIKA_MAX_TEXT_SIZE_BYTES = 10_485_760L;
+    private static final String WORD_DOC_MAIN_CONTENT_TYPE =
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml";
+    private static final String WORD_DOC_MACRO_CONTENT_TYPE =
+        "application/vnd.ms-word.document.macroEnabled.main+xml";
+    private static final String WORD_TEMPLATE_CONTENT_TYPE =
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.template.main+xml";
+    private static final String OFFICE_DOC_REL_TYPE =
+        "http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument";
+    private static final String STRICT_OFFICE_DOC_REL_TYPE =
+        "http://purl.oclc.org/ooxml/officeDocument/relationships/officeDocument";
     private static final Object ZIP_CONFIG_LOCK = new Object();
-    // Eagerly initialize Tika's OOXML/AutoDetect parsers once so OOXMLParser.<clinit>()'s ZipSecureFile reset runs before we apply our strict limits.
+    // Eagerly initialize Tika's OOXMLParser once so OOXMLParser.<clinit>()'s ZipSecureFile reset runs before we apply our strict limits.
     private static final OOXMLParser OOXML_PARSER = new OOXMLParser();
-    private static final AutoDetectParser FALLBACK_PARSER = new AutoDetectParser();
 
     private final IngestionProperties properties;
     private final PlainTextSectionExtractor plainTextSectionExtractor;
@@ -80,19 +100,34 @@ public class DocxDocumentExtractor {
         parseContext.set(OfficeParserConfig.class, officeConfig);
 
         try {
-            if (startsWithPkZipSignature(docxTempFile)) {
+            byte[] header = readHeaderPrefix(docxTempFile);
+            if (startsWithPkZipSignature(header)) {
                 try (ZipSecureFile secureZip = new ZipSecureFile(docxTempFile.toFile());
                      ZipFileZipEntrySource entrySource = new ZipFileZipEntrySource(secureZip);
                      OPCPackage opcPackage = OPCPackage.open(entrySource);
                      OPCPackageWrapper wrapper = new OPCPackageWrapper(opcPackage);
                      TikaInputStream tikaStream = TikaInputStream.get(docxTempFile, metadata)) {
+                    if (!isWordProcessingPackage(opcPackage)) {
+                        throw new DocumentExtractionException(
+                            DocumentExtractionErrorCode.UNSUPPORTED_FORMAT,
+                            "ZIP container is not a valid WordprocessingML .docx document: " + displayName
+                        );
+                    }
                     tikaStream.setOpenContainer(wrapper);
                     OOXML_PARSER.parse(tikaStream, handler, metadata, parseContext);
                 }
+            } else if (startsWithOle2Signature(header)) {
+                inspectOle2Container(docxTempFile, displayName);
+            } else if (isRecognizableNonDocxFormat(header)) {
+                throw new DocumentExtractionException(
+                    DocumentExtractionErrorCode.UNSUPPORTED_FORMAT,
+                    "File content does not match .docx OOXML container format: " + displayName
+                );
             } else {
-                try (TikaInputStream tikaStream = TikaInputStream.get(docxTempFile, metadata)) {
-                    FALLBACK_PARSER.parse(tikaStream, handler, metadata, parseContext);
-                }
+                throw new DocumentExtractionException(
+                    DocumentExtractionErrorCode.CORRUPT_DOCUMENT,
+                    "Corrupt or unrecognized .docx container header: " + displayName
+                );
             }
         } catch (Exception ex) {
             throw translateExtractionFailure(ex, displayName);
@@ -118,6 +153,9 @@ public class DocxDocumentExtractor {
         return segments;
     }
 
+    /**
+     * Applies JVM-wide {@link ZipSecureFile} thresholds once (or when configuration changes) under a lock.
+     */
     private static void ensureZipSecureLimits(IngestionProperties.ExtractionProperties cfg) {
         if (limitsMatch(cfg)) {
             return;
@@ -192,23 +230,106 @@ public class DocxDocumentExtractor {
         );
     }
 
-    private static boolean startsWithPkZipSignature(Path file) throws IOException {
-        byte[] magic = new byte[4];
+    private static byte[] readHeaderPrefix(Path file) throws IOException {
+        byte[] buffer = new byte[HEADER_PROBE_BYTES];
+        int offset = 0;
         try (InputStream in = Files.newInputStream(file)) {
-            int offset = 0;
-            while (offset < magic.length) {
-                int read = in.read(magic, offset, magic.length - offset);
+            while (offset < buffer.length) {
+                int read = in.read(buffer, offset, buffer.length - offset);
                 if (read == -1) {
-                    return false;
+                    break;
                 }
                 offset += read;
             }
         }
-        return magic[0] == 0x50
+        return offset == buffer.length ? buffer : Arrays.copyOf(buffer, offset);
+    }
+
+    private static boolean startsWithPkZipSignature(byte[] magic) {
+        return magic.length >= 4
+            && magic[0] == 0x50
             && magic[1] == 0x4B
             && ((magic[2] == 0x03 && magic[3] == 0x04)
                 || (magic[2] == 0x05 && magic[3] == 0x06)
                 || (magic[2] == 0x07 && magic[3] == 0x08));
+    }
+
+    private static boolean startsWithOle2Signature(byte[] magic) {
+        return magic.length >= 8
+            && magic[0] == (byte) 0xD0
+            && magic[1] == (byte) 0xCF
+            && magic[2] == (byte) 0x11
+            && magic[3] == (byte) 0xE0
+            && magic[4] == (byte) 0xA1
+            && magic[5] == (byte) 0xB1
+            && magic[6] == (byte) 0x1A
+            && magic[7] == (byte) 0xE1;
+    }
+
+    private static boolean isRecognizableNonDocxFormat(byte[] header) {
+        if (header.length >= 5
+            && header[0] == '%'
+            && header[1] == 'P'
+            && header[2] == 'D'
+            && header[3] == 'F'
+            && header[4] == '-') {
+            return true;
+        }
+        String latin1Prefix = new String(header, StandardCharsets.ISO_8859_1);
+        if (latin1Prefix.startsWith("{\\rtf")) {
+            return true;
+        }
+        String utf8Prefix = new String(header, StandardCharsets.UTF_8);
+        if (utf8Prefix.startsWith("\uFEFF")) {
+            utf8Prefix = utf8Prefix.substring(1);
+        }
+        String trimmedLower = utf8Prefix.stripLeading().toLowerCase(Locale.ROOT);
+        return trimmedLower.startsWith("<html") || trimmedLower.startsWith("<!doctype html");
+    }
+
+    private static void inspectOle2Container(Path docxTempFile, String displayName) throws IOException {
+        try (POIFSFileSystem fs = new POIFSFileSystem(docxTempFile.toFile(), true)) {
+            DirectoryNode root = fs.getRoot();
+            if (root.hasEntryCaseInsensitive("EncryptionInfo")
+                || root.hasEntryCaseInsensitive("EncryptedPackage")
+                || root.hasEntryCaseInsensitive("EncryptedSummary")) {
+                throw new DocumentExtractionException(
+                    DocumentExtractionErrorCode.ENCRYPTED_DOCUMENT,
+                    "DOCX document is password-protected or encrypted: " + displayName
+                );
+            }
+            throw new DocumentExtractionException(
+                DocumentExtractionErrorCode.UNSUPPORTED_FORMAT,
+                "Legacy OLE2 container is not a supported OOXML .docx document: " + displayName
+            );
+        }
+    }
+
+    private static boolean isWordProcessingPackage(OPCPackage opcPackage) {
+        if (!opcPackage.getPartsByContentType(WORD_DOC_MAIN_CONTENT_TYPE).isEmpty()
+            || !opcPackage.getPartsByContentType(WORD_DOC_MACRO_CONTENT_TYPE).isEmpty()
+            || !opcPackage.getPartsByContentType(WORD_TEMPLATE_CONTENT_TYPE).isEmpty()) {
+            return true;
+        }
+        return hasWordOfficeDocumentRel(opcPackage, OFFICE_DOC_REL_TYPE)
+            || hasWordOfficeDocumentRel(opcPackage, STRICT_OFFICE_DOC_REL_TYPE);
+    }
+
+    private static boolean hasWordOfficeDocumentRel(OPCPackage opcPackage, String relType) {
+        for (PackageRelationship rel : opcPackage.getRelationshipsByType(relType)) {
+            URI target = rel.getTargetURI();
+            if (target == null || target.getPath() == null) {
+                continue;
+            }
+            String path = target.getPath().toLowerCase(Locale.ROOT);
+            while (path.startsWith("/")) {
+                path = path.substring(1);
+            }
+            if (path.startsWith("word/")) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private static boolean hasCause(Throwable error, Class<? extends Throwable> target) {
@@ -254,14 +375,14 @@ public class DocxDocumentExtractor {
         private final String displayName;
         private final List<ExtractedSegment> segments = new ArrayList<>();
         private final String[] headings = new String[MAX_HEADING_LEVELS];
+        private final boolean[] dirtyHeadings = new boolean[MAX_HEADING_LEVELS];
         private final StringBuilder bodyBuffer = new StringBuilder();
         private final StringBuilder headingBuffer = new StringBuilder();
-        private final StringBuilder cellBuffer = new StringBuilder();
-        private final List<String> currentRowCells = new ArrayList<>();
+        private final Deque<List<String>> rowStack = new ArrayDeque<>();
+        private final Deque<StringBuilder> cellStack = new ArrayDeque<>();
 
         private boolean inBody;
         private int activeHeadingLevel;
-        private boolean inTableCell;
         private boolean sawHeadingTag;
         private int totalChars;
 
@@ -276,7 +397,12 @@ public class DocxDocumentExtractor {
 
         private List<ExtractedSegment> segments() {
             flushSegment();
+            flushOrphanedHeadingIfNeeded(0);
             return List.copyOf(segments);
+        }
+
+        private boolean inTableCell() {
+            return !cellStack.isEmpty();
         }
 
         @Override
@@ -289,7 +415,7 @@ public class DocxDocumentExtractor {
             if (!inBody) {
                 return;
             }
-            if (!inTableCell) {
+            if (!inTableCell()) {
                 int headingLevel = parseHeadingLevel(tag);
                 if (headingLevel > 0) {
                     sawHeadingTag = true;
@@ -300,12 +426,11 @@ public class DocxDocumentExtractor {
                 }
             }
             if ("tr".equals(tag)) {
-                currentRowCells.clear();
+                rowStack.push(new ArrayList<>());
             } else if ("td".equals(tag) || "th".equals(tag)) {
-                inTableCell = true;
-                cellBuffer.setLength(0);
+                cellStack.push(new StringBuilder());
             } else if ("br".equals(tag)) {
-                appendNewline(inTableCell ? cellBuffer : bodyBuffer);
+                appendNewline(inTableCell() ? cellStack.peek() : bodyBuffer);
             }
         }
 
@@ -324,13 +449,14 @@ public class DocxDocumentExtractor {
             String tag = resolveTag(localName, qName);
             if ("body".equals(tag)) {
                 flushSegment();
+                flushOrphanedHeadingIfNeeded(0);
                 inBody = false;
                 return;
             }
             if (!inBody) {
                 return;
             }
-            if (!inTableCell) {
+            if (!inTableCell()) {
                 int headingLevel = parseHeadingLevel(tag);
                 if (headingLevel > 0 && activeHeadingLevel == headingLevel) {
                     String cleanHeading = IngestionTextNormalizer.normalizeText(headingBuffer.toString())
@@ -338,34 +464,54 @@ public class DocxDocumentExtractor {
                     headingBuffer.setLength(0);
                     activeHeadingLevel = 0;
                     if (!cleanHeading.isEmpty()) {
+                        flushOrphanedHeadingIfNeeded(headingLevel - 1);
                         headings[headingLevel - 1] = cleanHeading;
                         Arrays.fill(headings, headingLevel, headings.length, null);
+                        dirtyHeadings[headingLevel - 1] = true;
                     }
                     return;
                 }
             }
             if ("td".equals(tag) || "th".equals(tag)) {
-                inTableCell = false;
-                String cell = IngestionTextNormalizer.normalizeText(cellBuffer.toString())
-                    .replaceAll("\\s+", " ");
-                cellBuffer.setLength(0);
-                currentRowCells.add(cell);
+                if (!cellStack.isEmpty()) {
+                    StringBuilder finishedCell = cellStack.pop();
+                    String cell = IngestionTextNormalizer.normalizeText(finishedCell.toString())
+                        .replaceAll("\\s+", " ");
+                    if (!rowStack.isEmpty()) {
+                        rowStack.peek().add(cell);
+                    }
+                }
                 return;
             }
             if ("tr".equals(tag)) {
-                if (currentRowCells.stream().anyMatch(cell -> !cell.isEmpty())) {
-                    if (!bodyBuffer.isEmpty() && bodyBuffer.charAt(bodyBuffer.length() - 1) != '\n') {
-                        bodyBuffer.append('\n');
+                if (!rowStack.isEmpty()) {
+                    List<String> rowCells = rowStack.pop();
+                    if (rowCells.stream().anyMatch(cell -> !cell.isEmpty())) {
+                        if (inTableCell()) {
+                            List<String> nonEmpty = rowCells.stream().filter(cell -> !cell.isEmpty()).toList();
+                            String nestedRow = String.join(" - ", nonEmpty);
+                            StringBuilder parentCell = cellStack.peek();
+                            if (!parentCell.isEmpty()
+                                && !Character.isWhitespace(parentCell.charAt(parentCell.length() - 1))) {
+                                parentCell.append(' ');
+                            }
+                            parentCell.append(nestedRow);
+                        } else {
+                            if (!bodyBuffer.isEmpty() && bodyBuffer.charAt(bodyBuffer.length() - 1) != '\n') {
+                                bodyBuffer.append('\n');
+                            }
+                            bodyBuffer.append("| ").append(String.join(" | ", rowCells)).append(" |\n");
+                        }
                     }
-                    bodyBuffer.append("| ").append(String.join(" | ", currentRowCells)).append(" |\n");
                 }
-                currentRowCells.clear();
                 return;
             }
-            if ("p".equals(tag) || "li".equals(tag) || (inTableCell && parseHeadingLevel(tag) > 0)) {
-                if (inTableCell) {
-                    if (!cellBuffer.isEmpty() && !Character.isWhitespace(cellBuffer.charAt(cellBuffer.length() - 1))) {
-                        cellBuffer.append(' ');
+            if ("p".equals(tag) || "li".equals(tag) || (inTableCell() && parseHeadingLevel(tag) > 0)) {
+                if (inTableCell()) {
+                    StringBuilder currentCell = cellStack.peek();
+                    if (!currentCell.isEmpty()
+                        && !Character.isWhitespace(currentCell.charAt(currentCell.length() - 1))) {
+                        currentCell.append(' ');
                     }
                 } else {
                     appendNewline(bodyBuffer);
@@ -388,8 +534,8 @@ public class DocxDocumentExtractor {
             }
             if (activeHeadingLevel > 0) {
                 headingBuffer.append(ch, start, length);
-            } else if (inTableCell) {
-                cellBuffer.append(ch, start, length);
+            } else if (inTableCell()) {
+                cellStack.peek().append(ch, start, length);
             } else {
                 bodyBuffer.append(ch, start, length);
             }
@@ -403,6 +549,21 @@ public class DocxDocumentExtractor {
             bodyBuffer.setLength(0);
             if (!content.isEmpty()) {
                 segments.add(new ExtractedSegment(content, null, IngestionTextNormalizer.formatBreadcrumb(headings)));
+                Arrays.fill(dirtyHeadings, false);
+            }
+        }
+
+        private void flushOrphanedHeadingIfNeeded(int targetLevel) {
+            int deepestDirty = -1;
+            for (int k = targetLevel; k < dirtyHeadings.length; k++) {
+                if (dirtyHeadings[k] && headings[k] != null && !headings[k].isBlank()) {
+                    deepestDirty = k;
+                }
+            }
+            if (deepestDirty >= 0) {
+                String parentBreadcrumb = IngestionTextNormalizer.formatBreadcrumb(Arrays.copyOf(headings, deepestDirty));
+                segments.add(new ExtractedSegment(headings[deepestDirty], null, parentBreadcrumb));
+                Arrays.fill(dirtyHeadings, false);
             }
         }
 

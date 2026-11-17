@@ -19,7 +19,7 @@ import java.util.Objects;
 @Service
 public class SmartChunkingService {
 
-    private static final int MIN_BODY_BUDGET_TOKENS = 32;
+    private static final int MIN_BODY_BUDGET_TOKENS = 8;
     private static final int MAX_HEADER_PREFIX_DIVISOR = 4;
 
     private final IngestionProperties properties;
@@ -121,40 +121,63 @@ public class SmartChunkingService {
         String prefix = headerForPrefix + "\n\n";
         int prefixTokens = splitter.countTokens(prefix);
 
-        int initialBodyBudget = Math.max(8, chunkSize - prefixTokens);
+        int rawAllowance = chunkSize - prefixTokens;
+        int initialBodyBudget = rawAllowance > 10 ? rawAllowance - 2 : Math.max(8, rawAllowance);
         int minBodyBudget = Math.min(MIN_BODY_BUDGET_TOKENS, initialBodyBudget);
         int bodyBudget = initialBodyBudget;
         int bodyOverlap = Math.min(chunkOverlap, Math.max(0, bodyBudget - 1));
         List<String> rawBodyChunks = splitter.splitTextWithBudget(normalizedBody, bodyBudget, bodyOverlap);
 
-        while (!allFitWithPrefix(rawBodyChunks, normalizedHeading, prefix, chunkSize) && bodyBudget > minBodyBudget) {
-            bodyBudget = Math.max(minBodyBudget, bodyBudget - 4);
+        int maxExcess = maxTokenExcessWithPrefix(rawBodyChunks, normalizedHeading, prefix, chunkSize);
+        if (maxExcess > 0 && bodyBudget > minBodyBudget) {
+            bodyBudget = Math.max(minBodyBudget, bodyBudget - Math.max(maxExcess + 2, 2));
             bodyOverlap = Math.min(chunkOverlap, Math.max(0, bodyBudget - 1));
             rawBodyChunks = splitter.splitTextWithBudget(normalizedBody, bodyBudget, bodyOverlap);
         }
 
         List<String> enriched = new ArrayList<>(rawBodyChunks.size());
         for (String bodyChunk : rawBodyChunks) {
-            enriched.add(assembleWithPrefix(bodyChunk, normalizedHeading, prefix));
+            String assembled = assembleWithPrefix(bodyChunk, normalizedHeading, prefix);
+            if (splitter.countTokens(assembled) > chunkSize) {
+                assembled = splitter.trimToTokenLimit(assembled, chunkSize);
+            }
+            if (!assembled.isEmpty()) {
+                enriched.add(assembled);
+            }
         }
         return List.copyOf(enriched);
     }
 
-    private boolean allFitWithPrefix(
+    private int maxTokenExcessWithPrefix(
         List<String> rawBodyChunks,
         String normalizedHeading,
         String prefix,
         int chunkSize
     ) {
-        return rawBodyChunks.stream()
-            .allMatch(body -> splitter.countTokens(assembleWithPrefix(body, normalizedHeading, prefix)) <= chunkSize);
+        int maxExcess = 0;
+        for (String body : rawBodyChunks) {
+            int tokens = splitter.countTokens(assembleWithPrefix(body, normalizedHeading, prefix));
+            if (tokens > chunkSize) {
+                maxExcess = Math.max(maxExcess, tokens - chunkSize);
+            }
+        }
+        return maxExcess;
     }
 
     private String assembleWithPrefix(String bodyChunk, String fullHeading, String prefix) {
-        if (bodyChunk.startsWith(fullHeading) || bodyChunk.startsWith(prefix)) {
+        if (startsWithHeadingOnBoundary(bodyChunk, fullHeading, prefix)) {
             return bodyChunk;
         }
         return prefix + bodyChunk;
+    }
+
+    private static boolean startsWithHeadingOnBoundary(String bodyChunk, String fullHeading, String prefix) {
+        if (bodyChunk.startsWith(prefix) || bodyChunk.equals(fullHeading)) {
+            return true;
+        }
+        return bodyChunk.startsWith(fullHeading)
+            && bodyChunk.length() > fullHeading.length()
+            && bodyChunk.charAt(fullHeading.length()) == '\n';
     }
 
     private String capHeadingToTokenBudget(String heading, int maxTokens) {

@@ -215,4 +215,191 @@ class MarkdownAndPlainTextExtractorTest {
             .extracting(ex -> ((DocumentExtractionException) ex).errorCode())
             .isEqualTo(DocumentExtractionErrorCode.EXTRACTION_LIMIT_EXCEEDED);
     }
+
+    @Test
+    void plainTextPreservesNumberedAndRomanListsWithoutDroppingStepsWhileRecognizingGenuineNumberedHeadings() {
+        String singleSpacedList = """
+            Quy trình xin nghỉ phép:
+
+            1. Nộp đơn cho quản lý trực tiếp
+            2. Quản lý phê duyệt trong 3 ngày
+            3. Phòng nhân sự ghi nhận
+
+            Hết.
+            """;
+
+        List<ExtractedSegment> singleSegments = plainTextExtractor.extractFromText(singleSpacedList, "nghi_phep.txt");
+        assertThat(singleSegments).hasSize(1);
+        assertThat(singleSegments.getFirst().sectionHeading()).isNull();
+        assertThat(singleSegments.getFirst().content())
+            .contains("Quy trình xin nghỉ phép:")
+            .contains("1. Nộp đơn cho quản lý trực tiếp")
+            .contains("2. Quản lý phê duyệt trong 3 ngày")
+            .contains("3. Phòng nhân sự ghi nhận")
+            .contains("Hết.");
+
+        String doubleSpacedMixedPunctuationList = """
+            Các bước thực hiện:
+
+            1. Bước một.
+
+            2. Bước hai.
+
+            3. Bước ba
+
+            Hết.
+            """;
+
+        List<ExtractedSegment> doubleSegments = plainTextExtractor.extractFromText(
+            doubleSpacedMixedPunctuationList,
+            "double_list.txt"
+        );
+        assertThat(doubleSegments).hasSize(1);
+        assertThat(doubleSegments.getFirst().sectionHeading()).isNull();
+        assertThat(doubleSegments.getFirst().content())
+            .contains("1. Bước một.")
+            .contains("2. Bước hai.")
+            .contains("3. Bước ba");
+
+        String doubleSpacedNoPeriodList = """
+            1. Nộp đơn cho quản lý trực tiếp
+
+            2. Quản lý phê duyệt trong 3 ngày
+
+            3. Phòng nhân sự ghi nhận
+            """;
+
+        List<ExtractedSegment> unpunctuatedList = plainTextExtractor.extractFromText(
+            doubleSpacedNoPeriodList,
+            "double_list_no_dot.txt"
+        );
+        assertThat(unpunctuatedList).hasSize(1);
+        assertThat(unpunctuatedList.getFirst().sectionHeading()).isNull();
+        assertThat(unpunctuatedList.getFirst().content())
+            .contains("1. Nộp đơn cho quản lý trực tiếp")
+            .contains("2. Quản lý phê duyệt trong 3 ngày")
+            .contains("3. Phòng nhân sự ghi nhận");
+
+        String genuineNumberedHeadings = """
+            1. Phạm vi áp dụng
+            Quy chế áp dụng toàn công ty.
+
+            2. Hiệu lực thi hành
+            Có hiệu lực ngay.
+            """;
+
+        List<ExtractedSegment> headingSegments = plainTextExtractor.extractFromText(
+            genuineNumberedHeadings,
+            "headings.txt"
+        );
+        assertThat(headingSegments).hasSize(2);
+        assertThat(headingSegments.get(0).sectionHeading()).isEqualTo("1. Phạm vi áp dụng");
+        assertThat(headingSegments.get(0).content()).isEqualTo("Quy chế áp dụng toàn công ty.");
+        assertThat(headingSegments.get(1).sectionHeading()).isEqualTo("2. Hiệu lực thi hành");
+        assertThat(headingSegments.get(1).content()).isEqualTo("Có hiệu lực ngay.");
+
+        String romanList = """
+            I. Bước một
+            II. Bước hai
+            III. Bước ba
+            """;
+        List<ExtractedSegment> romanListSegments = plainTextExtractor.extractFromText(romanList, "roman_list.txt");
+        assertThat(romanListSegments).hasSize(1);
+        assertThat(romanListSegments.getFirst().sectionHeading()).isNull();
+        assertThat(romanListSegments.getFirst().content())
+            .contains("I. Bước một")
+            .contains("II. Bước hai")
+            .contains("III. Bước ba");
+
+        String genuineRomanHeadings = """
+            I. Quy định chung
+            Nội dung phần một.
+
+            II. Tổ chức thực hiện
+            Nội dung phần hai.
+            """;
+        List<ExtractedSegment> romanHeadingSegments = plainTextExtractor.extractFromText(
+            genuineRomanHeadings,
+            "roman_headings.txt"
+        );
+        assertThat(romanHeadingSegments).hasSize(2);
+        assertThat(romanHeadingSegments.get(0).sectionHeading()).isEqualTo("I. Quy định chung");
+        assertThat(romanHeadingSegments.get(0).content()).isEqualTo("Nội dung phần một.");
+        assertThat(romanHeadingSegments.get(1).sectionHeading()).isEqualTo("II. Tổ chức thực hiện");
+        assertThat(romanHeadingSegments.get(1).content()).isEqualTo("Nội dung phần hai.");
+    }
+
+    @Test
+    void consecutiveBodylessHeadingsArePreservedAcrossMarkdownAndPlainText() {
+        String mdConsecutive = """
+            # Chương 1
+            ## Mục 1.1
+            ## Mục 1.2
+            Nội dung 1.2
+            """;
+        List<ExtractedSegment> mdSegments = markdownExtractor.extractFromText(mdConsecutive, "empty_sec.md");
+        assertThat(mdSegments).hasSize(2);
+        assertThat(mdSegments.get(0).sectionHeading()).isEqualTo("Chương 1");
+        assertThat(mdSegments.get(0).content()).isEqualTo("Mục 1.1");
+        assertThat(mdSegments.get(1).sectionHeading()).isEqualTo("Chương 1 > Mục 1.2");
+        assertThat(mdSegments.get(1).content()).isEqualTo("Nội dung 1.2");
+
+        String txtConsecutive = """
+            CHƯƠNG I: TỔNG QUAN
+            Điều 1. Phạm vi
+            Điều 2. Đối tượng
+            Nội dung đối tượng.
+            """;
+        List<ExtractedSegment> txtSegments = plainTextExtractor.extractFromText(txtConsecutive, "empty_sec.txt");
+        assertThat(txtSegments).hasSize(2);
+        assertThat(txtSegments.get(0).sectionHeading()).isEqualTo("CHƯƠNG I: TỔNG QUAN");
+        assertThat(txtSegments.get(0).content()).isEqualTo("Điều 1. Phạm vi");
+        assertThat(txtSegments.get(1).sectionHeading()).isEqualTo("CHƯƠNG I: TỔNG QUAN > Điều 2. Đối tượng");
+        assertThat(txtSegments.get(1).content()).isEqualTo("Nội dung đối tượng.");
+    }
+
+    @Test
+    void utf16LeAndBeWithBomDecodeCleanlyWhileUtf32LeAndRawNullBytesStillFail() {
+        String txtSample = "CHƯƠNG I: BẢO MẬT\n\nNội dung tiếng Việt đầy đủ dấu ăâđêôơư.";
+        byte[] utf16LePayload = concat(
+            new byte[]{(byte) 0xFF, (byte) 0xFE},
+            txtSample.getBytes(StandardCharsets.UTF_16LE)
+        );
+        List<ExtractedSegment> leSegments = plainTextExtractor.extract(
+            new ByteArrayInputStream(utf16LePayload),
+            "utf16le.txt"
+        );
+        assertThat(leSegments).hasSize(1);
+        assertThat(leSegments.getFirst().sectionHeading()).isEqualTo("CHƯƠNG I: BẢO MẬT");
+        assertThat(leSegments.getFirst().content()).contains("Nội dung tiếng Việt đầy đủ dấu ăâđêôơư.");
+
+        String mdSample = "# Tiêu đề UTF-16BE\n\nNội dung Markdown chuẩn tiếng Việt.";
+        byte[] utf16BePayload = concat(
+            new byte[]{(byte) 0xFE, (byte) 0xFF},
+            mdSample.getBytes(StandardCharsets.UTF_16BE)
+        );
+        List<ExtractedSegment> beSegments = markdownExtractor.extract(
+            new ByteArrayInputStream(utf16BePayload),
+            "utf16be.md"
+        );
+        assertThat(beSegments).hasSize(1);
+        assertThat(beSegments.getFirst().sectionHeading()).isEqualTo("Tiêu đề UTF-16BE");
+        assertThat(beSegments.getFirst().content()).isEqualTo("Nội dung Markdown chuẩn tiếng Việt.");
+
+        byte[] utf32LeBomPayload = new byte[]{(byte) 0xFF, (byte) 0xFE, 0x00, 0x00, 'A', 0x00, 0x00, 0x00};
+        assertThatThrownBy(() -> plainTextExtractor.extract(
+            new ByteArrayInputStream(utf32LeBomPayload),
+            "utf32.txt"
+        ))
+            .isInstanceOf(DocumentExtractionException.class)
+            .extracting(ex -> ((DocumentExtractionException) ex).errorCode())
+            .isEqualTo(DocumentExtractionErrorCode.CORRUPT_DOCUMENT);
+    }
+
+    private static byte[] concat(byte[] prefix, byte[] body) {
+        byte[] out = new byte[prefix.length + body.length];
+        System.arraycopy(prefix, 0, out, 0, prefix.length);
+        System.arraycopy(body, 0, out, prefix.length, body.length);
+        return out;
+    }
 }

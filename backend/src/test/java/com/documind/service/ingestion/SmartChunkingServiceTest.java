@@ -9,6 +9,7 @@ import org.springframework.ai.document.Document;
 import java.time.Duration;
 import java.util.List;
 import java.util.UUID;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -259,6 +260,62 @@ class SmartChunkingServiceTest {
             assertThat(chunk.getText()).doesNotContain("\uFFFD");
             assertThat(chunk.getMetadata().get(ChunkMetadataKeys.SECTION_HEADING)).isEqualTo(heading);
         });
+    }
+
+    @Test
+    void prefixBoundaryCheckAndOnePassBudgetAvoidsFalseSkipAndStepDownLoop() {
+        DocumentIngestionContext ctx = new DocumentIngestionContext(
+            UUID.randomUUID(),
+            UUID.randomUUID(),
+            "departments/hr/doc/v1/dieu_khoan.txt",
+            "Điều khoản.txt",
+            "txt",
+            AccessLevel.PUBLIC,
+            1
+        );
+
+        List<Document> prefixSimilarityChunks = chunkingService.chunk(
+            ctx,
+            List.of(new ExtractedSegment("Điều 10 quy định trách nhiệm bảo mật hệ thống.", null, "Điều 1"))
+        );
+        assertThat(prefixSimilarityChunks).hasSize(1);
+        assertThat(prefixSimilarityChunks.getFirst().getText())
+            .isEqualTo("Điều 1\n\nĐiều 10 quy định trách nhiệm bảo mật hệ thống.");
+
+        List<Document> lineBoundaryChunks = chunkingService.chunk(
+            ctx,
+            List.of(new ExtractedSegment("Điều 1\nNội dung điều một.", null, "Điều 1"))
+        );
+        assertThat(lineBoundaryChunks).hasSize(1);
+        assertThat(lineBoundaryChunks.getFirst().getText()).isEqualTo("Điều 1\nNội dung điều một.");
+
+        AtomicInteger splitCallCount = new AtomicInteger(0);
+        OverlappingTokenTextSplitter countingSplitter = new OverlappingTokenTextSplitter(800, 150, 10_000) {
+            @Override
+            public List<String> splitTextWithBudget(String text, int effectiveChunkSize, int effectiveOverlap) {
+                splitCallCount.incrementAndGet();
+                return super.splitTextWithBudget(text, effectiveChunkSize, effectiveOverlap);
+            }
+        };
+        SmartChunkingService countingService = new SmartChunkingService(properties, countingSplitter);
+
+        StringBuilder longSection = new StringBuilder();
+        for (int i = 1; i <= 75; i++) {
+            longSection.append("Điều khoản chi tiết số ").append(i)
+                .append(": Mọi truy cập vào kho tri thức doanh nghiệp đều phải đi qua lớp lọc phân quyền theo phòng ban và được ghi log kiểm toán đầy đủ.\n\n");
+        }
+        String threeThousandTokenBody = longSection.toString().trim();
+        assertThat(splitter.countTokens(threeThousandTokenBody)).isGreaterThan(2_500);
+
+        List<Document> longChunks = countingService.chunk(
+            ctx,
+            List.of(new ExtractedSegment(threeThousandTokenBody, null, "Chương 2 > Điều 4: Kiểm soát truy cập"))
+        );
+        assertThat(longChunks).hasSizeGreaterThanOrEqualTo(4);
+        assertThat(splitCallCount.get()).isLessThanOrEqualTo(2);
+        assertThat(longChunks).allSatisfy(chunk ->
+            assertThat(splitter.countTokens(chunk.getText())).isLessThanOrEqualTo(800)
+        );
     }
 
     private static String findSuffixPrefixOverlap(String previous, String next) {

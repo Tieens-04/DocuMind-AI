@@ -7,6 +7,8 @@ import java.io.FilterInputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
+import java.io.PushbackInputStream;
+import java.nio.charset.Charset;
 import java.nio.charset.CodingErrorAction;
 import java.nio.charset.StandardCharsets;
 import java.text.Normalizer;
@@ -19,6 +21,7 @@ import java.util.regex.Pattern;
 final class IngestionTextNormalizer {
 
     private static final int READ_BUFFER_CHARS = 8_192;
+    private static final int BOM_PROBE_BYTES = 4;
     private static final Pattern TRAILING_LINE_WHITESPACE = Pattern.compile("[ \\t\\x0B\\f]+(?=\n|$)");
     private static final Pattern EXCESS_NEWLINES = Pattern.compile("\n{3,}");
 
@@ -31,35 +34,73 @@ final class IngestionTextNormalizer {
 
         try (
             InputStream boundedBytes = new ByteLimitedInputStream(inputStream, maxBytes, displayName);
-            InputStreamReader reader = new InputStreamReader(
-                boundedBytes,
-                StandardCharsets.UTF_8.newDecoder()
+            PushbackInputStream pushback = new PushbackInputStream(boundedBytes, BOM_PROBE_BYTES)
+        ) {
+            Charset charset = detectBomAndConsume(pushback);
+            try (InputStreamReader reader = new InputStreamReader(
+                pushback,
+                charset.newDecoder()
                     .onMalformedInput(CodingErrorAction.REPLACE)
                     .onUnmappableCharacter(CodingErrorAction.REPLACE)
-            )
-        ) {
-            StringBuilder out = new StringBuilder();
-            char[] buffer = new char[READ_BUFFER_CHARS];
-            int read;
-            while ((read = reader.read(buffer)) != -1) {
-                if (out.length() + read > maxChars) {
-                    throw new DocumentExtractionException(
-                        DocumentExtractionErrorCode.EXTRACTION_LIMIT_EXCEEDED,
-                        "Extracted character count exceeded limit of " + maxChars + " for " + displayName
-                    );
+            )) {
+                StringBuilder out = new StringBuilder();
+                char[] buffer = new char[READ_BUFFER_CHARS];
+                int read;
+                while ((read = reader.read(buffer)) != -1) {
+                    if (out.length() + read > maxChars) {
+                        throw new DocumentExtractionException(
+                            DocumentExtractionErrorCode.EXTRACTION_LIMIT_EXCEEDED,
+                            "Extracted character count exceeded limit of " + maxChars + " for " + displayName
+                        );
+                    }
+                    out.append(buffer, 0, read);
                 }
-                out.append(buffer, 0, read);
+                return normalizeRawText(out.toString(), maxChars, displayName);
             }
-            return normalizeRawText(out.toString(), maxChars, displayName);
         } catch (DocumentExtractionException ex) {
             throw ex;
         } catch (IOException ex) {
             throw new DocumentExtractionException(
                 DocumentExtractionErrorCode.CORRUPT_DOCUMENT,
-                "Failed to read UTF-8 text from document: " + displayName,
+                "Failed to read text from document: " + displayName,
                 ex
             );
         }
+    }
+
+    private static Charset detectBomAndConsume(PushbackInputStream pushback) throws IOException {
+        byte[] bom = new byte[BOM_PROBE_BYTES];
+        int n = 0;
+        while (n < bom.length) {
+            int r = pushback.read(bom, n, bom.length - n);
+            if (r == -1) {
+                break;
+            }
+            n += r;
+        }
+        if (n >= 3 && bom[0] == (byte) 0xEF && bom[1] == (byte) 0xBB && bom[2] == (byte) 0xBF) {
+            if (n > 3) {
+                pushback.unread(bom, 3, n - 3);
+            }
+            return StandardCharsets.UTF_8;
+        }
+        if (n >= 2 && bom[0] == (byte) 0xFE && bom[1] == (byte) 0xFF) {
+            if (n > 2) {
+                pushback.unread(bom, 2, n - 2);
+            }
+            return StandardCharsets.UTF_16BE;
+        }
+        if (n >= 2 && bom[0] == (byte) 0xFF && bom[1] == (byte) 0xFE
+            && !(n == 4 && bom[2] == 0x00 && bom[3] == 0x00)) {
+            if (n > 2) {
+                pushback.unread(bom, 2, n - 2);
+            }
+            return StandardCharsets.UTF_16LE;
+        }
+        if (n > 0) {
+            pushback.unread(bom, 0, n);
+        }
+        return StandardCharsets.UTF_8;
     }
 
     static String normalizeRawText(String raw, int maxChars, String originalName) {

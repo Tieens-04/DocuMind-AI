@@ -39,7 +39,12 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.UUID;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.Stream;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipOutputStream;
@@ -428,6 +433,250 @@ class CompositeDocumentExtractorTest {
         assertTempDirIsClean();
     }
 
+    @Test
+    void docxPreservesUnstyledNumberedListsNestedTablesAndRejectsSpoofedOrCorruptContainers() throws Exception {
+        byte[] unstyledListDocx = createUnstyledDocxParagraphs(List.of(
+            "Quy trình nghỉ phép:",
+            "",
+            "1. Nộp đơn",
+            "2. Quản lý duyệt",
+            "3. Nhân sự lưu hồ sơ",
+            "",
+            "Hết."
+        ));
+        List<ExtractedSegment> listSegments = compositeExtractor.extractFromStream(
+            "nghi_phep_unstyled.docx",
+            "docx",
+            new ByteArrayInputStream(unstyledListDocx)
+        );
+        assertThat(listSegments).hasSize(1);
+        assertThat(listSegments.getFirst().sectionHeading()).isNull();
+        assertThat(listSegments.getFirst().content())
+            .contains("Quy trình nghỉ phép:")
+            .contains("1. Nộp đơn")
+            .contains("2. Quản lý duyệt")
+            .contains("3. Nhân sự lưu hồ sơ")
+            .contains("Hết.");
+
+        byte[] nestedTableDocx = createDocxWithNestedTable();
+        List<ExtractedSegment> nestedSegments = compositeExtractor.extractFromStream(
+            "nested_table.docx",
+            "docx",
+            new ByteArrayInputStream(nestedTableDocx)
+        );
+        assertThat(nestedSegments).hasSize(1);
+        assertThat(nestedSegments.getFirst().sectionHeading()).isEqualTo("Chương 1: Bảng lồng nhau");
+        assertThat(nestedSegments.getFirst().content())
+            .contains("Ngoài trước")
+            .contains("Trong A - Trong B")
+            .contains("Cột ngoài 2")
+            .contains("|");
+
+        byte[] rtfPayload = "{\\rtf1\\ansi Nội dung RTF giả mạo}".getBytes(StandardCharsets.UTF_8);
+        byte[] htmlPayload = "<html><body><p>Hello HTML</p></body></html>".getBytes(StandardCharsets.UTF_8);
+        byte[] pdfPayload = createVietnameseMultiPagePdf(List.of("PDF disguised as docx."));
+        byte[] ole2LegacyDoc = createUnencryptedOle2Doc();
+        byte[] xlsxZip = createXlsxZipWithoutWordMainPart();
+
+        for (byte[] nonDocx : List.of(rtfPayload, htmlPayload, pdfPayload, ole2LegacyDoc, xlsxZip)) {
+            assertThatThrownBy(() -> compositeExtractor.extractFromStream(
+                "spoofed.docx",
+                "docx",
+                new ByteArrayInputStream(nonDocx)
+            ))
+                .isInstanceOf(DocumentExtractionException.class)
+                .extracting(ex -> ((DocumentExtractionException) ex).errorCode())
+                .isEqualTo(DocumentExtractionErrorCode.UNSUPPORTED_FORMAT);
+        }
+
+        byte[] randomCorrupt = new byte[]{0x01, 0x02, 0x03, 0x04, 0x05};
+        assertThatThrownBy(() -> compositeExtractor.extractFromStream(
+            "corrupt.docx",
+            "docx",
+            new ByteArrayInputStream(randomCorrupt)
+        ))
+            .isInstanceOf(DocumentExtractionException.class)
+            .extracting(ex -> ((DocumentExtractionException) ex).errorCode())
+            .isEqualTo(DocumentExtractionErrorCode.CORRUPT_DOCUMENT);
+
+        assertTempDirIsClean();
+    }
+
+    @Test
+    void minioStreamClosesBeforeBinaryParsingIgnoresPostReadCloseGlitchesAndTranslatesTempFileErrors()
+        throws Exception {
+        byte[] pdfBytes = createVietnameseMultiPagePdf(List.of("Nội dung kiểm tra đóng stream trước khi parse."));
+        UUID docId = UUID.randomUUID();
+        UUID deptId = UUID.randomUUID();
+        String key = "departments/" + deptId + "/" + docId + "/v1/stream-lifecycle.pdf";
+
+        AtomicBoolean streamClosed = new AtomicBoolean(false);
+        AtomicBoolean closedBeforeParse = new AtomicBoolean(false);
+        InputStream closeTrackingPayload = new FilterInputStream(new ByteArrayInputStream(pdfBytes)) {
+            @Override
+            public void close() throws IOException {
+                streamClosed.set(true);
+                super.close();
+                throw new IOException("Simulated post-read close glitch");
+            }
+        };
+        ResponseInputStream<GetObjectResponse> s3PdfStream = new ResponseInputStream<>(
+            GetObjectResponse.builder().build(),
+            AbortableInputStream.create(closeTrackingPayload)
+        );
+        when(minioStorageService.openStream(key)).thenReturn(s3PdfStream);
+
+        PdfDocumentExtractor checkingPdfExtractor = new PdfDocumentExtractor(properties) {
+            @Override
+            public List<ExtractedSegment> extract(Path pdfTempFile, String originalName) {
+                closedBeforeParse.set(streamClosed.get());
+                return super.extract(pdfTempFile, originalName);
+            }
+        };
+        CompositeDocumentExtractor checkingComposite = new CompositeDocumentExtractor(
+            minioStorageService,
+            properties,
+            checkingPdfExtractor,
+            docxExtractor,
+            new MarkdownSectionExtractor(properties),
+            new PlainTextSectionExtractor(properties),
+            tempDir
+        );
+
+        List<ExtractedSegment> pdfSegments = checkingComposite.extract(new DocumentIngestionContext(
+            docId, deptId, key, "stream-lifecycle.pdf", "pdf", AccessLevel.PUBLIC, 1
+        ));
+        assertThat(closedBeforeParse).isTrue();
+        assertThat(streamClosed).isTrue();
+        assertThat(pdfSegments).hasSize(1);
+        assertThat(pdfSegments.getFirst().content()).contains("Nội dung kiểm tra đóng stream trước khi parse.");
+
+        String mdKey = "departments/" + deptId + "/" + docId + "/v1/glitch.md";
+        byte[] mdPayload = "# Tiêu đề\n\nNội dung markdown vẫn trả về bình thường.".getBytes(StandardCharsets.UTF_8);
+        InputStream closeFailingMdStream = new FilterInputStream(new ByteArrayInputStream(mdPayload)) {
+            @Override
+            public void close() throws IOException {
+                super.close();
+                throw new IOException("Simulated MD close glitch");
+            }
+        };
+        when(minioStorageService.openStream(mdKey)).thenReturn(new ResponseInputStream<>(
+            GetObjectResponse.builder().build(),
+            AbortableInputStream.create(closeFailingMdStream)
+        ));
+        List<ExtractedSegment> mdSegments = checkingComposite.extract(new DocumentIngestionContext(
+            docId, deptId, mdKey, "glitch.md", "md", AccessLevel.PUBLIC, 1
+        ));
+        assertThat(mdSegments).hasSize(1);
+        assertThat(mdSegments.getFirst().content()).contains("Nội dung markdown vẫn trả về bình thường.");
+
+        Path notADirectory = Files.writeString(tempDir.resolve("not-a-dir.tmp"), "blocker");
+        CompositeDocumentExtractor brokenTempComposite = new CompositeDocumentExtractor(
+            minioStorageService,
+            properties,
+            pdfExtractor,
+            docxExtractor,
+            new MarkdownSectionExtractor(properties),
+            new PlainTextSectionExtractor(properties),
+            notADirectory
+        );
+        assertThatThrownBy(() -> brokenTempComposite.extractFromStream(
+            "fail-temp.pdf",
+            "pdf",
+            new ByteArrayInputStream(pdfBytes)
+        ))
+            .isInstanceOf(DocumentStorageException.class);
+        Files.deleteIfExists(notADirectory);
+
+        assertTempDirIsClean();
+    }
+
+    @Test
+    void pdfTier2IsolatesPerPageFailuresEnforcesPerPageCharBudgetAndCapsConcurrency() throws Exception {
+        byte[] threePagePdf = createVietnameseMultiPagePdf(List.of(
+            "Trang một ngắn.",
+            "Trang hai ngắn.",
+            "Trang ba được khôi phục an toàn."
+        ));
+        Path threePageFile = Files.write(tempDir.resolve("tier2-per-page.pdf"), threePagePdf);
+
+        PdfDocumentExtractor partialStripperFailureExtractor = new PdfDocumentExtractor(
+            properties,
+            path -> Map.of(),
+            PdfDocumentExtractor.DEFAULT_MAX_CONCURRENT_EXTRACTIONS,
+            () -> (doc, pageNum) -> {
+                if (pageNum == 1) {
+                    throw new IOException("Simulated I/O failure on page 1");
+                }
+                if (pageNum == 2) {
+                    throw new IllegalArgumentException("Simulated malformed font stream on page 2");
+                }
+                return "Trang ba được khôi phục an toàn.";
+            }
+        );
+        List<ExtractedSegment> rescuedOnlyPage3 = partialStripperFailureExtractor.extract(
+            threePageFile,
+            "tier2-per-page.pdf"
+        );
+        assertThat(rescuedOnlyPage3).hasSize(1);
+        assertThat(rescuedOnlyPage3.getFirst().pageNumber()).isEqualTo(3);
+        assertThat(rescuedOnlyPage3.getFirst().content()).contains("Trang ba được khôi phục an toàn.");
+
+        IngestionProperties tinyCharBudget = new IngestionProperties(
+            new IngestionProperties.ExtractionProperties(52_428_800L, 25, 0.01d, 104_857_600L, 1_000L),
+            IngestionProperties.ChunkingProperties.defaults()
+        );
+        PdfDocumentExtractor tier1CapExtractor = new PdfDocumentExtractor(
+            tinyCharBudget,
+            path -> Map.of(
+                1, "Nội dung trang một đã vượt quá giới hạn hai mươi lăm ký tự.",
+                2, "Trang hai"
+            )
+        );
+        assertThatThrownBy(() -> tier1CapExtractor.extract(threePageFile, "tier1-cap.pdf"))
+            .isInstanceOf(DocumentExtractionException.class)
+            .extracting(ex -> ((DocumentExtractionException) ex).errorCode())
+            .isEqualTo(DocumentExtractionErrorCode.EXTRACTION_LIMIT_EXCEEDED);
+
+        AtomicInteger inFlight = new AtomicInteger(0);
+        AtomicInteger maxObserved = new AtomicInteger(0);
+        PdfDocumentExtractor concurrencyCapped = new PdfDocumentExtractor(
+            properties,
+            path -> {
+                int active = inFlight.incrementAndGet();
+                maxObserved.accumulateAndGet(active, Math::max);
+                try {
+                    Thread.sleep(60);
+                } catch (InterruptedException ex) {
+                    Thread.currentThread().interrupt();
+                } finally {
+                    inFlight.decrementAndGet();
+                }
+                return Map.of(1, "Trang 1", 2, "Trang 2", 3, "Trang 3");
+            },
+            2
+        );
+
+        try (var pool = Executors.newVirtualThreadPerTaskExecutor()) {
+            CountDownLatch ready = new CountDownLatch(1);
+            List<Future<List<ExtractedSegment>>> futures = new java.util.ArrayList<>();
+            for (int i = 0; i < 5; i++) {
+                futures.add(pool.submit(() -> {
+                    ready.await(5, TimeUnit.SECONDS);
+                    return concurrencyCapped.extract(threePageFile, "concurrent.pdf");
+                }));
+            }
+            ready.countDown();
+            for (Future<List<ExtractedSegment>> f : futures) {
+                assertThat(f.get(10, TimeUnit.SECONDS)).hasSize(3);
+            }
+        }
+        assertThat(maxObserved.get()).isLessThanOrEqualTo(2).isGreaterThanOrEqualTo(1);
+
+        Files.deleteIfExists(threePageFile);
+        assertTempDirIsClean();
+    }
+
     private void assertMinioRoundTrip(
         String name,
         String ext,
@@ -715,6 +964,93 @@ class CompositeDocumentExtractorTest {
             fs.writeFilesystem(encryptedOut);
             return encryptedOut.toByteArray();
         }
+    }
+
+    private static byte[] createUnstyledDocxParagraphs(List<String> paragraphs) throws IOException {
+        StringBuilder body = new StringBuilder();
+        for (String paragraph : paragraphs) {
+            body.append("<w:p><w:r><w:t>")
+                .append(paragraph.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
+                .append("</w:t></w:r></w:p>");
+        }
+        String documentXml = """
+            <?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+            <w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+              <w:body>
+                %s
+              </w:body>
+            </w:document>
+            """.formatted(body.toString());
+        return createDocxPackage(documentXml, false);
+    }
+
+    private static byte[] createDocxWithNestedTable() throws IOException {
+        String documentXml = """
+            <?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+            <w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+              <w:body>
+                <w:p>
+                  <w:pPr><w:pStyle w:val="Heading1"/></w:pPr>
+                  <w:r><w:t>Chương 1: Bảng lồng nhau</w:t></w:r>
+                </w:p>
+                <w:tbl>
+                  <w:tr>
+                    <w:tc>
+                      <w:p><w:r><w:t>Ngoài trước</w:t></w:r></w:p>
+                      <w:tbl>
+                        <w:tr>
+                          <w:tc><w:p><w:r><w:t>Trong A</w:t></w:r></w:p></w:tc>
+                          <w:tc><w:p><w:r><w:t>Trong B</w:t></w:r></w:p></w:tc>
+                        </w:tr>
+                      </w:tbl>
+                      <w:p><w:r><w:t>Ngoài sau</w:t></w:r></w:p>
+                    </w:tc>
+                    <w:tc>
+                      <w:p><w:r><w:t>Cột ngoài 2</w:t></w:r></w:p>
+                    </w:tc>
+                  </w:tr>
+                </w:tbl>
+              </w:body>
+            </w:document>
+            """;
+        return createDocxPackage(documentXml, true);
+    }
+
+    private static byte[] createUnencryptedOle2Doc() throws IOException {
+        try (POIFSFileSystem fs = new POIFSFileSystem();
+             ByteArrayOutputStream out = new ByteArrayOutputStream()) {
+            fs.createDocument(new ByteArrayInputStream("Legacy Word binary".getBytes(StandardCharsets.UTF_8)), "WordDocument");
+            fs.writeFilesystem(out);
+            return out.toByteArray();
+        }
+    }
+
+    private static byte[] createXlsxZipWithoutWordMainPart() throws IOException {
+        String contentTypes = """
+            <?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+            <Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+              <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+              <Default Extension="xml" ContentType="application/xml"/>
+              <Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>
+            </Types>
+            """;
+        String rootRels = """
+            <?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+            <Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+              <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>
+            </Relationships>
+            """;
+        String workbookXml = """
+            <?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+            <workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"/>
+            """;
+        ByteArrayOutputStream baos = new ByteArrayOutputStream();
+        try (ZipOutputStream zos = new ZipOutputStream(baos, StandardCharsets.UTF_8)) {
+            writeZipEntry(zos, "[Content_Types].xml", contentTypes);
+            writeZipEntry(zos, "_rels/.rels", rootRels);
+            writeZipEntry(zos, "xl/workbook.xml", workbookXml);
+        }
+        return baos.toByteArray();
     }
 
     private static void writeZipEntry(ZipOutputStream zos, String name, String xml) throws IOException {

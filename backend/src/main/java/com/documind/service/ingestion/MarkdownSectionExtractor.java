@@ -72,6 +72,7 @@ public class MarkdownSectionExtractor {
 
         String[] lines = normalized.split("\n", -1);
         String[] headings = new String[MAX_HEADING_LEVELS];
+        boolean[] dirtyHeadings = new boolean[MAX_HEADING_LEVELS];
         List<ExtractedSegment> segments = new ArrayList<>();
         StringBuilder bodyBuffer = new StringBuilder();
 
@@ -105,9 +106,9 @@ public class MarkdownSectionExtractor {
 
             Matcher atxMatcher = ATX_HEADING.matcher(line);
             if (atxMatcher.matches()) {
-                flushSegment(segments, bodyBuffer, headings);
+                flushSegment(segments, bodyBuffer, headings, dirtyHeadings);
                 int level = atxMatcher.group(1).length();
-                updateHeadings(headings, level - 1, atxMatcher.group(2));
+                updateHeadings(segments, headings, dirtyHeadings, level - 1, atxMatcher.group(2));
                 continue;
             }
 
@@ -115,8 +116,8 @@ public class MarkdownSectionExtractor {
                 String nextLine = lines[i + 1];
                 int setextLevel = resolveSetextLevel(nextLine);
                 if (setextLevel > 0) {
-                    flushSegment(segments, bodyBuffer, headings);
-                    updateHeadings(headings, setextLevel - 1, line);
+                    flushSegment(segments, bodyBuffer, headings, dirtyHeadings);
+                    updateHeadings(segments, headings, dirtyHeadings, setextLevel - 1, line);
                     i++;
                     continue;
                 }
@@ -125,7 +126,8 @@ public class MarkdownSectionExtractor {
             appendLine(bodyBuffer, line);
         }
 
-        flushSegment(segments, bodyBuffer, headings);
+        flushSegment(segments, bodyBuffer, headings, dirtyHeadings);
+        flushOrphanedHeadingIfNeeded(segments, headings, dirtyHeadings, 0);
         if (segments.isEmpty()) {
             throw new DocumentExtractionException(
                 DocumentExtractionErrorCode.EMPTY_DOCUMENT,
@@ -169,13 +171,21 @@ public class MarkdownSectionExtractor {
         return 0;
     }
 
-    private static void updateHeadings(String[] headings, int levelIndex, String rawHeading) {
+    private static void updateHeadings(
+        List<ExtractedSegment> segments,
+        String[] headings,
+        boolean[] dirtyHeadings,
+        int levelIndex,
+        String rawHeading
+    ) {
         String cleanHeading = IngestionTextNormalizer.normalizeText(rawHeading);
         if (cleanHeading.isEmpty()) {
             return;
         }
+        flushOrphanedHeadingIfNeeded(segments, headings, dirtyHeadings, levelIndex);
         headings[levelIndex] = cleanHeading;
         Arrays.fill(headings, levelIndex + 1, headings.length, null);
+        dirtyHeadings[levelIndex] = true;
     }
 
     private static void appendLine(StringBuilder bodyBuffer, String line) {
@@ -188,7 +198,12 @@ public class MarkdownSectionExtractor {
         bodyBuffer.append(line);
     }
 
-    private static void flushSegment(List<ExtractedSegment> segments, StringBuilder bodyBuffer, String[] headings) {
+    private static void flushSegment(
+        List<ExtractedSegment> segments,
+        StringBuilder bodyBuffer,
+        String[] headings,
+        boolean[] dirtyHeadings
+    ) {
         if (bodyBuffer.isEmpty()) {
             return;
         }
@@ -196,6 +211,26 @@ public class MarkdownSectionExtractor {
         bodyBuffer.setLength(0);
         if (!content.isEmpty()) {
             segments.add(new ExtractedSegment(content, null, IngestionTextNormalizer.formatBreadcrumb(headings)));
+            Arrays.fill(dirtyHeadings, false);
+        }
+    }
+
+    private static void flushOrphanedHeadingIfNeeded(
+        List<ExtractedSegment> segments,
+        String[] headings,
+        boolean[] dirtyHeadings,
+        int targetLevel
+    ) {
+        int deepestDirty = -1;
+        for (int k = targetLevel; k < dirtyHeadings.length; k++) {
+            if (dirtyHeadings[k] && headings[k] != null && !headings[k].isBlank()) {
+                deepestDirty = k;
+            }
+        }
+        if (deepestDirty >= 0) {
+            String parentBreadcrumb = IngestionTextNormalizer.formatBreadcrumb(Arrays.copyOf(headings, deepestDirty));
+            segments.add(new ExtractedSegment(headings[deepestDirty], null, parentBreadcrumb));
+            Arrays.fill(dirtyHeadings, false);
         }
     }
 }

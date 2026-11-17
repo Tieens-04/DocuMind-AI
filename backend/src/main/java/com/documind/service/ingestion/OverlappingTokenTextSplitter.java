@@ -4,27 +4,28 @@ import com.documind.exception.DocumentExtractionErrorCode;
 import com.documind.exception.DocumentExtractionException;
 import com.knuddels.jtokkit.Encodings;
 import com.knuddels.jtokkit.api.Encoding;
-import com.knuddels.jtokkit.api.EncodingRegistry;
 import com.knuddels.jtokkit.api.EncodingType;
 import com.knuddels.jtokkit.api.IntArrayList;
-import org.springframework.ai.transformer.splitter.TokenTextSplitter;
+import org.springframework.ai.transformer.splitter.TextSplitter;
 
 import java.util.ArrayList;
 import java.util.List;
 
 /**
- * {@link TokenTextSplitter} extension implementing sliding-window token overlap with UTF-8 multi-byte safety
- * and linguistic boundary snapping for Vietnamese and English enterprise documents.
+ * {@link TextSplitter} implementation providing sliding-window token overlap with UTF-8 multi-byte safety
+ * and linguistic boundary snapping for Vietnamese and English enterprise documents, sharing a single static
+ * {@code CL100K_BASE} {@link Encoding} instance to avoid duplicating BPE dictionaries across callers.
  */
-public class OverlappingTokenTextSplitter extends TokenTextSplitter {
+public class OverlappingTokenTextSplitter extends TextSplitter {
 
     private static final double BOUNDARY_FLOOR_RATIO = 0.60d;
     private static final int MAX_UTF8_BOUNDARY_ADJUST_TOKENS = 4;
     private static final List<String> SENTENCE_TERMINATORS = List.of(
         ". ", "? ", "! ", "… ", "; ", ".\n", "?\n", "!\n"
     );
+    private static final Encoding SHARED_CL100K_ENCODING =
+        Encodings.newLazyEncodingRegistry().getEncoding(EncodingType.CL100K_BASE);
 
-    private final Encoding encoding;
     private final int chunkSize;
     private final int chunkOverlap;
     private final int maxChunks;
@@ -38,7 +39,6 @@ public class OverlappingTokenTextSplitter extends TokenTextSplitter {
     }
 
     public OverlappingTokenTextSplitter(int chunkSize, int chunkOverlap, int maxChunks) {
-        super(chunkSize, 1, 1, maxChunks, true);
         if (chunkSize < 32) {
             throw new IllegalArgumentException("chunkSize must be >= 32");
         }
@@ -48,8 +48,6 @@ public class OverlappingTokenTextSplitter extends TokenTextSplitter {
         if (maxChunks < 1) {
             throw new IllegalArgumentException("maxChunks must be >= 1");
         }
-        EncodingRegistry registry = Encodings.newLazyEncodingRegistry();
-        this.encoding = registry.getEncoding(EncodingType.CL100K_BASE);
         this.chunkSize = chunkSize;
         this.chunkOverlap = chunkOverlap;
         this.maxChunks = maxChunks;
@@ -59,7 +57,7 @@ public class OverlappingTokenTextSplitter extends TokenTextSplitter {
         if (text == null || text.isEmpty()) {
             return 0;
         }
-        return encoding.countTokens(text);
+        return SHARED_CL100K_ENCODING.countTokens(text);
     }
 
     @Override
@@ -83,7 +81,7 @@ public class OverlappingTokenTextSplitter extends TokenTextSplitter {
             return List.of();
         }
 
-        IntArrayList allTokens = encoding.encode(normalized);
+        IntArrayList allTokens = SHARED_CL100K_ENCODING.encode(normalized);
         int total = allTokens.size();
         if (total <= effectiveChunkSize) {
             return List.of(normalized);
@@ -123,7 +121,7 @@ public class OverlappingTokenTextSplitter extends TokenTextSplitter {
             }
 
             chunkText = sanitizeReplacementEdges(chunkText);
-            while (encoding.countTokens(chunkText) > effectiveChunkSize && cutTokenEnd > start + 1) {
+            while (SHARED_CL100K_ENCODING.countTokens(chunkText) > effectiveChunkSize && cutTokenEnd > start + 1) {
                 cutTokenEnd--;
                 chunkText = sanitizeReplacementEdges(decodeSlice(allTokens, start, cutTokenEnd).trim());
             }
@@ -147,13 +145,28 @@ public class OverlappingTokenTextSplitter extends TokenTextSplitter {
             if (nextStart <= start) {
                 nextStart = Math.min(total, start + Math.max(1, cutTokenEnd - start));
             }
-            if (total - nextStart <= effectiveOverlap && cutTokenEnd >= total) {
-                break;
-            }
             start = nextStart;
         }
 
         return List.copyOf(chunks);
+    }
+
+    String trimToTokenLimit(String text, int maxTokens) {
+        if (text == null || text.isEmpty() || maxTokens <= 0) {
+            return "";
+        }
+        IntArrayList tokens = SHARED_CL100K_ENCODING.encode(text);
+        int total = tokens.size();
+        if (total <= maxTokens) {
+            return text;
+        }
+        int end = trimTrailingReplacementTokens(tokens, 0, maxTokens, total);
+        String candidate = sanitizeReplacementEdges(decodeSlice(tokens, 0, end).trim());
+        while (SHARED_CL100K_ENCODING.countTokens(candidate) > maxTokens && end > 1) {
+            end--;
+            candidate = sanitizeReplacementEdges(decodeSlice(tokens, 0, end).trim());
+        }
+        return candidate;
     }
 
     private int advancePastReplacementPrefix(IntArrayList allTokens, int start, int total) {
@@ -283,7 +296,7 @@ public class OverlappingTokenTextSplitter extends TokenTextSplitter {
         for (int i = startInclusive; i < endExclusive; i++) {
             slice.add(allTokens.get(i));
         }
-        return encoding.decode(slice);
+        return SHARED_CL100K_ENCODING.decode(slice);
     }
 
     private static String sanitizeReplacementEdges(String value) {

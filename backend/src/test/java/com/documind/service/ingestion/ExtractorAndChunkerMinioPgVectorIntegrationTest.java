@@ -122,7 +122,11 @@ class ExtractorAndChunkerMinioPgVectorIntegrationTest {
             CHƯƠNG I: BẢO MẬT DỮ LIỆU
 
             Điều 1. Quy tắc truy cập nội bộ
-            Nhân viên chỉ được phép tra cứu tài liệu thuộc phòng ban mình hoặc tài liệu công khai.
+            Nhân viên chỉ được phép tra cứu tài liệu thuộc phòng ban mình hoặc tài liệu công khai theo quy trình:
+
+            1. Đăng nhập tài khoản doanh nghiệp hợp lệ
+            2. Chọn đúng phòng ban hoặc tài liệu công khai được phân quyền
+            3. Không sao chép dữ liệu mật ra thiết bị cá nhân
             """.getBytes(StandardCharsets.UTF_8);
 
         DocumentEntity pdfDoc = uploadAndPersistDocument(
@@ -175,6 +179,15 @@ class ExtractorAndChunkerMinioPgVectorIntegrationTest {
         assertNonPdfTriggerNormalizedRows(docxDoc, "Quy trình Phê duyệt Nghỉ phép.docx", docxChunks.size());
         assertNonPdfTriggerNormalizedRows(mdDoc, "Kiến trúc Hệ thống RAG.md", mdChunks.size());
         assertNonPdfTriggerNormalizedRows(txtDoc, "Nội quy Bảo mật CNTT.txt", txtChunks.size());
+        String persistedTxtContent = jdbcTemplate.queryForObject(
+            "SELECT content FROM document_chunks WHERE document_id = ? AND chunk_index = 0",
+            String.class,
+            txtDoc.getId()
+        );
+        assertThat(persistedTxtContent)
+            .contains("1. Đăng nhập tài khoản doanh nghiệp hợp lệ")
+            .contains("2. Chọn đúng phòng ban hoặc tài liệu công khai được phân quyền")
+            .contains("3. Không sao chép dữ liệu mật ra thiết bị cá nhân");
 
         // Prove DA-9 @Retryable idempotency: re-adding identical deterministic chunks succeeds without unique violations
         vectorStore.add(pdfChunks);

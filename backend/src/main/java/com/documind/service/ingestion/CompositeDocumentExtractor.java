@@ -90,20 +90,38 @@ public class CompositeDocumentExtractor {
         if (context == null) {
             throw new IllegalArgumentException("context must not be null");
         }
-        String normalizedExtension = normalizeAndValidateExtension(context.fileExtension(), context.originalName());
-        try (ResponseInputStream<GetObjectResponse> s3Stream = minioStorageService.openStream(context.storageKey());
-             InputStream storageStream = new StorageTranslatingInputStream(s3Stream, context.storageKey())) {
-            return extractFromStream(context.originalName(), normalizedExtension, storageStream);
-        } catch (IOException ex) {
-            throw new DocumentStorageException(
-                "Failed to close MinIO stream after extracting " + context.storageKey(),
-                ex
+        String displayName = resolveDisplayName(context.originalName());
+        String normalizedExtension = normalizeAndValidateExtension(context.fileExtension(), displayName);
+        return switch (normalizedExtension) {
+            case "pdf" -> extractBinaryFromMinio(
+                context.storageKey(),
+                ".pdf",
+                displayName,
+                tempFile -> pdfDocumentExtractor.extract(tempFile, displayName)
             );
-        }
+            case "docx" -> extractBinaryFromMinio(
+                context.storageKey(),
+                ".docx",
+                displayName,
+                tempFile -> docxDocumentExtractor.extract(tempFile, displayName)
+            );
+            case "md" -> extractTextFromMinio(
+                context.storageKey(),
+                stream -> markdownSectionExtractor.extract(stream, displayName)
+            );
+            case "txt" -> extractTextFromMinio(
+                context.storageKey(),
+                stream -> plainTextSectionExtractor.extract(stream, displayName)
+            );
+            default -> throw new DocumentExtractionException(
+                DocumentExtractionErrorCode.UNSUPPORTED_FORMAT,
+                "Unsupported document format '." + normalizedExtension + "' for " + displayName
+            );
+        };
     }
 
     public List<ExtractedSegment> extractFromStream(String originalName, String fileExtension, InputStream rawStream) {
-        String displayName = (originalName == null || originalName.isBlank()) ? "document" : originalName;
+        String displayName = resolveDisplayName(originalName);
         String normalizedExtension = normalizeAndValidateExtension(fileExtension, displayName);
         if (rawStream == null) {
             throw new DocumentExtractionException(
@@ -126,6 +144,58 @@ public class CompositeDocumentExtractor {
         };
     }
 
+    private List<ExtractedSegment> extractBinaryFromMinio(
+        String storageKey,
+        String suffix,
+        String displayName,
+        Function<Path, List<ExtractedSegment>> extractor
+    ) {
+        Path tempFile = createTempFile(suffix, displayName);
+        try {
+            long totalBytes = spoolMinioObjectToTempFile(storageKey, tempFile, displayName);
+            if (totalBytes == 0L) {
+                throw new DocumentExtractionException(
+                    DocumentExtractionErrorCode.EMPTY_DOCUMENT,
+                    "Uploaded binary document stream is empty (0 bytes): " + displayName
+                );
+            }
+            return extractor.apply(tempFile);
+        } finally {
+            deleteTempFileQuietly(tempFile);
+        }
+    }
+
+    private long spoolMinioObjectToTempFile(String storageKey, Path tempFile, String displayName) {
+        ResponseInputStream<GetObjectResponse> s3Stream = minioStorageService.openStream(storageKey);
+        Throwable primaryFailure = null;
+        try {
+            InputStream storageStream = new StorageTranslatingInputStream(s3Stream, storageKey);
+            return spoolBoundedToTempFile(storageStream, tempFile, displayName);
+        } catch (RuntimeException | Error ex) {
+            primaryFailure = ex;
+            throw ex;
+        } finally {
+            closeS3StreamAfterRead(s3Stream, storageKey, primaryFailure);
+        }
+    }
+
+    private List<ExtractedSegment> extractTextFromMinio(
+        String storageKey,
+        Function<InputStream, List<ExtractedSegment>> extractor
+    ) {
+        ResponseInputStream<GetObjectResponse> s3Stream = minioStorageService.openStream(storageKey);
+        Throwable primaryFailure = null;
+        try {
+            InputStream storageStream = new StorageTranslatingInputStream(s3Stream, storageKey);
+            return extractor.apply(storageStream);
+        } catch (RuntimeException | Error ex) {
+            primaryFailure = ex;
+            throw ex;
+        } finally {
+            closeS3StreamAfterRead(s3Stream, storageKey, primaryFailure);
+        }
+    }
+
     private List<ExtractedSegment> spoolAndExtract(
         InputStream rawStream,
         String suffix,
@@ -134,7 +204,12 @@ public class CompositeDocumentExtractor {
     ) {
         Path tempFile = createTempFile(suffix, displayName);
         try {
-            long totalBytes = spoolBoundedToTempFile(rawStream, tempFile, displayName);
+            long totalBytes;
+            try {
+                totalBytes = spoolBoundedToTempFile(rawStream, tempFile, displayName);
+            } finally {
+                closeInputStreamQuietly(rawStream, displayName);
+            }
             if (totalBytes == 0L) {
                 throw new DocumentExtractionException(
                     DocumentExtractionErrorCode.EMPTY_DOCUMENT,
@@ -166,7 +241,7 @@ public class CompositeDocumentExtractor {
             }
             out.flush();
             return totalBytes;
-        } catch (DocumentExtractionException ex) {
+        } catch (DocumentExtractionException | DocumentStorageException ex) {
             throw ex;
         } catch (IOException ex) {
             throw new DocumentExtractionException(
@@ -183,7 +258,37 @@ public class CompositeDocumentExtractor {
                 ? Files.createTempFile(tempDirectory, "documind-extract-", suffix)
                 : Files.createTempFile("documind-extract-", suffix);
         } catch (IOException ex) {
-            throw new IllegalStateException("Failed to create temp extraction file for " + displayName, ex);
+            throw new DocumentStorageException("Failed to create temporary extraction file for " + displayName, ex);
+        }
+    }
+
+    private static void closeS3StreamAfterRead(
+        ResponseInputStream<GetObjectResponse> s3Stream,
+        String storageKey,
+        Throwable primaryFailure
+    ) {
+        if (s3Stream == null) {
+            return;
+        }
+        try {
+            s3Stream.close();
+        } catch (IOException ex) {
+            if (primaryFailure != null) {
+                primaryFailure.addSuppressed(ex);
+            } else {
+                log.warn("Failed to close MinIO stream cleanly after reading '{}': {}", storageKey, ex.getMessage());
+            }
+        }
+    }
+
+    private static void closeInputStreamQuietly(InputStream rawStream, String displayName) {
+        if (rawStream == null) {
+            return;
+        }
+        try {
+            rawStream.close();
+        } catch (IOException ex) {
+            log.warn("Failed to close input stream cleanly after spooling '{}': {}", displayName, ex.getMessage());
         }
     }
 
@@ -196,6 +301,10 @@ public class CompositeDocumentExtractor {
         } catch (IOException ex) {
             log.warn("Failed to delete temporary extraction file '{}': {}", tempFile, ex.getMessage());
         }
+    }
+
+    private static String resolveDisplayName(String originalName) {
+        return (originalName == null || originalName.isBlank()) ? "document" : originalName;
     }
 
     private static String normalizeAndValidateExtension(String fileExtension, String displayName) {
@@ -253,14 +362,7 @@ public class CompositeDocumentExtractor {
 
         @Override
         public void close() {
-            try {
-                super.close();
-            } catch (IOException ex) {
-                throw new DocumentStorageException(
-                    "Failed to close MinIO stream for key: " + storageKey,
-                    ex
-                );
-            }
+            // Closed explicitly by closeS3StreamAfterRead once extraction/spooling completes.
         }
     }
 }

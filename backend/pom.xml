@@ -175,7 +175,7 @@
                 <groupId>org.apache.maven.plugins</groupId>
                 <artifactId>maven-surefire-plugin</artifactId>
                 <configuration>
-                    <argLine>-Dfile.encoding=UTF-8</argLine>
+                    <argLine>-Dfile.encoding=UTF-8 -Xmx768m</argLine>
                     <useManifestOnlyJar>false</useManifestOnlyJar>
                     <systemPropertyVariables>
                         <smoke>${smoke}</smoke>
