@@ -2,6 +2,7 @@ package com.documind.service.ingestion;
 
 import com.documind.exception.DocumentExtractionErrorCode;
 import com.documind.exception.DocumentExtractionException;
+import com.documind.exception.DocumentStorageException;
 import com.documind.infrastructure.storage.MinioStorageService;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -10,6 +11,7 @@ import org.springframework.stereotype.Service;
 import software.amazon.awssdk.core.ResponseInputStream;
 import software.amazon.awssdk.services.s3.model.GetObjectResponse;
 
+import java.io.FilterInputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
@@ -89,12 +91,12 @@ public class CompositeDocumentExtractor {
             throw new IllegalArgumentException("context must not be null");
         }
         String normalizedExtension = normalizeAndValidateExtension(context.fileExtension(), context.originalName());
-        try (ResponseInputStream<GetObjectResponse> s3Stream = minioStorageService.openStream(context.storageKey())) {
-            return extractFromStream(context.originalName(), normalizedExtension, s3Stream);
+        try (ResponseInputStream<GetObjectResponse> s3Stream = minioStorageService.openStream(context.storageKey());
+             InputStream storageStream = new StorageTranslatingInputStream(s3Stream, context.storageKey())) {
+            return extractFromStream(context.originalName(), normalizedExtension, storageStream);
         } catch (IOException ex) {
-            throw new DocumentExtractionException(
-                DocumentExtractionErrorCode.CORRUPT_DOCUMENT,
-                "Failed to close MinIO stream after extracting " + context.originalName(),
+            throw new DocumentStorageException(
+                "Failed to close MinIO stream after extracting " + context.storageKey(),
                 ex
             );
         }
@@ -214,5 +216,51 @@ public class CompositeDocumentExtractor {
             );
         }
         return normalized;
+    }
+
+    private static final class StorageTranslatingInputStream extends FilterInputStream {
+
+        private final String storageKey;
+
+        private StorageTranslatingInputStream(InputStream delegate, String storageKey) {
+            super(delegate);
+            this.storageKey = storageKey;
+        }
+
+        @Override
+        public int read() {
+            try {
+                return super.read();
+            } catch (IOException ex) {
+                throw new DocumentStorageException(
+                    "Failed while streaming document from MinIO for key: " + storageKey,
+                    ex
+                );
+            }
+        }
+
+        @Override
+        public int read(byte[] b, int off, int len) {
+            try {
+                return super.read(b, off, len);
+            } catch (IOException ex) {
+                throw new DocumentStorageException(
+                    "Failed while streaming document from MinIO for key: " + storageKey,
+                    ex
+                );
+            }
+        }
+
+        @Override
+        public void close() {
+            try {
+                super.close();
+            } catch (IOException ex) {
+                throw new DocumentStorageException(
+                    "Failed to close MinIO stream for key: " + storageKey,
+                    ex
+                );
+            }
+        }
     }
 }

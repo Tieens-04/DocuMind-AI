@@ -230,6 +230,37 @@ class SmartChunkingServiceTest {
             .isEqualTo(DocumentExtractionErrorCode.EXTRACTION_LIMIT_EXCEEDED);
     }
 
+    @Test
+    void enforcesMinimumChunkSize32CeilingEvenWithSectionHeadingPrefix() {
+        IngestionProperties minChunkProps = new IngestionProperties(
+            IngestionProperties.ExtractionProperties.defaults(),
+            new IngestionProperties.ChunkingProperties(32, 8, 500)
+        );
+        SmartChunkingService minChunkService = new SmartChunkingService(minChunkProps);
+        OverlappingTokenTextSplitter checkSplitter = new OverlappingTokenTextSplitter(32, 8, 500);
+
+        DocumentIngestionContext ctx = new DocumentIngestionContext(
+            UUID.randomUUID(),
+            UUID.randomUUID(),
+            "departments/it/doc/v1/small_chunks.md",
+            "Small chunks.md",
+            "md",
+            AccessLevel.DEPARTMENT,
+            1
+        );
+        String heading = "Chương 1: Quy định bảo mật thông tin và kiểm soát truy cập hệ thống";
+        String body = ("Nhân viên kỹ thuật phải tuân thủ nguyên tắc phân quyền tối thiểu khi truy cập dữ liệu nội bộ và báo cáo sự cố ngay lập tức.\n\n").repeat(6).trim();
+
+        List<Document> chunks = minChunkService.chunk(ctx, List.of(new ExtractedSegment(body, null, heading)));
+
+        assertThat(chunks).hasSizeGreaterThanOrEqualTo(3);
+        assertThat(chunks).allSatisfy(chunk -> {
+            assertThat(checkSplitter.countTokens(chunk.getText())).isLessThanOrEqualTo(32);
+            assertThat(chunk.getText()).doesNotContain("\uFFFD");
+            assertThat(chunk.getMetadata().get(ChunkMetadataKeys.SECTION_HEADING)).isEqualTo(heading);
+        });
+    }
+
     private static String findSuffixPrefixOverlap(String previous, String next) {
         int maxLen = Math.min(previous.length(), next.length());
         for (int len = maxLen; len >= 1; len--) {

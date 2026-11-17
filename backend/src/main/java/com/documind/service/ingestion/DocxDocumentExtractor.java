@@ -2,6 +2,9 @@ package com.documind.service.ingestion;
 
 import com.documind.exception.DocumentExtractionErrorCode;
 import com.documind.exception.DocumentExtractionException;
+import org.apache.poi.openxml4j.exceptions.OpenXML4JException;
+import org.apache.poi.openxml4j.opc.OPCPackage;
+import org.apache.poi.openxml4j.util.ZipFileZipEntrySource;
 import org.apache.poi.openxml4j.util.ZipSecureFile;
 import org.apache.tika.exception.EncryptedDocumentException;
 import org.apache.tika.exception.TikaException;
@@ -11,16 +14,16 @@ import org.apache.tika.metadata.TikaCoreProperties;
 import org.apache.tika.parser.AutoDetectParser;
 import org.apache.tika.parser.ParseContext;
 import org.apache.tika.parser.microsoft.OfficeParserConfig;
-import org.springframework.ai.document.Document;
-import org.springframework.ai.reader.tika.TikaDocumentReader;
+import org.apache.tika.parser.microsoft.ooxml.OPCPackageWrapper;
+import org.apache.tika.parser.microsoft.ooxml.OOXMLParser;
 import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.core.io.FileSystemResource;
 import org.springframework.stereotype.Component;
 import org.xml.sax.Attributes;
 import org.xml.sax.SAXException;
 import org.xml.sax.helpers.DefaultHandler;
 
 import java.io.IOException;
+import java.io.InputStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
@@ -38,6 +41,10 @@ public class DocxDocumentExtractor {
 
     private static final int MAX_HEADING_LEVELS = 6;
     private static final long MIN_TIKA_MAX_TEXT_SIZE_BYTES = 10_485_760L;
+    private static final Object ZIP_CONFIG_LOCK = new Object();
+    // Eagerly initialize Tika's OOXML/AutoDetect parsers once so OOXMLParser.<clinit>()'s ZipSecureFile reset runs before we apply our strict limits.
+    private static final OOXMLParser OOXML_PARSER = new OOXMLParser();
+    private static final AutoDetectParser FALLBACK_PARSER = new AutoDetectParser();
 
     private final IngestionProperties properties;
     private final PlainTextSectionExtractor plainTextSectionExtractor;
@@ -52,13 +59,14 @@ public class DocxDocumentExtractor {
             plainTextSectionExtractor,
             "plainTextSectionExtractor must not be null"
         );
+        ensureZipSecureLimits(this.properties.extraction());
     }
 
     public List<ExtractedSegment> extract(Path docxTempFile, String originalName) {
         Objects.requireNonNull(docxTempFile, "docxTempFile must not be null");
         String displayName = (originalName == null || originalName.isBlank()) ? "document.docx" : originalName;
         verifyNonEmptyFile(docxTempFile, displayName);
-        configureZipSecureLimits();
+        ensureZipSecureLimits(this.properties.extraction());
 
         HeadingAwareXhtmlContentHandler handler = new HeadingAwareXhtmlContentHandler(
             properties.extraction().maxExtractedChars(),
@@ -71,15 +79,23 @@ public class DocxDocumentExtractor {
         ParseContext parseContext = new ParseContext();
         parseContext.set(OfficeParserConfig.class, officeConfig);
 
-        AutoDetectParser parser = new AutoDetectParser();
-        try (TikaInputStream tikaStream = TikaInputStream.get(docxTempFile, metadata)) {
-            parser.parse(tikaStream, handler, metadata, parseContext);
-        } catch (Throwable ex) {
+        try {
+            if (startsWithPkZipSignature(docxTempFile)) {
+                try (ZipSecureFile secureZip = new ZipSecureFile(docxTempFile.toFile());
+                     ZipFileZipEntrySource entrySource = new ZipFileZipEntrySource(secureZip);
+                     OPCPackage opcPackage = OPCPackage.open(entrySource);
+                     OPCPackageWrapper wrapper = new OPCPackageWrapper(opcPackage);
+                     TikaInputStream tikaStream = TikaInputStream.get(docxTempFile, metadata)) {
+                    tikaStream.setOpenContainer(wrapper);
+                    OOXML_PARSER.parse(tikaStream, handler, metadata, parseContext);
+                }
+            } else {
+                try (TikaInputStream tikaStream = TikaInputStream.get(docxTempFile, metadata)) {
+                    FALLBACK_PARSER.parse(tikaStream, handler, metadata, parseContext);
+                }
+            }
+        } catch (Exception ex) {
             throw translateExtractionFailure(ex, displayName);
-        }
-
-        if (!handler.sawHeadingTag()) {
-            return extractUnstyledViaTikaReader(docxTempFile, displayName);
         }
 
         List<ExtractedSegment> segments = handler.segments();
@@ -89,54 +105,38 @@ public class DocxDocumentExtractor {
                 "DOCX document contains no extractable body text: " + displayName
             );
         }
+        if (!handler.sawHeadingTag()) {
+            StringBuilder combined = new StringBuilder();
+            for (ExtractedSegment segment : segments) {
+                if (!combined.isEmpty()) {
+                    combined.append("\n\n");
+                }
+                combined.append(segment.content());
+            }
+            return plainTextSectionExtractor.extractFromText(combined.toString(), displayName);
+        }
         return segments;
     }
 
-    private List<ExtractedSegment> extractUnstyledViaTikaReader(Path docxTempFile, String displayName) {
-        try {
-            TikaDocumentReader reader = new TikaDocumentReader(new FileSystemResource(docxTempFile));
-            List<Document> docs = reader.get();
-            if (docs.isEmpty()) {
-                throw new DocumentExtractionException(
-                    DocumentExtractionErrorCode.EMPTY_DOCUMENT,
-                    "DOCX document contains no extractable text: " + displayName
-                );
+    private static void ensureZipSecureLimits(IngestionProperties.ExtractionProperties cfg) {
+        if (limitsMatch(cfg)) {
+            return;
+        }
+        synchronized (ZIP_CONFIG_LOCK) {
+            if (!limitsMatch(cfg)) {
+                ZipSecureFile.setMinInflateRatio(cfg.zipMinInflateRatio());
+                ZipSecureFile.setMaxEntrySize(cfg.zipMaxEntrySizeBytes());
+                ZipSecureFile.setMaxFileCount(cfg.zipMaxFileCount());
+                ZipSecureFile.setMaxTextSize(MIN_TIKA_MAX_TEXT_SIZE_BYTES);
             }
-            StringBuilder combined = new StringBuilder();
-            int maxChars = properties.extraction().maxExtractedChars();
-            for (Document doc : docs) {
-                String text = doc.getText();
-                if (text != null && !text.isBlank()) {
-                    if (combined.length() + text.length() + 2 > maxChars) {
-                        throw new DocumentExtractionException(
-                            DocumentExtractionErrorCode.EXTRACTION_LIMIT_EXCEEDED,
-                            "Extracted DOCX character count exceeded limit of " + maxChars + " for " + displayName
-                        );
-                    }
-                    if (!combined.isEmpty()) {
-                        combined.append("\n\n");
-                    }
-                    combined.append(text);
-                }
-            }
-            if (combined.isEmpty()) {
-                throw new DocumentExtractionException(
-                    DocumentExtractionErrorCode.EMPTY_DOCUMENT,
-                    "DOCX document contains no extractable text: " + displayName
-                );
-            }
-            return plainTextSectionExtractor.extractFromText(combined.toString(), displayName);
-        } catch (Throwable ex) {
-            throw translateExtractionFailure(ex, displayName);
         }
     }
 
-    private void configureZipSecureLimits() {
-        IngestionProperties.ExtractionProperties cfg = properties.extraction();
-        ZipSecureFile.setMinInflateRatio(cfg.zipMinInflateRatio());
-        ZipSecureFile.setMaxEntrySize(cfg.zipMaxEntrySizeBytes());
-        ZipSecureFile.setMaxFileCount(cfg.zipMaxFileCount());
-        ZipSecureFile.setMaxTextSize(MIN_TIKA_MAX_TEXT_SIZE_BYTES);
+    private static boolean limitsMatch(IngestionProperties.ExtractionProperties cfg) {
+        return Double.compare(ZipSecureFile.getMinInflateRatio(), cfg.zipMinInflateRatio()) == 0
+            && ZipSecureFile.getMaxEntrySize() == cfg.zipMaxEntrySizeBytes()
+            && ZipSecureFile.getMaxFileCount() == cfg.zipMaxFileCount()
+            && ZipSecureFile.getMaxTextSize() == MIN_TIKA_MAX_TEXT_SIZE_BYTES;
     }
 
     private static void verifyNonEmptyFile(Path docxTempFile, String displayName) {
@@ -175,7 +175,10 @@ public class DocxDocumentExtractor {
                 ex
             );
         }
-        if (ex instanceof IOException || ex instanceof TikaException || ex instanceof SAXException) {
+        if (ex instanceof IOException
+            || ex instanceof TikaException
+            || ex instanceof SAXException
+            || ex instanceof OpenXML4JException) {
             return new DocumentExtractionException(
                 DocumentExtractionErrorCode.CORRUPT_DOCUMENT,
                 "Failed to parse DOCX document: " + displayName,
@@ -187,6 +190,25 @@ public class DocxDocumentExtractor {
             "Unexpected error extracting DOCX document: " + displayName,
             ex
         );
+    }
+
+    private static boolean startsWithPkZipSignature(Path file) throws IOException {
+        byte[] magic = new byte[4];
+        try (InputStream in = Files.newInputStream(file)) {
+            int offset = 0;
+            while (offset < magic.length) {
+                int read = in.read(magic, offset, magic.length - offset);
+                if (read == -1) {
+                    return false;
+                }
+                offset += read;
+            }
+        }
+        return magic[0] == 0x50
+            && magic[1] == 0x4B
+            && ((magic[2] == 0x03 && magic[3] == 0x04)
+                || (magic[2] == 0x05 && magic[3] == 0x06)
+                || (magic[2] == 0x07 && magic[3] == 0x08));
     }
 
     private static boolean hasCause(Throwable error, Class<? extends Throwable> target) {
@@ -267,13 +289,15 @@ public class DocxDocumentExtractor {
             if (!inBody) {
                 return;
             }
-            int headingLevel = parseHeadingLevel(tag);
-            if (headingLevel > 0) {
-                sawHeadingTag = true;
-                flushSegment();
-                activeHeadingLevel = headingLevel;
-                headingBuffer.setLength(0);
-                return;
+            if (!inTableCell) {
+                int headingLevel = parseHeadingLevel(tag);
+                if (headingLevel > 0) {
+                    sawHeadingTag = true;
+                    flushSegment();
+                    activeHeadingLevel = headingLevel;
+                    headingBuffer.setLength(0);
+                    return;
+                }
             }
             if ("tr".equals(tag)) {
                 currentRowCells.clear();
@@ -306,17 +330,19 @@ public class DocxDocumentExtractor {
             if (!inBody) {
                 return;
             }
-            int headingLevel = parseHeadingLevel(tag);
-            if (headingLevel > 0 && activeHeadingLevel == headingLevel) {
-                String cleanHeading = IngestionTextNormalizer.normalizeText(headingBuffer.toString())
-                    .replace('\n', ' ');
-                headingBuffer.setLength(0);
-                activeHeadingLevel = 0;
-                if (!cleanHeading.isEmpty()) {
-                    headings[headingLevel - 1] = cleanHeading;
-                    Arrays.fill(headings, headingLevel, headings.length, null);
+            if (!inTableCell) {
+                int headingLevel = parseHeadingLevel(tag);
+                if (headingLevel > 0 && activeHeadingLevel == headingLevel) {
+                    String cleanHeading = IngestionTextNormalizer.normalizeText(headingBuffer.toString())
+                        .replace('\n', ' ');
+                    headingBuffer.setLength(0);
+                    activeHeadingLevel = 0;
+                    if (!cleanHeading.isEmpty()) {
+                        headings[headingLevel - 1] = cleanHeading;
+                        Arrays.fill(headings, headingLevel, headings.length, null);
+                    }
+                    return;
                 }
-                return;
             }
             if ("td".equals(tag) || "th".equals(tag)) {
                 inTableCell = false;
@@ -336,10 +362,16 @@ public class DocxDocumentExtractor {
                 currentRowCells.clear();
                 return;
             }
-            if (!inTableCell && ("p".equals(tag) || "li".equals(tag))) {
-                appendNewline(bodyBuffer);
-                if ("p".equals(tag)) {
+            if ("p".equals(tag) || "li".equals(tag) || (inTableCell && parseHeadingLevel(tag) > 0)) {
+                if (inTableCell) {
+                    if (!cellBuffer.isEmpty() && !Character.isWhitespace(cellBuffer.charAt(cellBuffer.length() - 1))) {
+                        cellBuffer.append(' ');
+                    }
+                } else {
                     appendNewline(bodyBuffer);
+                    if ("p".equals(tag)) {
+                        appendNewline(bodyBuffer);
+                    }
                 }
             }
         }

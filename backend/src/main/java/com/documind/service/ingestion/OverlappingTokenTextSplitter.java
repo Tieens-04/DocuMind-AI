@@ -68,8 +68,8 @@ public class OverlappingTokenTextSplitter extends TokenTextSplitter {
     }
 
     public List<String> splitTextWithBudget(String text, int effectiveChunkSize, int effectiveOverlap) {
-        if (effectiveChunkSize < 16) {
-            throw new IllegalArgumentException("effectiveChunkSize must be >= 16");
+        if (effectiveChunkSize < 8) {
+            throw new IllegalArgumentException("effectiveChunkSize must be >= 8");
         }
         if (effectiveOverlap < 0 || effectiveOverlap >= effectiveChunkSize) {
             throw new IllegalArgumentException("effectiveOverlap must be >= 0 and < effectiveChunkSize");
@@ -186,15 +186,23 @@ public class OverlappingTokenTextSplitter extends TokenTextSplitter {
     }
 
     private int resolveTokenEndForCharLength(IntArrayList allTokens, int start, int maxEnd, int targetChars) {
-        int probeEnd = maxEnd;
-        while (probeEnd > start + 1) {
-            int len = decodeSlice(allTokens, start, probeEnd).length();
+        int low = start + 1;
+        int high = maxEnd;
+        int best = low;
+        while (low <= high) {
+            int mid = low + ((high - low) >>> 1);
+            int len = decodeSlice(allTokens, start, mid).length();
             if (len <= targetChars) {
-                return probeEnd;
+                best = mid;
+                low = mid + 1;
+            } else {
+                high = mid - 1;
             }
-            probeEnd--;
         }
-        return start + 1;
+        while (best < maxEnd && decodeSlice(allTokens, start, best + 1).length() <= targetChars) {
+            best++;
+        }
+        return best;
     }
 
     private int snapOverlapStartToCleanBoundary(IntArrayList allTokens, int rawNextStart, int cutTokenEnd, int total) {

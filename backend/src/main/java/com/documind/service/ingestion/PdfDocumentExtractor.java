@@ -8,6 +8,7 @@ import org.apache.pdfbox.pdmodel.encryption.InvalidPasswordException;
 import org.apache.pdfbox.text.PDFTextStripper;
 import org.apache.tika.exception.EncryptedDocumentException;
 import org.apache.tika.exception.TikaException;
+import org.apache.tika.exception.WriteLimitReachedException;
 import org.apache.tika.metadata.Metadata;
 import org.apache.tika.parser.ParseContext;
 import org.apache.tika.parser.pdf.PDFParser;
@@ -186,6 +187,7 @@ public class PdfDocumentExtractor {
         pdfConfig.setSortByPosition(true);
         pdfConfig.setExtractAcroFormContent(true);
         pdfConfig.setExtractAnnotationText(true);
+        pdfConfig.setCatchIntermediateIOExceptions(false);
 
         ParseContext context = new ParseContext();
         context.set(PDFParserConfig.class, pdfConfig);
@@ -205,13 +207,15 @@ public class PdfDocumentExtractor {
                 "PDF document is password-protected or encrypted: " + displayName,
                 ex
             );
-        } catch (LimitExceededSaxException ex) {
-            throw new DocumentExtractionException(
-                DocumentExtractionErrorCode.EXTRACTION_LIMIT_EXCEEDED,
-                ex.getMessage(),
-                ex
-            );
         } catch (IOException | TikaException | SAXException ex) {
+            if (hasCause(ex, LimitExceededSaxException.class) || hasCause(ex, WriteLimitReachedException.class)) {
+                throw new DocumentExtractionException(
+                    DocumentExtractionErrorCode.EXTRACTION_LIMIT_EXCEEDED,
+                    "Extracted PDF character count exceeded limit of " + properties.extraction().maxExtractedChars()
+                        + " for " + displayName,
+                    ex
+                );
+            }
             throw new DocumentExtractionException(
                 DocumentExtractionErrorCode.CORRUPT_DOCUMENT,
                 "Failed to extract PDF pages via Tika fallback: " + displayName,

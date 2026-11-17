@@ -13,6 +13,11 @@ import org.apache.pdfbox.pdmodel.encryption.StandardProtectionPolicy;
 import org.apache.pdfbox.pdmodel.font.PDType0Font;
 import org.apache.pdfbox.pdmodel.graphics.image.LosslessFactory;
 import org.apache.pdfbox.pdmodel.graphics.image.PDImageXObject;
+import org.apache.poi.openxml4j.opc.OPCPackage;
+import org.apache.poi.poifs.crypt.EncryptionInfo;
+import org.apache.poi.poifs.crypt.EncryptionMode;
+import org.apache.poi.poifs.crypt.Encryptor;
+import org.apache.poi.poifs.filesystem.POIFSFileSystem;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -26,6 +31,7 @@ import java.io.ByteArrayOutputStream;
 import java.io.FilterInputStream;
 import java.io.IOException;
 import java.io.InputStream;
+import java.io.OutputStream;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -195,11 +201,21 @@ class CompositeDocumentExtractorTest {
         assertThat(unstyledSegments.getFirst().sectionHeading()).isEqualTo("CHƯƠNG I: VẬN HÀNH");
         assertThat(unstyledSegments.getFirst().content()).contains("Nội dung quy trình vận hành hệ thống nội bộ.");
 
-        byte[] zipBombDocx = createHighlyCompressibleDocx(300_000);
+        byte[] zipBombDocx = createHighlyCompressibleDocx(300_000, false);
         assertThatThrownBy(() -> compositeExtractor.extractFromStream(
             "bomb.docx",
             "docx",
             new ByteArrayInputStream(zipBombDocx)
+        ))
+            .isInstanceOf(DocumentExtractionException.class)
+            .extracting(ex -> ((DocumentExtractionException) ex).errorCode())
+            .isEqualTo(DocumentExtractionErrorCode.EXTRACTION_LIMIT_EXCEEDED);
+
+        byte[] styledZipBombDocx = createHighlyCompressibleDocx(300_000, true);
+        assertThatThrownBy(() -> compositeExtractor.extractFromStream(
+            "styled-bomb.docx",
+            "docx",
+            new ByteArrayInputStream(styledZipBombDocx)
         ))
             .isInstanceOf(DocumentExtractionException.class)
             .extracting(ex -> ((DocumentExtractionException) ex).errorCode())
@@ -261,6 +277,152 @@ class CompositeDocumentExtractorTest {
         when(minioStorageService.openStream(missingMinioCtx.storageKey()))
             .thenThrow(new DocumentStorageException("MinIO down", new RuntimeException("connection refused")));
         assertThatThrownBy(() -> compositeExtractor.extract(missingMinioCtx))
+            .isInstanceOf(DocumentStorageException.class);
+
+        assertTempDirIsClean();
+    }
+
+    @Test
+    void tier3PdfMaxExtractedCharsEncryptedDocxTableCellsErrorsSpoolCapAndMidStreamS3FailuresAreHandledCorrectly()
+        throws Exception {
+        IngestionProperties tightCharCap = new IngestionProperties(
+            new IngestionProperties.ExtractionProperties(52_428_800L, 100, 0.01d, 104_857_600L, 1_000L),
+            IngestionProperties.ChunkingProperties.defaults()
+        );
+
+        // 1. Tier-3 PDF maxExtractedChars breach (Critical #1: must throw EXTRACTION_LIMIT_EXCEEDED, not CORRUPT_DOCUMENT)
+        byte[] largeMultiPagePdf = createVietnameseMultiPagePdf(List.of(
+            "Trang một chứa nội dung dài hơn năm mươi ký tự để kiểm tra giới hạn ký tự ở tầng ba.",
+            "Trang hai chứa thêm bảy mươi ký tự vượt quá ngưỡng một trăm ký tự ngay trong quá trình đọc SAX.",
+            "Trang ba bổ sung thêm văn bản nữa."
+        ));
+        Path tier3PdfFile = Files.write(tempDir.resolve("tier3-cap.pdf"), largeMultiPagePdf);
+        PdfDocumentExtractor tier3CappedPdf = new PdfDocumentExtractor(tightCharCap);
+        assertThatThrownBy(() -> tier3CappedPdf.extractViaTikaPageSax(tier3PdfFile, "tier3-cap.pdf"))
+            .isInstanceOf(DocumentExtractionException.class)
+            .extracting(ex -> ((DocumentExtractionException) ex).errorCode())
+            .isEqualTo(DocumentExtractionErrorCode.EXTRACTION_LIMIT_EXCEEDED);
+        Files.deleteIfExists(tier3PdfFile);
+
+        // 2. Unstyled DOCX maxExtractedChars breach & table preservation (Important #3)
+        byte[] unstyledLargeDocx = createUnstyledDocxWithTable(
+            "CHƯƠNG I: BẢNG BIỂU",
+            "Đoạn nội dung khá dài nhằm kiểm tra giới hạn ký tự trên văn bản Word không dùng Heading style.",
+            "Tiêu chí",
+            "Giá trị"
+        );
+        List<ExtractedSegment> unstyledWithTable = compositeExtractor.extractFromStream(
+            "unstyled-table.docx",
+            "docx",
+            new ByteArrayInputStream(unstyledLargeDocx)
+        );
+        assertThat(unstyledWithTable).hasSize(1);
+        assertThat(unstyledWithTable.getFirst().sectionHeading()).isEqualTo("CHƯƠNG I: BẢNG BIỂU");
+        assertThat(unstyledWithTable.getFirst().content()).contains("| Tiêu chí | Giá trị |");
+
+        DocxDocumentExtractor tightCharDocx = new DocxDocumentExtractor(
+            tightCharCap,
+            new PlainTextSectionExtractor(tightCharCap)
+        );
+        Path unstyledCapPath = Files.write(tempDir.resolve("unstyled-cap.docx"), unstyledLargeDocx);
+        assertThatThrownBy(() -> tightCharDocx.extract(unstyledCapPath, "unstyled-cap.docx"))
+            .isInstanceOf(DocumentExtractionException.class)
+            .extracting(ex -> ((DocumentExtractionException) ex).errorCode())
+            .isEqualTo(DocumentExtractionErrorCode.EXTRACTION_LIMIT_EXCEEDED);
+        Files.deleteIfExists(unstyledCapPath);
+
+        // 3. Multi-paragraph & heading-styled table cell in DOCX (Important #8)
+        byte[] complexTableDocx = createDocxWithComplexTableCells();
+        List<ExtractedSegment> complexSegments = compositeExtractor.extractFromStream(
+            "complex-table.docx",
+            "docx",
+            new ByteArrayInputStream(complexTableDocx)
+        );
+        assertThat(complexSegments).hasSize(1);
+        assertThat(complexSegments.getFirst().sectionHeading()).isEqualTo("Chương 2: Biểu mẫu");
+        assertThat(complexSegments.getFirst().content())
+            .contains("| Hàng 1 Hàng 2 | Tiêu đề trong ô |");
+
+        // 4. Encrypted DOCX (Important #9)
+        byte[] encryptedDocx = createEncryptedDocx("Mật khẩu nội bộ!");
+        assertThatThrownBy(() -> compositeExtractor.extractFromStream(
+            "secret.docx",
+            "docx",
+            new ByteArrayInputStream(encryptedDocx)
+        ))
+            .isInstanceOf(DocumentExtractionException.class)
+            .extracting(ex -> ((DocumentExtractionException) ex).errorCode())
+            .isEqualTo(DocumentExtractionErrorCode.ENCRYPTED_DOCUMENT);
+
+        // 5. Fatal JVM Error must not be swallowed as CORRUPT_DOCUMENT (Critical #2)
+        PlainTextSectionExtractor jvmErrorExtractor = new PlainTextSectionExtractor(properties) {
+            @Override
+            public List<ExtractedSegment> extractFromText(String rawText, String originalName) {
+                throw new AssertionError("Simulated JVM error");
+            }
+        };
+        DocxDocumentExtractor nonSwallowingDocx = new DocxDocumentExtractor(properties, jvmErrorExtractor);
+        byte[] simpleUnstyled = createUnstyledDocx("CHƯƠNG I: TEST", "Nội dung ngắn.");
+        Path errPath = Files.write(tempDir.resolve("jvm-error.docx"), simpleUnstyled);
+        assertThatThrownBy(() -> nonSwallowingDocx.extract(errPath, "jvm-error.docx"))
+            .isInstanceOf(AssertionError.class)
+            .hasMessageContaining("Simulated JVM error");
+        Files.deleteIfExists(errPath);
+
+        // 6. maxSpoolBytes breach on binary stream (Important #9)
+        IngestionProperties tinySpoolCap = new IngestionProperties(
+            new IngestionProperties.ExtractionProperties(128L, 5_000_000, 0.01d, 104_857_600L, 1_000L),
+            IngestionProperties.ChunkingProperties.defaults()
+        );
+        CompositeDocumentExtractor tinySpoolComposite = new CompositeDocumentExtractor(
+            minioStorageService,
+            tinySpoolCap,
+            new PdfDocumentExtractor(tinySpoolCap),
+            new DocxDocumentExtractor(tinySpoolCap, new PlainTextSectionExtractor(tinySpoolCap)),
+            new MarkdownSectionExtractor(tinySpoolCap),
+            new PlainTextSectionExtractor(tinySpoolCap),
+            tempDir
+        );
+        byte[] samplePdf = createVietnameseMultiPagePdf(List.of("PDF nhỏ nhưng lớn hơn 128 bytes."));
+        assertThatThrownBy(() -> tinySpoolComposite.extractFromStream(
+            "oversized.pdf",
+            "pdf",
+            new ByteArrayInputStream(samplePdf)
+        ))
+            .isInstanceOf(DocumentExtractionException.class)
+            .extracting(ex -> ((DocumentExtractionException) ex).errorCode())
+            .isEqualTo(DocumentExtractionErrorCode.EXTRACTION_LIMIT_EXCEEDED);
+
+        // 7. Mid-stream S3 IOException surfaces DocumentStorageException, not CORRUPT_DOCUMENT (Important #7)
+        UUID midFailDocId = UUID.randomUUID();
+        UUID midFailDeptId = UUID.randomUUID();
+        String midFailKey = "departments/" + midFailDeptId + "/" + midFailDocId + "/v1/drop.pdf";
+        InputStream failingStream = new InputStream() {
+            private int count;
+
+            @Override
+            public int read() throws IOException {
+                if (count++ < 32) {
+                    return '%';
+                }
+                throw new IOException("Simulated MinIO TCP connection reset mid-stream");
+            }
+        };
+        ResponseInputStream<GetObjectResponse> failingS3Stream = new ResponseInputStream<>(
+            GetObjectResponse.builder().build(),
+            AbortableInputStream.create(failingStream)
+        );
+        when(minioStorageService.openStream(midFailKey)).thenReturn(failingS3Stream);
+        DocumentIngestionContext midFailCtx = new DocumentIngestionContext(
+            midFailDocId,
+            midFailDeptId,
+            midFailKey,
+            "drop.pdf",
+            "pdf",
+            AccessLevel.PUBLIC,
+            1
+        );
+        assertThatThrownBy(() -> compositeExtractor.extract(midFailCtx))
             .isInstanceOf(DocumentStorageException.class);
 
         assertTempDirIsClean();
@@ -420,13 +582,18 @@ class CompositeDocumentExtractorTest {
         return createDocxPackage(documentXml, false);
     }
 
-    private static byte[] createHighlyCompressibleDocx(int repeatedChars) throws IOException {
+    private static byte[] createHighlyCompressibleDocx(int repeatedChars, boolean includeStyles) throws IOException {
+        String headingBlock = includeStyles
+            ? "<w:p><w:pPr><w:pStyle w:val=\"Heading1\"/></w:pPr><w:r><w:t>Chương 1</w:t></w:r></w:p>"
+            : "";
         String documentXml = "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>"
             + "<w:document xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\">"
-            + "<w:body><w:p><w:r><w:t>"
+            + "<w:body>"
+            + headingBlock
+            + "<w:p><w:r><w:t>"
             + "A".repeat(repeatedChars)
             + "</w:t></w:r></w:p></w:body></w:document>";
-        return createDocxPackage(documentXml, false);
+        return createDocxPackage(documentXml, includeStyles);
     }
 
     private static byte[] createDocxPackage(String documentXml, boolean includeStyles) throws IOException {
@@ -483,6 +650,71 @@ class CompositeDocumentExtractorTest {
             writeZipEntry(zos, "word/document.xml", documentXml);
         }
         return baos.toByteArray();
+    }
+
+    private static byte[] createDocxWithComplexTableCells() throws IOException {
+        String documentXml = """
+            <?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+            <w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+              <w:body>
+                <w:p>
+                  <w:pPr><w:pStyle w:val="Heading1"/></w:pPr>
+                  <w:r><w:t>Chương 2: Biểu mẫu</w:t></w:r>
+                </w:p>
+                <w:tbl>
+                  <w:tr>
+                    <w:tc>
+                      <w:p><w:r><w:t>Hàng 1</w:t></w:r></w:p>
+                      <w:p><w:r><w:t>Hàng 2</w:t></w:r></w:p>
+                    </w:tc>
+                    <w:tc>
+                      <w:p>
+                        <w:pPr><w:pStyle w:val="Heading2"/></w:pPr>
+                        <w:r><w:t>Tiêu đề trong ô</w:t></w:r>
+                      </w:p>
+                    </w:tc>
+                  </w:tr>
+                </w:tbl>
+              </w:body>
+            </w:document>
+            """;
+        return createDocxPackage(documentXml, true);
+    }
+
+    private static byte[] createUnstyledDocxWithTable(String headingLine, String bodyLine, String col1, String col2)
+        throws IOException {
+        String documentXml = """
+            <?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+            <w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+              <w:body>
+                <w:p><w:r><w:t>%s</w:t></w:r></w:p>
+                <w:p><w:r><w:t>%s</w:t></w:r></w:p>
+                <w:tbl>
+                  <w:tr>
+                    <w:tc><w:p><w:r><w:t>%s</w:t></w:r></w:p></w:tc>
+                    <w:tc><w:p><w:r><w:t>%s</w:t></w:r></w:p></w:tc>
+                  </w:tr>
+                </w:tbl>
+              </w:body>
+            </w:document>
+            """.formatted(headingLine, bodyLine, col1, col2);
+        return createDocxPackage(documentXml, false);
+    }
+
+    private static byte[] createEncryptedDocx(String password) throws Exception {
+        byte[] plainDocx = createStyledDocxWithTable();
+        try (POIFSFileSystem fs = new POIFSFileSystem();
+             OPCPackage opc = OPCPackage.open(new ByteArrayInputStream(plainDocx));
+             ByteArrayOutputStream encryptedOut = new ByteArrayOutputStream()) {
+            EncryptionInfo info = new EncryptionInfo(EncryptionMode.agile);
+            Encryptor encryptor = info.getEncryptor();
+            encryptor.confirmPassword(password);
+            try (OutputStream encStream = encryptor.getDataStream(fs)) {
+                opc.save(encStream);
+            }
+            fs.writeFilesystem(encryptedOut);
+            return encryptedOut.toByteArray();
+        }
     }
 
     private static void writeZipEntry(ZipOutputStream zos, String name, String xml) throws IOException {
