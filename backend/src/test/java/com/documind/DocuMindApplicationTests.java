@@ -66,5 +66,8 @@ class DocuMindApplicationTests {
         );
         assertThat(httpClientProps.getConnectTimeout()).isEqualTo(java.time.Duration.ofSeconds(10));
         assertThat(httpClientProps.getReadTimeout()).isEqualTo(java.time.Duration.ofSeconds(90));
+        assertThat(environment.getProperty("spring.datasource.hikari.maximum-pool-size", Integer.class)).isEqualTo(20);
+        assertThat(environment.getProperty("spring.datasource.hikari.minimum-idle", Integer.class)).isEqualTo(5);
+        assertThat(environment.getProperty("spring.datasource.hikari.connection-timeout", Long.class)).isEqualTo(5000L);
     }
 }
