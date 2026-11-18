@@ -26,6 +26,9 @@ spring:
     password: ${POSTGRES_PASSWORD:documind_secret}
     driver-class-name: org.postgresql.Driver
     hikari:
+      maximum-pool-size: 20
+      minimum-idle: 5
+      connection-timeout: 5000
       # Session-level init SQL requires session pooling; switch to transaction-scoped SET LOCAL if behind PgBouncer transaction pooling
       connection-init-sql: SET hnsw.iterative_scan = 'relaxed_order'
   jpa:
@@ -128,3 +131,12 @@ documind:
       backoff-multiplier: 2.0
       max-backoff: 5s
       recovery-stale-after: 15m
+  rag:
+    retrieval:
+      top-k: ${RAG_TOP_K:5}
+      similarity-threshold: ${RAG_SIMILARITY_THRESHOLD:0.65}
+      overfetch-multiplier: 2
+      max-excerpt-chars: 500
+    llm:
+      max-question-chars: 4000
+      fallback-enabled: true
