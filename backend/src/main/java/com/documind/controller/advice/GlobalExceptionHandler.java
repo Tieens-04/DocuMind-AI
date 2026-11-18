@@ -6,17 +6,23 @@ import com.documind.exception.DocumentNotFoundException;
 import com.documind.exception.DocumentStorageException;
 import com.documind.exception.DocumentTooLargeException;
 import com.documind.exception.DuplicateDocumentException;
+import com.documind.exception.InvalidChatRequestException;
 import com.documind.exception.InvalidDocumentRequestException;
+import com.documind.exception.LlmProviderException;
 import com.documind.exception.ResourceNotFoundException;
 import com.documind.exception.UnsupportedDocumentTypeException;
 import com.documind.infrastructure.storage.HashingBoundedInputStream;
 import jakarta.servlet.http.HttpServletRequest;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ProblemDetail;
 import org.springframework.http.ResponseEntity;
+import org.springframework.http.converter.HttpMessageNotReadableException;
+import org.springframework.validation.FieldError;
 import org.springframework.web.ErrorResponse;
+import org.springframework.web.bind.MethodArgumentNotValidException;
 import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
 import org.springframework.web.method.annotation.MethodArgumentTypeMismatchException;
@@ -36,6 +42,7 @@ public class GlobalExceptionHandler {
 
     private static final String ERROR_CODE_PROPERTY = "errorCode";
     private static final String DEFAULT_OCTET_STREAM = "application/octet-stream";
+    private static final String WWW_AUTHENTICATE_BEARER = "Bearer realm=\"DocuMind AI\"";
 
     @ExceptionHandler(InvalidDocumentRequestException.class)
     public ResponseEntity<ProblemDetail> handleInvalidRequest(
@@ -116,7 +123,9 @@ public class GlobalExceptionHandler {
             "AUTHENTICATION_REQUIRED",
             request
         );
-        return ResponseEntity.of(problem).build();
+        return ResponseEntity.status(HttpStatus.UNAUTHORIZED)
+            .header(HttpHeaders.WWW_AUTHENTICATE, WWW_AUTHENTICATE_BEARER)
+            .body(problem);
     }
 
     @ExceptionHandler(DocumentAccessDeniedException.class)
@@ -221,6 +230,55 @@ public class GlobalExceptionHandler {
         return ResponseEntity.of(problem).build();
     }
 
+    @ExceptionHandler(InvalidChatRequestException.class)
+    public ResponseEntity<ProblemDetail> handleInvalidChatRequest(
+        InvalidChatRequestException ex,
+        HttpServletRequest request
+    ) {
+        ProblemDetail problem = buildProblem(
+            HttpStatus.BAD_REQUEST,
+            "Invalid Chat Request",
+            ex.getMessage(),
+            "INVALID_CHAT_REQUEST",
+            request
+        );
+        return ResponseEntity.of(problem).build();
+    }
+
+    @ExceptionHandler(MethodArgumentNotValidException.class)
+    public ResponseEntity<ProblemDetail> handleMethodArgumentNotValid(
+        MethodArgumentNotValidException ex,
+        HttpServletRequest request
+    ) {
+        FieldError fieldError = ex.getBindingResult().getFieldError();
+        String detail = (fieldError != null && fieldError.getDefaultMessage() != null)
+            ? fieldError.getDefaultMessage()
+            : "Request validation failed";
+        ProblemDetail problem = buildProblem(
+            HttpStatus.BAD_REQUEST,
+            "Validation Failed",
+            detail,
+            "VALIDATION_ERROR",
+            request
+        );
+        return ResponseEntity.of(problem).build();
+    }
+
+    @ExceptionHandler(HttpMessageNotReadableException.class)
+    public ResponseEntity<ProblemDetail> handleMessageNotReadable(
+        HttpMessageNotReadableException ex,
+        HttpServletRequest request
+    ) {
+        ProblemDetail problem = buildProblem(
+            HttpStatus.BAD_REQUEST,
+            "Malformed JSON Request",
+            "Request body is missing or malformed JSON",
+            "MALFORMED_JSON_REQUEST",
+            request
+        );
+        return ResponseEntity.of(problem).build();
+    }
+
     @ExceptionHandler(DocumentStorageException.class)
     public ResponseEntity<ProblemDetail> handleStorageUnavailable(
         DocumentStorageException ex,
@@ -232,6 +290,22 @@ public class GlobalExceptionHandler {
             "Storage Unavailable",
             "Document storage service is temporarily unavailable",
             "STORAGE_UNAVAILABLE",
+            request
+        );
+        return ResponseEntity.of(problem).build();
+    }
+
+    @ExceptionHandler(LlmProviderException.class)
+    public ResponseEntity<ProblemDetail> handleLlmProviderUnavailable(
+        LlmProviderException ex,
+        HttpServletRequest request
+    ) {
+        log.error("LLM provider error on {}", request != null ? request.getRequestURI() : "unknown", ex);
+        ProblemDetail problem = buildProblem(
+            HttpStatus.BAD_GATEWAY,
+            "LLM Provider Unavailable",
+            "Language model service is temporarily unavailable",
+            "LLM_PROVIDER_UNAVAILABLE",
             request
         );
         return ResponseEntity.of(problem).build();

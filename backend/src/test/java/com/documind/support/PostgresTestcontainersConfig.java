@@ -8,6 +8,7 @@ import org.springframework.ai.embedding.EmbeddingResponse;
 import org.springframework.boot.test.context.TestConfiguration;
 import org.springframework.boot.testcontainers.service.connection.ServiceConnection;
 import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Import;
 import org.springframework.context.annotation.Primary;
 import org.testcontainers.containers.PostgreSQLContainer;
 import org.testcontainers.utility.DockerImageName;
@@ -20,6 +21,7 @@ import java.util.ArrayList;
 import java.util.List;
 
 @TestConfiguration(proxyBeanMethods = false)
+@Import(PostgresTestcontainersConfig.ContainerOnly.class)
 public class PostgresTestcontainersConfig {
 
     public static final int EMBEDDING_DIMENSIONS = 1024;
@@ -34,10 +36,14 @@ public class PostgresTestcontainersConfig {
         SHARED_POSTGRES.start();
     }
 
-    @Bean(destroyMethod = "")
-    @ServiceConnection
-    PostgreSQLContainer<?> postgresContainer() {
-        return SHARED_POSTGRES;
+    @TestConfiguration(proxyBeanMethods = false)
+    public static class ContainerOnly {
+
+        @Bean(destroyMethod = "")
+        @ServiceConnection
+        PostgreSQLContainer<?> postgresContainer() {
+            return SHARED_POSTGRES;
+        }
     }
 
     @Bean
