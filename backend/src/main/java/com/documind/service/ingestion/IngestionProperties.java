@@ -24,8 +24,8 @@ public record IngestionProperties(
     public static final long DEFAULT_ZIP_MAX_ENTRY_SIZE_BYTES = 104_857_600L;
     public static final long DEFAULT_ZIP_MAX_FILE_COUNT = 1_000L;
 
-    public static final int DEFAULT_CHUNK_SIZE = 800;
-    public static final int DEFAULT_CHUNK_OVERLAP = 150;
+    public static final int DEFAULT_CHUNK_SIZE = 512;
+    public static final int DEFAULT_CHUNK_OVERLAP = 100;
     public static final int DEFAULT_MAX_CHUNKS_PER_DOCUMENT = 10_000;
 
     public static final boolean DEFAULT_WORKER_ENABLED = true;

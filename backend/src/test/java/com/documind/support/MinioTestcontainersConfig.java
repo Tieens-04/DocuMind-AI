@@ -26,14 +26,20 @@ public class MinioTestcontainersConfig {
     private static final String MINIO_IMAGE =
         "cgr.dev/chainguard/minio:latest@sha256:634c989a2f1029162fc2676c263caa181213b9410449968532f750a6fb77532d";
 
-    @Bean(initMethod = "start", destroyMethod = "stop")
+    private static final GenericContainer<?> SHARED_MINIO = new GenericContainer<>(DockerImageName.parse(MINIO_IMAGE))
+        .withEnv("MINIO_ROOT_USER", MINIO_ROOT_USER)
+        .withEnv("MINIO_ROOT_PASSWORD", MINIO_ROOT_PASSWORD)
+        .withCommand("server", "/data")
+        .withExposedPorts(MINIO_API_PORT)
+        .waitingFor(Wait.forHttp("/minio/health/live").forPort(MINIO_API_PORT).forStatusCode(200));
+
+    static {
+        SHARED_MINIO.start();
+    }
+
+    @Bean(destroyMethod = "")
     GenericContainer<?> minioContainer() {
-        return new GenericContainer<>(DockerImageName.parse(MINIO_IMAGE))
-            .withEnv("MINIO_ROOT_USER", MINIO_ROOT_USER)
-            .withEnv("MINIO_ROOT_PASSWORD", MINIO_ROOT_PASSWORD)
-            .withCommand("server", "/data")
-            .withExposedPorts(MINIO_API_PORT)
-            .waitingFor(Wait.forHttp("/minio/health/live").forPort(MINIO_API_PORT).forStatusCode(200));
+        return SHARED_MINIO;
     }
 
     @Bean

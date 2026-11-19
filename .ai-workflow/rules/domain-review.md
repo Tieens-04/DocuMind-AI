@@ -52,7 +52,7 @@ Khi ticket chạm upload MinIO, trích xuất văn bản, chia chunk hoặc xử
 - **Định tuyến Reader & Chuẩn hóa Tiếng Việt**:
   - Không bao giờ đưa `.pdf` nhiều trang qua `TikaDocumentReader` thuần (gộp mất `page_number`); phải dùng pipeline bảo toàn từng trang (`PagePdfDocumentReader` / PDFBox per-page / Tika `<div class="page">` với `NO_OCR`), từ chối rõ ràng PDF khóa mật khẩu hoặc PDF ảnh scan `0` chữ.
   - Chuẩn hóa toàn bộ văn bản tiếng Việt về Unicode **`NFC`** (`Normalizer.Form.NFC`), loại bỏ `\u0000`, giữ nguyên dấu tiếng Việt.
-- **Smart Chunking (`800 / 150`) & Idempotency**:
+- **Smart Chunking (`512 / 100`, calibrated on `bge-m3` in `DA-11`) & Idempotency**:
   - Cắt theo token `CL100K_BASE` có độ gối `chunkOverlap` và dò điểm ngắt tự nhiên (`\n\n` -> `\n` -> câu -> khoảng trắng), không bao giờ cắt đôi ký tự UTF-8 tiếng Việt sinh ra `\uFFFD` và không gộp lẫn nội dung khác trang / khác mục.
   - Sinh `Document.id` tất định (`ChunkIdGenerator` theo `documentId + docVersion + chunkIndex`) để retry ở worker không gây trùng lặp hoặc vỡ ràng buộc `UNIQUE (document_id, doc_version, chunk_index)`.
 - **Vòng đời Trạng thái Tài liệu**:

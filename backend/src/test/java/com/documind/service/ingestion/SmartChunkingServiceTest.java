@@ -17,7 +17,13 @@ import static org.junit.jupiter.api.Assertions.assertTimeoutPreemptively;
 
 class SmartChunkingServiceTest {
 
-    private final IngestionProperties properties = IngestionProperties.defaults();
+    // Intentionally pinned to the pre-DA-11 800/150 mathematical window so legacy boundary/overlap
+    // unit assertions remain deterministic; active 512/100 production defaults are verified below in
+    // calibratedDefault512By100WindowPreservesVietnameseOverlapAndBounds().
+    private final IngestionProperties properties = new IngestionProperties(
+        IngestionProperties.ExtractionProperties.defaults(),
+        new IngestionProperties.ChunkingProperties(800, 150, IngestionProperties.DEFAULT_MAX_CHUNKS_PER_DOCUMENT)
+    );
     private final OverlappingTokenTextSplitter splitter = new OverlappingTokenTextSplitter(
         properties.chunking().chunkSize(),
         properties.chunking().chunkOverlap(),
@@ -316,6 +322,51 @@ class SmartChunkingServiceTest {
         assertThat(longChunks).allSatisfy(chunk ->
             assertThat(splitter.countTokens(chunk.getText())).isLessThanOrEqualTo(800)
         );
+    }
+
+    @Test
+    void calibratedDefault512By100WindowPreservesVietnameseOverlapAndBounds() {
+        IngestionProperties defaults = IngestionProperties.defaults();
+        assertThat(defaults.chunking().chunkSize()).isEqualTo(512);
+        assertThat(defaults.chunking().chunkOverlap()).isEqualTo(100);
+
+        OverlappingTokenTextSplitter defaultSplitter = new OverlappingTokenTextSplitter();
+        SmartChunkingService defaultService = new SmartChunkingService(defaults, defaultSplitter);
+
+        StringBuilder policyBuilder = new StringBuilder();
+        for (int i = 1; i <= 18; i++) {
+            policyBuilder.append("Điều khoản ").append(i)
+                .append(": Nhân viên chính thức tuân thủ quy định bảo mật dữ liệu nội bộ và chính sách nghỉ phép năm của doanh nghiệp.\n\n");
+        }
+        String policyText = policyBuilder.toString().trim();
+        assertThat(defaultSplitter.countTokens(policyText)).isBetween(900, 1_400);
+
+        DocumentIngestionContext ctx = new DocumentIngestionContext(
+            UUID.randomUUID(),
+            UUID.randomUUID(),
+            "departments/hr/doc/v1/chinh_sach_512.txt",
+            "Chính sách 512.txt",
+            "txt",
+            AccessLevel.DEPARTMENT,
+            1
+        );
+
+        List<Document> chunks = defaultService.chunk(
+            ctx,
+            List.of(new ExtractedSegment(policyText, null, null))
+        );
+
+        assertThat(chunks).hasSizeGreaterThanOrEqualTo(3);
+        assertThat(chunks).allSatisfy(chunk -> {
+            assertThat(chunk.getText()).isNotBlank().doesNotContain("\uFFFD");
+            assertThat(defaultSplitter.countTokens(chunk.getText())).isLessThanOrEqualTo(512);
+        });
+
+        for (int i = 0; i < chunks.size() - 1; i++) {
+            String overlapText = findSuffixPrefixOverlap(chunks.get(i).getText(), chunks.get(i + 1).getText());
+            assertThat(overlapText).isNotBlank();
+            assertThat(defaultSplitter.countTokens(overlapText)).isBetween(30, 120);
+        }
     }
 
     private static String findSuffixPrefixOverlap(String previous, String next) {

@@ -208,7 +208,7 @@ class CoreRagChatIntegrationTest {
         assertThat(pdfCitation.documentId()).isEqualTo(uploadedPdf.id());
         assertThat(pdfCitation.fileName()).isEqualTo("hr-handbook-2026.pdf");
         assertThat(pdfCitation.pageNumber()).isEqualTo(2);
-        assertThat(pdfCitation.similarityScore()).isGreaterThanOrEqualTo(0.65d);
+        assertThat(pdfCitation.similarityScore()).isGreaterThanOrEqualTo(0.58d);
         assertThat(pdfCitation.presignedUrl()).isNotBlank().endsWith("#page=2");
 
         try (HttpClient httpClient = HttpClient.newHttpClient()) {

@@ -1,0 +1,19 @@
+CHƯƠNG I: QUY ĐỊNH LỊCH LÀM VIỆC KẾT HỢP / HYBRID WORK SCHEDULE
+
+Điều 1. Số ngày làm việc từ xa và khung giờ phối hợp chung
+
+Chính sách Làm việc Kết hợp (Hybrid Work Policy) áp dụng thống nhất cho toàn thể nhân viên chính thức tại công ty sau khi hoàn thành giai đoạn thử việc. Nhân viên toàn thời gian được phép đăng ký làm việc từ xa (remote work) tối đa 2 ngày mỗi tuần (up to 2 days per week) khi được trưởng bộ phận phê duyệt trên hệ thống nhân sự trước ít nhất 24 giờ. Các ngày làm việc tại văn phòng tối thiểu là 3 ngày mỗi tuần để bảo đảm sự gắn kết đội nhóm, trao đổi chuyên môn trực tiếp và hướng dẫn nhân sự mới.
+
+Dù làm việc tại văn phòng hay làm việc từ xa, toàn bộ nhân sự bắt buộc duy trì khung giờ phối hợp chung (core collaboration hours) từ 09:30 đến 16:30 giờ Việt Nam (ICT / UTC+7) từ Thứ Hai đến Thứ Sáu. Trong khung giờ này, nhân viên phải trực tuyến trên Slack hoặc Microsoft Teams, tham gia đầy đủ các cuộc họp nhóm theo lịch và phản hồi yêu cầu công việc trong thời gian hợp lý. Lịch làm việc linh hoạt đầu hoặc cuối ngày có thể điều chỉnh giữa 08:00–17:30 hoặc 09:00–18:30 tùy theo thỏa thuận với quản lý trực tiếp.
+
+Điều 2. Tiêu chuẩn không gian làm việc và hỗ trợ thiết bị
+
+Nhân viên làm việc từ xa phải chủ động bố trí không gian làm việc yên tĩnh, bảo đảm đường truyền Internet ổn định tối thiểu 50 Mbps để phục vụ họp trực tuyến có hình ảnh và âm thanh rõ nét. Công ty không chi trả phụ cấp điện nước phát sinh tại nhà riêng, nhưng hỗ trợ màn hình rời và phụ kiện công thái học theo chính sách cấp phát tài sản định kỳ hằng năm. Trong trường hợp khu vực sinh sống gặp sự cố mất điện hoặc mất mạng kéo dài trên 60 phút, nhân viên cần thông báo ngay cho quản lý trực tiếp và di chuyển đến văn phòng hoặc điểm làm việc dự phòng gần nhất.
+
+CHƯƠNG II: BẢO MẬT THIẾT BỊ KHI LÀM VIỆC TỪ XA / REMOTE ENDPOINT SECURITY
+
+Điều 3. Kết nối mạng riêng ảo WireGuard VPN và khóa màn hình tự động
+
+Khi làm việc bên ngoài văn phòng hoặc kết nối qua mạng Wi-Fi công cộng, toàn bộ nhân viên bắt buộc kích hoạt kết nối mạng riêng ảo doanh nghiệp WireGuard VPN trước khi truy cập hệ thống nội bộ, cơ sở dữ liệu tri thức DocuMind AI, kho mã nguồn hoặc cổng kế toán. Nghiêm cấm sử dụng thiết bị cá nhân chưa cài đặt phần mềm quản trị thiết bị đầu cuối (MDM) để tải xuống hoặc lưu trữ tài liệu nội bộ thuộc cấp DEPARTMENT hoặc CONFIDENTIAL.
+
+Mọi máy tính xách tay do công ty cấp phải thiết lập chế độ khóa màn hình tự động (automatic screen lock) sau tối đa 5 phút (5 minutes) không tương tác. Khi rời khỏi bàn làm việc tại quán cà phê, không gian làm việc chung hoặc phòng họp, nhân viên phải chủ động khóa màn hình ngay lập tức bằng tổ hợp phím tắt và không chia sẻ tài liệu nhạy cảm ở nơi đông người có nguy cơ bị nhìn trộm màn hình. Mọi vi phạm quy định bảo mật đầu cuối sẽ được xử lý theo nội quy lao động và quy trình kiểm soát rủi ro thông tin.
