@@ -172,5 +172,11 @@ class IntegrationTestSupportContractTest {
         assertThat(customFallback.prompt(samplePrompt).call().content()).contains("[Nguồn: a.pdf]");
         assertThat(interceptedBuilder.build().prompt(samplePrompt).call().content()).contains("[Nguồn: a.pdf]");
         assertThat(shared.callCount()).isEqualTo(3);
+
+        var springBootTest = AbstractIntegrationTest.class.getAnnotation(
+            org.springframework.boot.test.context.SpringBootTest.class
+        );
+        assertThat(springBootTest).isNotNull();
+        assertThat(springBootTest.properties()).contains("DOCUMIND_ENV_FILE=.env.test-isolated");
     }
 }

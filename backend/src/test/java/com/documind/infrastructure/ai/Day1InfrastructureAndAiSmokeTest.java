@@ -182,7 +182,7 @@ class Day1InfrastructureAndAiSmokeTest {
     }
 
     @Test
-    void livePostgresAppliesFlywayV1ToV6AndCreatesAllNineTables() {
+    void livePostgresAppliesFlywayV1ToV7AndCreatesAllNineTables() {
         Integer failedMigrations = jdbcTemplate.queryForObject(
             "SELECT COUNT(*) FROM flyway_schema_history WHERE success = false",
             Integer.class
@@ -193,7 +193,7 @@ class Day1InfrastructureAndAiSmokeTest {
             "SELECT version FROM flyway_schema_history WHERE success = true AND version IS NOT NULL AND version <> '0' ORDER BY installed_rank",
             String.class
         );
-        assertThat(versions).containsSubsequence("1", "2", "3", "4", "5", "6");
+        assertThat(versions).containsSubsequence("1", "2", "3", "4", "5", "6", "7");
 
         List<String> tables = jdbcTemplate.queryForList(
             "SELECT table_name FROM information_schema.tables WHERE table_schema = 'public' AND table_type = 'BASE TABLE'",

@@ -87,6 +87,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 @SpringBootTest(
     webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT,
     properties = {
+        "DOCUMIND_ENV_FILE=.env.test-isolated",
         "spring.main.allow-bean-definition-overriding=true",
         "documind.ingestion.worker.enabled=true"
     }
