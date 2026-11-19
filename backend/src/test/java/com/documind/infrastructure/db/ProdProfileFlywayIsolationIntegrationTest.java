@@ -32,7 +32,10 @@ import java.util.Objects;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
-@SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
+@SpringBootTest(
+    webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT,
+    properties = "documind.security.jwt.secret=prod-isolated-test-jwt-hmac-secret-key-2026-strong-32b"
+)
 @ActiveProfiles("prod")
 @Import(ProdProfileFlywayIsolationIntegrationTest.IsolatedProdPostgresConfig.class)
 class ProdProfileFlywayIsolationIntegrationTest {

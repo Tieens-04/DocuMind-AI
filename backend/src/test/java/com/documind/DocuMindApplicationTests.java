@@ -69,5 +69,8 @@ class DocuMindApplicationTests {
         assertThat(environment.getProperty("spring.datasource.hikari.maximum-pool-size", Integer.class)).isEqualTo(20);
         assertThat(environment.getProperty("spring.datasource.hikari.minimum-idle", Integer.class)).isEqualTo(5);
         assertThat(environment.getProperty("spring.datasource.hikari.connection-timeout", Long.class)).isEqualTo(5000L);
+        assertThat(environment.getProperty("spring.data.redis.timeout")).isEqualTo("500ms");
+        assertThat(environment.getProperty("spring.data.redis.connect-timeout")).isEqualTo("1s");
+        assertThat(environment.getProperty("server.forward-headers-strategy")).isEqualTo("native");
     }
 }

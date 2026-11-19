@@ -45,7 +45,10 @@ import java.util.function.Supplier;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
-@SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
+@SpringBootTest(
+    webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT,
+    properties = "documind.security.dev-caller-fallback.enabled=true"
+)
 @ActiveProfiles("dev")
 @EnabledIfSystemProperty(named = "smoke", matches = "true")
 class Day1InfrastructureAndAiSmokeTest {

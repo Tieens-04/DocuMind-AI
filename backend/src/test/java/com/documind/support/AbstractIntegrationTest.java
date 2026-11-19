@@ -89,7 +89,8 @@ import static org.assertj.core.api.Assertions.assertThat;
     properties = {
         "DOCUMIND_ENV_FILE=.env.test-isolated",
         "spring.main.allow-bean-definition-overriding=true",
-        "documind.ingestion.worker.enabled=true"
+        "documind.ingestion.worker.enabled=true",
+        "documind.security.dev-caller-fallback.enabled=true"
     }
 )
 @ActiveProfiles("dev")

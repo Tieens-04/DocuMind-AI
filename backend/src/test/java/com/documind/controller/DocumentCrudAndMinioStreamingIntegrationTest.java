@@ -93,7 +93,10 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 @SpringBootTest(
     webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT,
-    properties = "documind.ingestion.worker.enabled=false"
+    properties = {
+        "documind.ingestion.worker.enabled=false",
+        "documind.security.dev-caller-fallback.enabled=true"
+    }
 )
 @ActiveProfiles("dev")
 @Import({
