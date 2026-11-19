@@ -71,7 +71,7 @@ class VectorRetrievalServiceTest {
     void ragPropertiesDefaultsAndBoundsValidation() {
         RagProperties defaults = RagProperties.defaults();
         assertThat(defaults.retrieval().topK()).isEqualTo(5);
-        assertThat(defaults.retrieval().similarityThreshold()).isEqualTo(0.65d);
+        assertThat(defaults.retrieval().similarityThreshold()).isEqualTo(0.58d);
         assertThat(defaults.retrieval().overfetchMultiplier()).isEqualTo(2);
         assertThat(defaults.retrieval().maxExcerptChars()).isEqualTo(500);
         assertThat(defaults.retrieval().candidateFetchLimit()).isEqualTo(10);
@@ -210,7 +210,7 @@ class VectorRetrievalServiceTest {
         assertThat(Normalizer.isNormalized(capturedRequest.getQuery(), Normalizer.Form.NFC)).isTrue();
         assertThat(capturedRequest.getQuery()).isEqualTo("Quy định nghỉ phép năm?");
         assertThat(capturedRequest.getTopK()).isEqualTo(10);
-        assertThat(capturedRequest.getSimilarityThreshold()).isEqualTo(0.65d);
+        assertThat(capturedRequest.getSimilarityThreshold()).isEqualTo(0.58d);
         assertThat(capturedRequest.getFilterExpression()).isEqualTo(retrievalService.buildRbacFilter(hrEmployee));
 
         verify(documentRepository, times(1)).findAllById(anyIterable());

@@ -16,7 +16,7 @@ public record RagProperties(
 ) {
 
     public static final int DEFAULT_TOP_K = 5;
-    public static final double DEFAULT_SIMILARITY_THRESHOLD = 0.65d;
+    public static final double DEFAULT_SIMILARITY_THRESHOLD = 0.58d;
     public static final int DEFAULT_OVERFETCH_MULTIPLIER = 2;
     public static final int DEFAULT_MAX_EXCERPT_CHARS = 500;
     public static final int DEFAULT_MAX_QUESTION_CHARS = 4000;
@@ -34,7 +34,7 @@ public record RagProperties(
 
     public record RetrievalProperties(
         @DefaultValue("5") int topK,
-        @DefaultValue("0.65") double similarityThreshold,
+        @DefaultValue("0.58") double similarityThreshold,
         @DefaultValue("2") int overfetchMultiplier,
         @DefaultValue("500") int maxExcerptChars
     ) {

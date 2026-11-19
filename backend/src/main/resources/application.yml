@@ -118,8 +118,9 @@ documind:
       zip-max-entry-size-bytes: 104857600
       zip-max-file-count: 1000
     chunking:
-      chunk-size: 800
-      chunk-overlap: 150
+      # Calibrated on live bge-m3 (DA-11 Milestone 1: 100% Hit@5, +0.0813 OOS margin)
+      chunk-size: ${INGESTION_CHUNK_SIZE:512}
+      chunk-overlap: ${INGESTION_CHUNK_OVERLAP:100}
       max-chunks-per-document: 10000
     worker:
       enabled: true
@@ -134,7 +135,7 @@ documind:
   rag:
     retrieval:
       top-k: ${RAG_TOP_K:5}
-      similarity-threshold: ${RAG_SIMILARITY_THRESHOLD:0.65}
+      similarity-threshold: ${RAG_SIMILARITY_THRESHOLD:0.58}
       overfetch-multiplier: 2
       max-excerpt-chars: 500
     llm:

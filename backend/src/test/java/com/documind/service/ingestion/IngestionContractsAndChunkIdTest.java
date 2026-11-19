@@ -23,8 +23,8 @@ class IngestionContractsAndChunkIdTest {
         assertThat(defaults.extraction().zipMinInflateRatio()).isEqualTo(0.01d);
         assertThat(defaults.extraction().zipMaxEntrySizeBytes()).isEqualTo(104_857_600L);
         assertThat(defaults.extraction().zipMaxFileCount()).isEqualTo(1_000L);
-        assertThat(defaults.chunking().chunkSize()).isEqualTo(800);
-        assertThat(defaults.chunking().chunkOverlap()).isEqualTo(150);
+        assertThat(defaults.chunking().chunkSize()).isEqualTo(512);
+        assertThat(defaults.chunking().chunkOverlap()).isEqualTo(100);
         assertThat(defaults.chunking().maxChunksPerDocument()).isEqualTo(10_000);
         assertThat(defaults.worker().enabled()).isTrue();
         assertThat(defaults.worker().maxConcurrentDocuments()).isEqualTo(10);

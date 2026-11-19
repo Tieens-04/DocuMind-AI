@@ -97,8 +97,8 @@ class ExtractorAndChunkerMinioPgVectorIntegrationTest {
         throws IOException {
         assertThat(ingestionProperties.extraction().maxSpoolBytes()).isEqualTo(52_428_800L);
         assertThat(ingestionProperties.extraction().maxExtractedChars()).isEqualTo(5_000_000);
-        assertThat(ingestionProperties.chunking().chunkSize()).isEqualTo(800);
-        assertThat(ingestionProperties.chunking().chunkOverlap()).isEqualTo(150);
+        assertThat(ingestionProperties.chunking().chunkSize()).isEqualTo(512);
+        assertThat(ingestionProperties.chunking().chunkOverlap()).isEqualTo(100);
         assertThat(ingestionProperties.chunking().maxChunksPerDocument()).isEqualTo(10_000);
 
         DepartmentEntity hr = departmentRepository.findByCodeIgnoreCase("HR").orElseThrow();
