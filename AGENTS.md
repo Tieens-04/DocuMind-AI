@@ -21,7 +21,7 @@
 
 ## 3. Non-Negotiable Security & RAG Invariants
 1. **Mandatory Vector RBAC Filtering (Zero Cross-Department Leakage):**
-   - Every chunk stored in `pgvector` MUST carry metadata: `document_id`, `file_name`, `page_number`, `department_id`, and `access_level` (`PUBLIC`, `DEPARTMENT`, `CONFIDENTIAL`).
+   - Every chunk stored in `pgvector` MUST carry non-null metadata: `document_id`, `file_name`, `department_id`, `access_level` (`PUBLIC`, `DEPARTMENT`, `CONFIDENTIAL`), `doc_version`, and `chunk_index`, plus `page_number` (`>= 1`) for paginated `.pdf` documents or `section_heading` when present (omit `null` metadata keys per `V7` for `PgVectorStore` compatibility).
    - Every `VectorStore.similaritySearch(...)` call MUST attach a server-enforced `Filter.Expression` derived strictly from `SecurityContextHolder` (never from unvalidated request parameters):
      - `STANDARD_EMPLOYEE` (`VIEWER`): `access_level == 'PUBLIC' || (department_id == <user.departmentId> && access_level == 'DEPARTMENT')` (never `CONFIDENTIAL`)
      - `DEPARTMENT_MANAGER` (`EDITOR`): manage documents only within `<user.departmentId>`; query `access_level == 'PUBLIC' || department_id == <user.departmentId>` (includes `DEPARTMENT` and `CONFIDENTIAL` within own department)
@@ -29,7 +29,7 @@
 2. **Deterministic Anti-Hallucination Fallback & Citations:**
    - Enforce a configurable `similarityThreshold` on vector retrieval.
    - When zero chunks pass the threshold, do NOT let the LLM speculate — return `"Không tìm thấy thông tin trong tài liệu nội bộ"` immediately.
-   - Every grounded answer MUST return structured source citations (`file_name`, `page_number`, `similarity_score`, `excerpt`) alongside the streamed SSE response.
+   - Every grounded answer MUST return structured source citations (`file_name`, `page_number` or `section_heading`, `similarity_score`, `excerpt`) alongside the streamed SSE response.
 3. **Async Document Ingestion Lifecycle:**
    - Validate file extension (`.pdf`, `.docx`, `.txt`, `.md`) and size (`<= 50MB`) at upload time.
    - Persist document state transitions atomically: `PENDING` -> `PROCESSING` -> `COMPLETED` / `FAILED` (with failure reason recorded).
