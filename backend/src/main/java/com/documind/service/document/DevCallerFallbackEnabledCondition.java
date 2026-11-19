@@ -11,7 +11,7 @@ import org.springframework.core.type.AnnotatedTypeMetadata;
  * {@code dev} or {@code local} profile is active, {@code prod} is inactive, and
  * {@code documind.security.dev-caller-fallback.enabled=true}.
  */
-final class DevCallerFallbackEnabledCondition implements Condition {
+public final class DevCallerFallbackEnabledCondition implements Condition {
 
     static final String PROPERTY_ENABLED = "documind.security.dev-caller-fallback.enabled";
 
