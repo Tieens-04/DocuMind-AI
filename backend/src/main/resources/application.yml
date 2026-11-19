@@ -1,7 +1,11 @@
 server:
   port: ${SERVER_PORT:8081}
+  forward-headers-strategy: ${SERVER_FORWARD_HEADERS_STRATEGY:native}
   tomcat:
     max-swallow-size: 64MB
+    remoteip:
+      remote-ip-header: X-Forwarded-For
+      protocol-header: X-Forwarded-Proto
 
 spring:
   application:
@@ -43,6 +47,8 @@ spring:
     redis:
       host: ${REDIS_HOST:localhost}
       port: ${REDIS_PORT:6380}
+      timeout: ${REDIS_TIMEOUT:500ms}
+      connect-timeout: ${REDIS_CONNECT_TIMEOUT:1s}
       repositories:
         enabled: false
   ai:
@@ -95,6 +101,11 @@ documind:
   security:
     dev-caller-fallback:
       enabled: false
+    jwt:
+      secret: ${JWT_SECRET:}
+      issuer: ${JWT_ISSUER:documind-ai}
+      access-token-ttl: ${JWT_ACCESS_TOKEN_TTL:15m}
+      refresh-token-ttl: ${JWT_REFRESH_TOKEN_TTL:7d}
   ai:
     gemini:
       base-url: ${GEMINI_BASE_URL:https://generativelanguage.googleapis.com/v1beta/openai}

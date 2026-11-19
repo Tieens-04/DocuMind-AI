@@ -19,3 +19,8 @@ management:
       enabled: false
     minio:
       enabled: false
+
+documind:
+  security:
+    jwt:
+      secret: ${JWT_SECRET:documind-local-dev-jwt-hmac-secret-key-min-32-bytes-2026}

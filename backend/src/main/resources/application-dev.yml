@@ -7,4 +7,6 @@ spring:
 documind:
   security:
     dev-caller-fallback:
-      enabled: true
+      enabled: false
+    jwt:
+      secret: ${JWT_SECRET:documind-local-dev-jwt-hmac-secret-key-min-32-bytes-2026}
