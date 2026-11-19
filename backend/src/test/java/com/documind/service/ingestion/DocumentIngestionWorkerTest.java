@@ -548,6 +548,55 @@ class DocumentIngestionWorkerTest {
         assertThat(redrivenLatch.await(3, TimeUnit.SECONDS)).isTrue();
     }
 
+    @Test
+    void markCompletedPurgesPriorVersionsAndScheduledRecoveryIsConfigured() {
+        UUID docId = UUID.randomUUID();
+        UUID deptId = UUID.randomUUID();
+        DocumentRepository docRepo = mock(DocumentRepository.class);
+        DepartmentRepository deptRepo = mock(DepartmentRepository.class);
+        DocumentChunkVectorRepository chunkRepo = mock(DocumentChunkVectorRepository.class);
+        TransactionTemplate txTemplate = new TransactionTemplate(new NoOpTransactionManager());
+
+        DocumentIngestionStateService stateService = new DocumentIngestionStateService(
+            docRepo,
+            deptRepo,
+            chunkRepo,
+            txTemplate
+        );
+
+        DocumentIngestionContext v2Context = new DocumentIngestionContext(
+            docId,
+            deptId,
+            "departments/" + deptId + "/" + docId + "/v2/policy.pdf",
+            "policy.pdf",
+            "pdf",
+            AccessLevel.DEPARTMENT,
+            2
+        );
+        when(docRepo.touchProcessingHeartbeat(docId, 2)).thenReturn(1);
+        assertThat(stateService.isActiveProcessingVersion(docId, 2)).isTrue();
+        verify(docRepo).touchProcessingHeartbeat(docId, 2);
+
+        when(docRepo.markCompleted(docId, 2, 8)).thenReturn(1);
+        when(docRepo.findById(docId)).thenReturn(Optional.empty());
+
+        assertThat(stateService.markCompleted(v2Context, 8)).isTrue();
+        InOrder order = inOrder(docRepo, chunkRepo, deptRepo);
+        order.verify(docRepo).markCompleted(docId, 2, 8);
+        order.verify(chunkRepo).deleteByDocumentIdAndVersionFromIndex(docId, 2, 8);
+        order.verify(chunkRepo).deleteByDocumentIdAndVersionLessThan(docId, 2);
+        order.verify(deptRepo).incrementCacheVersion(deptId);
+
+        assertThat(com.documind.infrastructure.config.IngestionAsyncConfig.class
+            .isAnnotationPresent(org.springframework.scheduling.annotation.EnableScheduling.class))
+            .as("IngestionAsyncConfig must enable @Scheduled stale ingestion recovery")
+            .isTrue();
+        assertThatCode(() -> {
+            var method = DocumentIngestionWorker.class.getDeclaredMethod("recoverStaleDocumentsScheduled");
+            assertThat(method.isAnnotationPresent(org.springframework.scheduling.annotation.Scheduled.class)).isTrue();
+        }).doesNotThrowAnyException();
+    }
+
     private static final class NoOpTransactionManager extends AbstractPlatformTransactionManager {
 
         @Override
