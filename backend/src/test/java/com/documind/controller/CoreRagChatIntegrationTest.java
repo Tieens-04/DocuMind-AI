@@ -95,7 +95,8 @@ import static org.assertj.core.api.Assertions.assertThat;
     webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT,
     properties = {
         "spring.main.allow-bean-definition-overriding=true",
-        "documind.ingestion.worker.enabled=true"
+        "documind.ingestion.worker.enabled=true",
+        "documind.security.dev-caller-fallback.enabled=true"
     }
 )
 @ActiveProfiles("dev")

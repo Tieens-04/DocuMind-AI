@@ -3,6 +3,8 @@ package com.documind.service.document;
 import com.documind.domain.entity.UserEntity;
 import com.documind.domain.enums.Role;
 import com.documind.exception.InvalidDocumentRequestException;
+import com.documind.infrastructure.security.ClientIpResolver;
+import com.documind.infrastructure.security.CustomUserDetails;
 import com.documind.repository.UserRepository;
 import jakarta.annotation.PostConstruct;
 import jakarta.servlet.http.HttpServletRequest;
@@ -11,6 +13,8 @@ import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.context.annotation.Conditional;
+import org.springframework.security.core.Authentication;
+import org.springframework.security.core.context.SecurityContextHolder;
 import org.springframework.stereotype.Component;
 
 import java.util.Locale;
@@ -38,8 +42,6 @@ public class DevFallbackCallerContextResolver implements CallerContextResolver {
     public static final String HEADER_DEPARTMENT_ID = "X-Department-Id";
     public static final String HEADER_USER_ID = "X-User-Id";
     public static final String HEADER_USER_ROLE = "X-User-Role";
-    private static final String HEADER_FORWARDED_FOR = "X-Forwarded-For";
-    private static final int MAX_IP_LENGTH = 45;
 
     private final Supplier<UserRepository> userRepositorySupplier;
 
@@ -73,6 +75,22 @@ public class DevFallbackCallerContextResolver implements CallerContextResolver {
 
     @Override
     public CallerContext resolve(HttpServletRequest request) {
+        Authentication authentication = SecurityContextHolder.getContext().getAuthentication();
+        if (authentication != null && authentication.isAuthenticated()) {
+            Object principal = authentication.getPrincipal();
+            if (principal instanceof CustomUserDetails userDetails) {
+                return new CallerContext(
+                    userDetails.userId(),
+                    userDetails.departmentId(),
+                    userDetails.role(),
+                    ClientIpResolver.resolve(request)
+                );
+            }
+            if (principal instanceof CallerContext callerContext) {
+                return callerContext;
+            }
+        }
+
         UUID headerDepartmentId = parseOptionalUuidHeader(request, HEADER_DEPARTMENT_ID);
         UUID headerUserId = parseOptionalUuidHeader(request, HEADER_USER_ID);
         Role headerRole = parseOptionalRoleHeader(request);
@@ -107,7 +125,7 @@ public class DevFallbackCallerContextResolver implements CallerContextResolver {
             userId = null;
         }
 
-        String ipAddress = resolveClientIp(request);
+        String ipAddress = ClientIpResolver.resolve(request);
         return new CallerContext(userId, departmentId, role, ipAddress);
     }
 
@@ -143,25 +161,5 @@ public class DevFallbackCallerContextResolver implements CallerContextResolver {
                 "Invalid " + HEADER_USER_ROLE + " header: must be one of SYSTEM_ADMIN, DEPARTMENT_MANAGER, STANDARD_EMPLOYEE"
             );
         }
-    }
-
-    private static String resolveClientIp(HttpServletRequest request) {
-        if (request == null) {
-            return null;
-        }
-        String forwardedFor = request.getHeader(HEADER_FORWARDED_FOR);
-        String candidate = null;
-        if (forwardedFor != null && !forwardedFor.isBlank()) {
-            int commaIdx = forwardedFor.indexOf(',');
-            candidate = (commaIdx >= 0 ? forwardedFor.substring(0, commaIdx) : forwardedFor).trim();
-        }
-        if (candidate == null || candidate.isBlank()) {
-            candidate = request.getRemoteAddr();
-        }
-        if (candidate == null || candidate.isBlank()) {
-            return null;
-        }
-        String trimmed = candidate.trim();
-        return trimmed.length() > MAX_IP_LENGTH ? trimmed.substring(0, MAX_IP_LENGTH) : trimmed;
     }
 }

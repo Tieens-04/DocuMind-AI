@@ -17,7 +17,10 @@ import org.springframework.http.ProblemDetail;
 import org.springframework.http.ResponseEntity;
 import org.springframework.mock.env.MockEnvironment;
 import org.springframework.mock.web.MockHttpServletRequest;
+import org.springframework.security.authentication.UsernamePasswordAuthenticationToken;
+import org.springframework.security.core.context.SecurityContextHolder;
 import org.springframework.web.HttpRequestMethodNotSupportedException;
+import com.documind.infrastructure.security.CustomUserDetails;
 
 import java.util.List;
 import java.util.Objects;
@@ -135,6 +138,7 @@ class DevFallbackCallerContextResolverTest {
 
     @Test
     void prodCallerContextResolverAlwaysFailsClosedEvenWhenSpoofedHeadersAreProvided() {
+        SecurityContextHolder.clearContext();
         var prodResolver = new ProdCallerContextResolver();
         var request = new MockHttpServletRequest();
         request.addHeader("X-Department-Id", HR_DEPT_ID.toString());
@@ -146,17 +150,51 @@ class DevFallbackCallerContextResolverTest {
     }
 
     @Test
-    void resolvesClientIpFromFirstXForwardedForHopOrRemoteAddr() {
+    void prodCallerContextResolverExtractsIdentityFromAuthenticatedSecurityContextAndIgnoresSpoofedHeaders() {
+        try {
+            CustomUserDetails principal = new CustomUserDetails(
+                SALES_EMPLOYEE_USER_ID,
+                SALES_DEPT_ID,
+                "employee.sales@documind.ai",
+                "Sales Standard Employee",
+                Role.STANDARD_EMPLOYEE,
+                "jti-123",
+                java.time.Instant.now().plusSeconds(300)
+            );
+            SecurityContextHolder.getContext().setAuthentication(
+                new UsernamePasswordAuthenticationToken(principal, null, principal.getAuthorities())
+            );
+
+            var request = new MockHttpServletRequest();
+            request.addHeader("X-Department-Id", HR_DEPT_ID.toString());
+            request.addHeader("X-User-Id", HR_MANAGER_USER_ID.toString());
+            request.addHeader("X-User-Role", "SYSTEM_ADMIN");
+            request.addHeader("X-Forwarded-For", "198.51.100.10, 10.0.0.1");
+            request.setRemoteAddr("10.20.30.40");
+
+            CallerContext context = new ProdCallerContextResolver().resolve(request);
+
+            assertThat(context.userId()).isEqualTo(SALES_EMPLOYEE_USER_ID);
+            assertThat(context.departmentId()).isEqualTo(SALES_DEPT_ID);
+            assertThat(context.role()).isEqualTo(Role.STANDARD_EMPLOYEE);
+            assertThat(context.ipAddress()).isEqualTo("10.20.30.40");
+        } finally {
+            SecurityContextHolder.clearContext();
+        }
+    }
+
+    @Test
+    void resolvesClientIpFromRemoteAddrIgnoringUntrustedXForwardedForAndBoundingLength() {
         var resolver = new DevFallbackCallerContextResolver();
 
-        var forwardedRequest = new MockHttpServletRequest();
-        forwardedRequest.addHeader("X-Forwarded-For", "203.0.113.42, 10.0.0.1");
-        forwardedRequest.setRemoteAddr("10.0.0.2");
-        assertThat(resolver.resolve(forwardedRequest).ipAddress()).isEqualTo("203.0.113.42");
+        var spoofedForwardedRequest = new MockHttpServletRequest();
+        spoofedForwardedRequest.addHeader("X-Forwarded-For", "203.0.113.42, 10.0.0.1");
+        spoofedForwardedRequest.setRemoteAddr("10.0.0.2");
+        assertThat(resolver.resolve(spoofedForwardedRequest).ipAddress()).isEqualTo("10.0.0.2");
 
-        var directRequest = new MockHttpServletRequest();
-        directRequest.setRemoteAddr("10.20.30.40");
-        assertThat(resolver.resolve(directRequest).ipAddress()).isEqualTo("10.20.30.40");
+        var longAddrRequest = new MockHttpServletRequest();
+        longAddrRequest.setRemoteAddr("a".repeat(60));
+        assertThat(resolver.resolve(longAddrRequest).ipAddress()).hasSize(45);
 
         assertThat(resolver.resolve(null).ipAddress()).isNull();
     }

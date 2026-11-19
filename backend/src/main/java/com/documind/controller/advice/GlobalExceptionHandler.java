@@ -1,5 +1,7 @@
 package com.documind.controller.advice;
 
+import com.documind.exception.AccountDisabledException;
+import com.documind.exception.AuthStateStoreUnavailableException;
 import com.documind.exception.AuthenticationRequiredException;
 import com.documind.exception.DocumentAccessDeniedException;
 import com.documind.exception.DocumentNotFoundException;
@@ -7,7 +9,9 @@ import com.documind.exception.DocumentStorageException;
 import com.documind.exception.DocumentTooLargeException;
 import com.documind.exception.DuplicateDocumentException;
 import com.documind.exception.InvalidChatRequestException;
+import com.documind.exception.InvalidCredentialsException;
 import com.documind.exception.InvalidDocumentRequestException;
+import com.documind.exception.InvalidTokenException;
 import com.documind.exception.LlmProviderException;
 import com.documind.exception.ResourceNotFoundException;
 import com.documind.exception.UnsupportedDocumentTypeException;
@@ -20,6 +24,7 @@ import org.springframework.http.HttpStatus;
 import org.springframework.http.ProblemDetail;
 import org.springframework.http.ResponseEntity;
 import org.springframework.http.converter.HttpMessageNotReadableException;
+import org.springframework.security.access.AccessDeniedException;
 import org.springframework.validation.FieldError;
 import org.springframework.web.ErrorResponse;
 import org.springframework.web.bind.MethodArgumentNotValidException;
@@ -43,6 +48,8 @@ public class GlobalExceptionHandler {
     private static final String ERROR_CODE_PROPERTY = "errorCode";
     private static final String DEFAULT_OCTET_STREAM = "application/octet-stream";
     private static final String WWW_AUTHENTICATE_BEARER = "Bearer realm=\"DocuMind AI\"";
+    private static final String WWW_AUTHENTICATE_INVALID_TOKEN =
+        "Bearer realm=\"DocuMind AI\", error=\"invalid_token\"";
 
     @ExceptionHandler(InvalidDocumentRequestException.class)
     public ResponseEntity<ProblemDetail> handleInvalidRequest(
@@ -126,6 +133,92 @@ public class GlobalExceptionHandler {
         return ResponseEntity.status(HttpStatus.UNAUTHORIZED)
             .header(HttpHeaders.WWW_AUTHENTICATE, WWW_AUTHENTICATE_BEARER)
             .body(problem);
+    }
+
+    @ExceptionHandler(InvalidCredentialsException.class)
+    public ResponseEntity<ProblemDetail> handleInvalidCredentials(
+        InvalidCredentialsException ex,
+        HttpServletRequest request
+    ) {
+        ProblemDetail problem = buildProblem(
+            HttpStatus.UNAUTHORIZED,
+            "Invalid Credentials",
+            ex.getMessage(),
+            "INVALID_CREDENTIALS",
+            request
+        );
+        return ResponseEntity.status(HttpStatus.UNAUTHORIZED)
+            .header(HttpHeaders.WWW_AUTHENTICATE, WWW_AUTHENTICATE_BEARER)
+            .body(problem);
+    }
+
+    @ExceptionHandler(InvalidTokenException.class)
+    public ResponseEntity<ProblemDetail> handleInvalidToken(
+        InvalidTokenException ex,
+        HttpServletRequest request
+    ) {
+        String title = switch (ex.errorCode()) {
+            case InvalidTokenException.CODE_TOKEN_EXPIRED -> "Token Expired";
+            case InvalidTokenException.CODE_TOKEN_REVOKED -> "Token Revoked";
+            case InvalidTokenException.CODE_REFRESH_TOKEN_REUSED -> "Refresh Token Reused";
+            default -> "Invalid Token";
+        };
+        ProblemDetail problem = buildProblem(
+            HttpStatus.UNAUTHORIZED,
+            title,
+            ex.getMessage(),
+            ex.errorCode(),
+            request
+        );
+        return ResponseEntity.status(HttpStatus.UNAUTHORIZED)
+            .header(HttpHeaders.WWW_AUTHENTICATE, WWW_AUTHENTICATE_INVALID_TOKEN)
+            .body(problem);
+    }
+
+    @ExceptionHandler(AccountDisabledException.class)
+    public ResponseEntity<ProblemDetail> handleAccountDisabled(
+        AccountDisabledException ex,
+        HttpServletRequest request
+    ) {
+        ProblemDetail problem = buildProblem(
+            HttpStatus.FORBIDDEN,
+            "Account Disabled",
+            ex.getMessage(),
+            "ACCOUNT_DISABLED",
+            request
+        );
+        return ResponseEntity.of(problem).build();
+    }
+
+    @ExceptionHandler(AuthStateStoreUnavailableException.class)
+    public ResponseEntity<ProblemDetail> handleAuthStateStoreUnavailable(
+        AuthStateStoreUnavailableException ex,
+        HttpServletRequest request
+    ) {
+        log.error("Auth revocation store error on {}", request != null ? request.getRequestURI() : "unknown", ex);
+        ProblemDetail problem = buildProblem(
+            HttpStatus.SERVICE_UNAVAILABLE,
+            "Authentication Service Unavailable",
+            "Authentication revocation store is temporarily unavailable",
+            "AUTH_STATE_STORE_UNAVAILABLE",
+            request
+        );
+        return ResponseEntity.of(problem).build();
+    }
+
+    @ExceptionHandler(AccessDeniedException.class)
+    public ResponseEntity<ProblemDetail> handleSpringAccessDenied(
+        AccessDeniedException ex,
+        HttpServletRequest request
+    ) {
+        ProblemDetail problem = buildProblem(
+            HttpStatus.FORBIDDEN,
+            "Access Denied",
+            "Insufficient permissions to access this resource",
+            "ACCESS_DENIED",
+            request
+        );
+        return ResponseEntity.of(problem).build();
     }
 
     @ExceptionHandler(DocumentAccessDeniedException.class)
