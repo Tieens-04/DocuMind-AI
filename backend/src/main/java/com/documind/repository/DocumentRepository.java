@@ -39,6 +39,17 @@ public interface DocumentRepository extends JpaRepository<DocumentEntity, UUID>,
     @Modifying(clearAutomatically = true, flushAutomatically = true)
     @Query("""
         UPDATE DocumentEntity d
+        SET d.updatedAt = CURRENT_TIMESTAMP
+        WHERE d.id = :id
+          AND d.currentVersion = :version
+          AND d.status = com.documind.domain.enums.DocumentStatus.PROCESSING
+        """)
+    int touchProcessingHeartbeat(@Param("id") UUID id, @Param("version") int version);
+
+    @Transactional
+    @Modifying(clearAutomatically = true, flushAutomatically = true)
+    @Query("""
+        UPDATE DocumentEntity d
         SET d.status = com.documind.domain.enums.DocumentStatus.PROCESSING,
             d.chunkCount = 0,
             d.errorMessage = NULL

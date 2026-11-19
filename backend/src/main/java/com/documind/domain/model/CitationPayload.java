@@ -11,7 +11,18 @@ public record CitationPayload(
     @JsonProperty("documentId") UUID documentId,
     @JsonProperty("fileName") String fileName,
     @JsonProperty("pageNumber") Integer pageNumber,
+    @JsonProperty("sectionHeading") String sectionHeading,
     @JsonProperty("similarityScore") double similarityScore,
     @JsonProperty("excerpt") String excerpt
 ) {
+
+    public CitationPayload(
+        UUID documentId,
+        String fileName,
+        Integer pageNumber,
+        double similarityScore,
+        String excerpt
+    ) {
+        this(documentId, fileName, pageNumber, null, similarityScore, excerpt);
+    }
 }

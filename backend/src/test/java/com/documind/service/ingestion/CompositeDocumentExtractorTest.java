@@ -677,6 +677,28 @@ class CompositeDocumentExtractorTest {
         assertTempDirIsClean();
     }
 
+    @Test
+    void pdfExtractionStripsUnmappedNullGlyphsWhilePreservingVietnameseNfcText() throws Exception {
+        byte[] samplePdf = createVietnameseMultiPagePdf(List.of("Trang một."));
+        Path pdfFile = Files.write(tempDir.resolve("null-glyph.pdf"), samplePdf);
+
+        PdfDocumentExtractor nullGlyphPdfExtractor = new PdfDocumentExtractor(
+            properties,
+            path -> Map.of(1, java.text.Normalizer.normalize("Quy chế\u0000 nghỉ phép năm\u0000 12 ngày.", java.text.Normalizer.Form.NFD))
+        );
+
+        List<ExtractedSegment> segments = nullGlyphPdfExtractor.extract(pdfFile, "null-glyph.pdf");
+        assertThat(segments).hasSize(1);
+        assertThat(segments.getFirst().pageNumber()).isEqualTo(1);
+        assertThat(segments.getFirst().content())
+            .isEqualTo("Quy chế nghỉ phép năm 12 ngày.")
+            .doesNotContain("\u0000");
+        assertThat(java.text.Normalizer.isNormalized(segments.getFirst().content(), java.text.Normalizer.Form.NFC)).isTrue();
+
+        Files.deleteIfExists(pdfFile);
+        assertTempDirIsClean();
+    }
+
     private void assertMinioRoundTrip(
         String name,
         String ext,

@@ -24,6 +24,6 @@ public record CitationDto(
      * @since DA-15
      */
     public CitationPayload toCitationPayload() {
-        return new CitationPayload(documentId, fileName, pageNumber, similarityScore, excerpt);
+        return new CitationPayload(documentId, fileName, pageNumber, sectionHeading, similarityScore, excerpt);
     }
 }

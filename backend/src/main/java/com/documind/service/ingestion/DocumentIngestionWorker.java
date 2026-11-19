@@ -14,6 +14,7 @@ import org.springframework.context.event.EventListener;
 import org.springframework.core.task.AsyncTaskExecutor;
 import org.springframework.core.task.VirtualThreadTaskExecutor;
 import org.springframework.scheduling.annotation.Async;
+import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.event.TransactionPhase;
 import org.springframework.transaction.event.TransactionalEventListener;
@@ -87,6 +88,18 @@ public class DocumentIngestionWorker {
 
     @EventListener(ApplicationReadyEvent.class)
     public void recoverStaleDocumentsOnStartup() {
+        sweepStaleDocuments();
+    }
+
+    @Scheduled(
+        initialDelayString = "${documind.ingestion.worker.recovery-poll-interval-ms:60000}",
+        fixedDelayString = "${documind.ingestion.worker.recovery-poll-interval-ms:60000}"
+    )
+    public void recoverStaleDocumentsScheduled() {
+        sweepStaleDocuments();
+    }
+
+    private void sweepStaleDocuments() {
         if (!stateService.isPersistenceAvailable()) {
             return;
         }

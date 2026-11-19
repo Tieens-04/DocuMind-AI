@@ -6,6 +6,7 @@ package com.documind.service.rag;
 public final class RagConstants {
 
     public static final String SAFE_REFUSAL_MESSAGE = "Không tìm thấy thông tin trong tài liệu nội bộ";
+    public static final String PROVIDER_OLLAMA = "ollama";
     public static final String PROVIDER_GROQ = "groq";
     public static final String PROVIDER_GEMINI = "gemini";
     public static final String PROVIDER_GROQ_GEMINI_FAILOVER = "groq+gemini";

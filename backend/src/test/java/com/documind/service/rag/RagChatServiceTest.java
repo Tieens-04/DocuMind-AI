@@ -304,6 +304,32 @@ class RagChatServiceTest {
     }
 
     @Test
+    void askRecords502AuditAndThrowsLlmProviderExceptionWhenEmbeddingProviderFails() {
+        RagChatService service = createService("unconfigured-api-key", ragProperties);
+        CallerContext caller = new CallerContext(HR_USER_ID, HR_DEPT_ID, Role.STANDARD_EMPLOYEE, "10.10.0.9");
+        when(vectorRetrievalService.retrieve("Số ngày phép?", caller))
+            .thenThrow(new org.springframework.ai.retry.TransientAiException("Ollama connection refused"));
+
+        assertThatThrownBy(() -> service.ask("Số ngày phép?", caller))
+            .isInstanceOf(LlmProviderException.class)
+            .extracting(ex -> ((LlmProviderException) ex).provider())
+            .isEqualTo("ollama");
+
+        verifyNoInteractions(groqChatModel, geminiChatModel);
+
+        ArgumentCaptor<AuditLogEntity> auditCaptor = ArgumentCaptor.forClass(AuditLogEntity.class);
+        verify(auditLogRepository).save(auditCaptor.capture());
+        AuditLogEntity savedAudit = auditCaptor.getValue();
+        assertThat(savedAudit.getActionType()).isEqualTo(AuditActionType.CHAT_QUERY);
+        assertThat(savedAudit.getStatusCode()).isEqualTo(502);
+        assertThat(savedAudit.getProvider()).isEqualTo("ollama");
+        assertThat(savedAudit.isAbstained()).isTrue();
+        assertThat(savedAudit.getPromptTokens()).isZero();
+        assertThat(savedAudit.getCompletionTokens()).isZero();
+        assertThat(savedAudit.getIpAddress()).isEqualTo("10.10.0.9");
+    }
+
+    @Test
     void askRejectsOversizedQuestionInactiveUserAndSpoofedRole() {
         RagChatService service = createService("unconfigured-api-key", ragProperties);
         CallerContext caller = new CallerContext(HR_USER_ID, HR_DEPT_ID, Role.STANDARD_EMPLOYEE, null);

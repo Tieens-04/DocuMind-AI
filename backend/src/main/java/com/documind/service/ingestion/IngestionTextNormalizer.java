@@ -55,6 +55,12 @@ final class IngestionTextNormalizer {
                     }
                     out.append(buffer, 0, read);
                 }
+                if (out.indexOf("\0") >= 0) {
+                    throw new DocumentExtractionException(
+                        DocumentExtractionErrorCode.CORRUPT_DOCUMENT,
+                        "Binary null byte detected in extracted document text"
+                    );
+                }
                 return normalizeRawText(out.toString(), maxChars, displayName);
             }
         } catch (DocumentExtractionException ex) {
@@ -121,14 +127,8 @@ final class IngestionTextNormalizer {
         if (raw == null || raw.isEmpty()) {
             return "";
         }
-        if (raw.indexOf('\0') >= 0) {
-            throw new DocumentExtractionException(
-                DocumentExtractionErrorCode.CORRUPT_DOCUMENT,
-                "Binary null byte detected in extracted document text"
-            );
-        }
 
-        String cleaned = raw;
+        String cleaned = raw.indexOf('\0') >= 0 ? raw.replace("\0", "") : raw;
         if (cleaned.startsWith("\uFEFF")) {
             cleaned = cleaned.substring(1);
         }

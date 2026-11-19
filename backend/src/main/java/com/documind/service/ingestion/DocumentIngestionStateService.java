@@ -109,7 +109,7 @@ public class DocumentIngestionStateService {
         if (docVersion < 1) {
             return false;
         }
-        return documentRepository().existsByIdAndCurrentVersionAndStatus(documentId, docVersion, DocumentStatus.PROCESSING);
+        return documentRepository().touchProcessingHeartbeat(documentId, docVersion) > 0;
     }
 
     public void purgeVersionChunks(UUID documentId, int docVersion) {
@@ -137,6 +137,9 @@ public class DocumentIngestionStateService {
                 return false;
             }
             chunkRepo.deleteByDocumentIdAndVersionFromIndex(context.documentId(), context.docVersion(), chunkCount);
+            if (context.docVersion() > 1) {
+                chunkRepo.deleteByDocumentIdAndVersionLessThan(context.documentId(), context.docVersion());
+            }
             DocumentEntity current = docRepo.findById(context.documentId()).orElse(null);
             AccessLevel effectiveAccess = current != null ? current.getAccessLevel() : context.accessLevel();
             UUID effectiveDeptId = current != null ? current.getDepartmentId() : context.departmentId();

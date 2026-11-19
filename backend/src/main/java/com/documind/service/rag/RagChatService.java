@@ -27,6 +27,8 @@ import org.springframework.ai.chat.messages.UserMessage;
 import org.springframework.ai.chat.metadata.Usage;
 import org.springframework.ai.chat.model.ChatResponse;
 import org.springframework.ai.chat.prompt.Prompt;
+import org.springframework.ai.retry.NonTransientAiException;
+import org.springframework.ai.retry.TransientAiException;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.core.env.Environment;
@@ -34,6 +36,7 @@ import org.springframework.core.env.Profiles;
 import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.support.TransactionTemplate;
+import org.springframework.web.client.RestClientException;
 
 import java.util.List;
 import java.util.Objects;
@@ -99,7 +102,19 @@ public class RagChatService {
         String normalizedQuestion = normalizeAndValidateQuestion(rawQuestion);
         UserEntity verifiedActor = resolveVerifiedActor(caller);
 
-        List<RetrievedChunk> chunks = vectorRetrievalService.retrieve(normalizedQuestion, caller);
+        List<RetrievedChunk> chunks;
+        try {
+            chunks = vectorRetrievalService.retrieve(normalizedQuestion, caller);
+        } catch (TransientAiException | NonTransientAiException | RestClientException ex) {
+            long failureLatencyMs = elapsedMillis(startedAtNanos);
+            recordFailureAuditQuietly(verifiedActor, caller, normalizedQuestion, failureLatencyMs, RagConstants.PROVIDER_OLLAMA);
+            throw new LlmProviderException(RagConstants.PROVIDER_OLLAMA, "Embedding provider failed during vector retrieval", ex);
+        } catch (LlmProviderException ex) {
+            long failureLatencyMs = elapsedMillis(startedAtNanos);
+            String failedProvider = ex.provider() != null ? ex.provider() : RagConstants.PROVIDER_OLLAMA;
+            recordFailureAuditQuietly(verifiedActor, caller, normalizedQuestion, failureLatencyMs, failedProvider);
+            throw ex;
+        }
         if (chunks.isEmpty()) {
             long latencyMs = elapsedMillis(startedAtNanos);
             saveAuditLog(

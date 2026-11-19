@@ -46,13 +46,13 @@ Pick **one** compact visual matching the change type (do not stack all of them):
     validateExtensionAndSize (<= 50MB)
     streamToMinio + saveDocument(PENDING)
     publish DocumentUploadedEvent -> VirtualThread worker
-      extract (NFC) -> chunk (800/150) -> PgVectorStore.add -> COMPLETED
+      extract (NFC) -> chunk (512/100) -> PgVectorStore.add -> COMPLETED
   ```
 - **Module / package additions** -> shallow annotated file tree:
   ```text
   backend/src/main/java/com/documind/service/ingestion/
   ├── CompositeDocumentExtractor.java   # PDF (3-tier page-safe), DOCX (SAX+ZIP guard), MD, TXT
-  ├── OverlappingTokenTextSplitter.java # 800/150 CL100K_BASE boundary-safe splitter
+  ├── OverlappingTokenTextSplitter.java # 512/100 CL100K_BASE boundary-safe splitter
   └── SmartChunkingService.java         # Contextual heading prefix + deterministic UUIDs
   ```
 - **Targeted bugfix / rule change** -> minimal `diff` snippet highlighting the behavioral delta.

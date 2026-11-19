@@ -190,7 +190,7 @@ class RepositoryTransactionAndEntityProxyIntegrationTest {
             })
             .toList();
         assertThat(jsonPropertyNames).containsExactly(
-            "documentId", "fileName", "pageNumber", "similarityScore", "excerpt"
+            "documentId", "fileName", "pageNumber", "sectionHeading", "similarityScore", "excerpt"
         );
     }
 }

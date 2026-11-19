@@ -323,25 +323,31 @@ class VectorRetrievalServiceTest {
     }
 
     @Test
-    void citationDtoToCitationPayloadMapsStructuredFields() {
+    void citationDtoToCitationPayloadMapsStructuredFieldsIncludingSectionHeading() throws Exception {
         UUID docId = UUID.randomUUID();
         CitationDto dto = new CitationDto(
             docId,
-            "handbook.pdf",
-            7,
-            "Leave Policy",
+            "handbook.docx",
+            null,
+            "Chương 2 > Điều 5",
             0.9123d,
             "Nhân viên được nghỉ 12 ngày phép.",
-            "http://localhost:9000/documind-documents/handbook.pdf?sig=1#page=7"
+            "http://localhost:9000/documind-documents/handbook.docx?sig=1"
         );
         CitationPayload payload = dto.toCitationPayload();
         assertThat(payload).isEqualTo(new CitationPayload(
             docId,
-            "handbook.pdf",
-            7,
+            "handbook.docx",
+            null,
+            "Chương 2 > Điều 5",
             0.9123d,
             "Nhân viên được nghỉ 12 ngày phép."
         ));
+        assertThat(payload.sectionHeading()).isEqualTo("Chương 2 > Điều 5");
+        String json = new com.fasterxml.jackson.databind.ObjectMapper().writeValueAsString(payload);
+        assertThat(json)
+            .contains("\"sectionHeading\":\"Chương 2 > Điều 5\"")
+            .doesNotContain("presignedUrl");
     }
 
     private static Document chunk(

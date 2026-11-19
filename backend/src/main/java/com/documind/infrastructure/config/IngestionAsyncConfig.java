@@ -16,14 +16,17 @@ import org.springframework.core.task.VirtualThreadTaskExecutor;
 import org.springframework.retry.annotation.EnableRetry;
 import org.springframework.scheduling.annotation.AsyncAnnotationBeanPostProcessor;
 import org.springframework.scheduling.annotation.EnableAsync;
+import org.springframework.scheduling.annotation.EnableScheduling;
 
 /**
- * Configures Java 21 Virtual Thread execution and Spring Retry AOP support for asynchronous document ingestion
- * while preserving Spring Boot's primary {@code applicationTaskExecutor} for MVC/SSE and general async tasks.
+ * Configures Java 21 Virtual Thread execution, periodic recovery scheduling, and Spring Retry AOP support
+ * for asynchronous document ingestion while preserving Spring Boot's primary {@code applicationTaskExecutor}
+ * for MVC/SSE and general async tasks.
  */
 @Configuration
 @EnableAsync
 @EnableRetry
+@EnableScheduling
 public class IngestionAsyncConfig {
 
     private static final Logger log = LoggerFactory.getLogger(IngestionAsyncConfig.class);

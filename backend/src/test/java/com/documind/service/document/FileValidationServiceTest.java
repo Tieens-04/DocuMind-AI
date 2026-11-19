@@ -152,6 +152,24 @@ class FileValidationServiceTest {
     }
 
     @Test
+    void decomposedMacOsNfdFilenameIsNormalizedToPrecomposedNfc() throws IOException {
+        byte[] pdfBytes = "%PDF-1.7\n%%EOF\n".getBytes(StandardCharsets.US_ASCII);
+        String expectedNfc = "Sổ tay nhân sự 2026.pdf";
+        String macOsNfd = java.text.Normalizer.normalize(expectedNfc, java.text.Normalizer.Form.NFD);
+        assertThat(macOsNfd).isNotEqualTo(expectedNfc);
+
+        FileValidationResult result = validator.validateAndPrepareStream(
+            macOsNfd,
+            pdfBytes.length,
+            new ByteArrayInputStream(pdfBytes)
+        );
+
+        assertThat(result.originalName()).isEqualTo(expectedNfc);
+        assertThat(java.text.Normalizer.isNormalized(result.originalName(), java.text.Normalizer.Form.NFC)).isTrue();
+        assertThat(java.text.Normalizer.isNormalized(result.sanitizedFileName(), java.text.Normalizer.Form.NFC)).isTrue();
+    }
+
+    @Test
     void rejectsZeroOrNegativeDeclaredSizeAndEmptyStreamWithInvalidDocumentRequestException() {
         byte[] pdfBytes = "%PDF-1.4\n%%EOF\n".getBytes(StandardCharsets.US_ASCII);
 

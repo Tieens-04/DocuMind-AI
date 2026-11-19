@@ -19,7 +19,7 @@ spring:
       max-request-size: 52MB
       file-size-threshold: 2MB
   config:
-    import: optional:file:.env[.properties],optional:file:../.env[.properties]
+    import: optional:file:${DOCUMIND_ENV_FILE:.env}[.properties],optional:file:../${DOCUMIND_ENV_FILE:.env}[.properties]
   datasource:
     url: jdbc:postgresql://${POSTGRES_HOST:localhost}:${POSTGRES_PORT:5432}/${POSTGRES_DB:documind}
     username: ${POSTGRES_USER:documind}
@@ -132,6 +132,7 @@ documind:
       backoff-multiplier: 2.0
       max-backoff: 5s
       recovery-stale-after: 15m
+      recovery-poll-interval-ms: 60000
   rag:
     retrieval:
       top-k: ${RAG_TOP_K:5}
