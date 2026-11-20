@@ -3,6 +3,7 @@ package com.documind.service.document;
 import com.documind.controller.dto.DocumentResponse;
 import com.documind.controller.dto.DocumentStatusResponse;
 import com.documind.controller.dto.PageResponse;
+import com.documind.controller.dto.UpdateDocumentMetadataRequest;
 import com.documind.domain.entity.AuditLogEntity;
 import com.documind.domain.entity.DepartmentEntity;
 import com.documind.domain.entity.DocumentEntity;
@@ -940,6 +941,148 @@ class DocumentServiceTest {
             .satisfies(ex -> assertThat(ex.getMessage())
                 .doesNotContain("/tmp/tomcat-secret")
                 .doesNotContain("upload_123.tmp"));
+    }
+
+    @Test
+    void getDocumentEnforcesRoleAndDepartmentVisibilityPolicy() {
+        DepartmentEntity hrDept = department(HR_DEPT_ID, "HR");
+        DocumentEntity hrDeptDoc = document(DOC_ID, hrDept, AccessLevel.DEPARTMENT, DocumentStatus.COMPLETED);
+        DocumentEntity hrConfidentialDoc = document(UUID.randomUUID(), hrDept, AccessLevel.CONFIDENTIAL, DocumentStatus.COMPLETED);
+        DocumentEntity hrPublicDoc = document(UUID.randomUUID(), hrDept, AccessLevel.PUBLIC, DocumentStatus.COMPLETED);
+
+        when(documentRepository.findById(hrDeptDoc.getId())).thenReturn(Optional.of(hrDeptDoc));
+        when(documentRepository.findById(hrConfidentialDoc.getId())).thenReturn(Optional.of(hrConfidentialDoc));
+        when(documentRepository.findById(hrPublicDoc.getId())).thenReturn(Optional.of(hrPublicDoc));
+
+        CallerContext itManager = new CallerContext(null, IT_DEPT_ID, Role.DEPARTMENT_MANAGER, "127.0.0.1");
+        CallerContext hrManager = new CallerContext(null, HR_DEPT_ID, Role.DEPARTMENT_MANAGER, "127.0.0.1");
+        CallerContext hrEmployee = new CallerContext(null, HR_DEPT_ID, Role.STANDARD_EMPLOYEE, "127.0.0.1");
+        CallerContext sysAdmin = new CallerContext(null, IT_DEPT_ID, Role.SYSTEM_ADMIN, "127.0.0.1");
+
+        // IT Manager blocked on HR DEPARTMENT & HR CONFIDENTIAL, allowed on HR PUBLIC
+        assertThatThrownBy(() -> documentService.getDocument(hrDeptDoc.getId(), itManager))
+            .isInstanceOf(DocumentAccessDeniedException.class);
+        assertThatThrownBy(() -> documentService.getDocument(hrConfidentialDoc.getId(), itManager))
+            .isInstanceOf(DocumentAccessDeniedException.class);
+        assertThat(documentService.getDocument(hrPublicDoc.getId(), itManager).id()).isEqualTo(hrPublicDoc.getId());
+
+        // HR Manager sees all HR docs including CONFIDENTIAL
+        assertThat(documentService.getDocument(hrConfidentialDoc.getId(), hrManager).accessLevel())
+            .isEqualTo(AccessLevel.CONFIDENTIAL);
+
+        // HR Employee sees HR DEPARTMENT & PUBLIC, blocked on HR CONFIDENTIAL
+        assertThat(documentService.getDocument(hrDeptDoc.getId(), hrEmployee).id()).isEqualTo(hrDeptDoc.getId());
+        assertThatThrownBy(() -> documentService.getDocument(hrConfidentialDoc.getId(), hrEmployee))
+            .isInstanceOf(DocumentAccessDeniedException.class);
+
+        // SYSTEM_ADMIN sees everything
+        assertThat(documentService.getDocument(hrConfidentialDoc.getId(), sysAdmin).id())
+            .isEqualTo(hrConfidentialDoc.getId());
+    }
+
+    @Test
+    void updateDocumentMetadataEnforcesOwnershipExtensionParityAndAdminDepartmentTransfer() {
+        DepartmentEntity itDept = department(IT_DEPT_ID, "IT");
+        DepartmentEntity hrDept = department(HR_DEPT_ID, "HR");
+        DocumentEntity hrPublicDoc = document(DOC_ID, hrDept, AccessLevel.PUBLIC, DocumentStatus.COMPLETED);
+
+        when(documentRepository.findByIdForUpdate(DOC_ID)).thenReturn(Optional.of(hrPublicDoc));
+        when(documentRepository.saveAndFlush(any(DocumentEntity.class))).thenAnswer(inv -> inv.getArgument(0));
+
+        CallerContext itManager = new CallerContext(null, IT_DEPT_ID, Role.DEPARTMENT_MANAGER, "127.0.0.1");
+        CallerContext hrManager = new CallerContext(null, HR_DEPT_ID, Role.DEPARTMENT_MANAGER, "127.0.0.1");
+        CallerContext hrEmployee = new CallerContext(null, HR_DEPT_ID, Role.STANDARD_EMPLOYEE, "127.0.0.1");
+        CallerContext sysAdmin = new CallerContext(null, IT_DEPT_ID, Role.SYSTEM_ADMIN, "127.0.0.1");
+
+        // 1. Empty payload rejected (400)
+        assertThatThrownBy(() -> documentService.updateDocumentMetadata(
+            DOC_ID, new UpdateDocumentMetadataRequest(null, null, null), hrManager
+        )).isInstanceOf(InvalidDocumentRequestException.class);
+
+        // 2. STANDARD_EMPLOYEE cannot update (403)
+        assertThatThrownBy(() -> documentService.updateDocumentMetadata(
+            DOC_ID, new UpdateDocumentMetadataRequest(null, AccessLevel.DEPARTMENT, null), hrEmployee
+        )).isInstanceOf(DocumentAccessDeniedException.class);
+
+        // 3. IT Manager cannot update HR document even when it is PUBLIC (403)
+        assertThatThrownBy(() -> documentService.updateDocumentMetadata(
+            DOC_ID, new UpdateDocumentMetadataRequest(null, AccessLevel.DEPARTMENT, null), itManager
+        )).isInstanceOf(DocumentAccessDeniedException.class);
+
+        // 4. HR Manager cannot transfer document to another department (403)
+        assertThatThrownBy(() -> documentService.updateDocumentMetadata(
+            DOC_ID, new UpdateDocumentMetadataRequest(null, null, IT_DEPT_ID), hrManager
+        )).isInstanceOf(DocumentAccessDeniedException.class);
+
+        // 5. Rejects mismatched file extension and path traversal characters (400)
+        assertThatThrownBy(() -> documentService.updateDocumentMetadata(
+            DOC_ID, new UpdateDocumentMetadataRequest("renamed.docx", null, null), hrManager
+        )).isInstanceOf(InvalidDocumentRequestException.class);
+        assertThatThrownBy(() -> documentService.updateDocumentMetadata(
+            DOC_ID, new UpdateDocumentMetadataRequest("../evil.pdf", null, null), hrManager
+        )).isInstanceOf(InvalidDocumentRequestException.class);
+
+        // 6. HR Manager updates own doc accessLevel to CONFIDENTIAL & valid PDF name (V6 trigger owns cache bump)
+        DocumentResponse updatedByManager = documentService.updateDocumentMetadata(
+            DOC_ID,
+            new UpdateDocumentMetadataRequest("Quy chế nhân sự mới.pdf", AccessLevel.CONFIDENTIAL, null),
+            hrManager
+        );
+        assertThat(updatedByManager.accessLevel()).isEqualTo(AccessLevel.CONFIDENTIAL);
+        assertThat(updatedByManager.originalName()).isEqualTo("Quy chế nhân sự mới.pdf");
+        verify(departmentRepository, never()).incrementCacheVersion(any());
+        verify(departmentRepository, never()).incrementAllCacheVersions();
+
+        // 7. SYSTEM_ADMIN transferring department checks duplicate hash conflict (409)
+        DocumentEntity duplicateInIt = document(UUID.randomUUID(), itDept, AccessLevel.DEPARTMENT, DocumentStatus.COMPLETED);
+        when(departmentRepository.findById(IT_DEPT_ID)).thenReturn(Optional.of(itDept));
+        when(documentRepository.findByDepartmentIdAndFileHash(IT_DEPT_ID, hrPublicDoc.getFileHash()))
+            .thenReturn(Optional.of(duplicateInIt));
+
+        assertThatThrownBy(() -> documentService.updateDocumentMetadata(
+            DOC_ID, new UpdateDocumentMetadataRequest(null, null, IT_DEPT_ID), sysAdmin
+        )).isInstanceOf(DuplicateDocumentException.class);
+
+        // 8. SYSTEM_ADMIN transfers department cleanly when target hash is absent
+        when(documentRepository.findByDepartmentIdAndFileHash(IT_DEPT_ID, hrPublicDoc.getFileHash()))
+            .thenReturn(Optional.empty());
+        DocumentResponse transferred = documentService.updateDocumentMetadata(
+            DOC_ID, new UpdateDocumentMetadataRequest(null, AccessLevel.DEPARTMENT, IT_DEPT_ID), sysAdmin
+        );
+        assertThat(transferred.departmentId()).isEqualTo(IT_DEPT_ID);
+        assertThat(transferred.accessLevel()).isEqualTo(AccessLevel.DEPARTMENT);
+    }
+
+    @Test
+    void updateDocumentMetadataDuringProcessingBumpsVersionResetsPendingAndRepublishesEvent() {
+        DepartmentEntity hrDept = department(HR_DEPT_ID, "HR");
+        DocumentEntity processingDoc = document(DOC_ID, hrDept, AccessLevel.PUBLIC, DocumentStatus.PROCESSING);
+        processingDoc.setCurrentVersion(1);
+        processingDoc.setChunkCount(12);
+
+        when(documentRepository.findByIdForUpdate(DOC_ID)).thenReturn(Optional.of(processingDoc));
+        when(documentRepository.saveAndFlush(any(DocumentEntity.class))).thenAnswer(inv -> inv.getArgument(0));
+
+        CallerContext hrManager = new CallerContext(null, HR_DEPT_ID, Role.DEPARTMENT_MANAGER, "127.0.0.1");
+
+        DocumentResponse updated = documentService.updateDocumentMetadata(
+            DOC_ID,
+            new UpdateDocumentMetadataRequest("Locked Down.pdf", AccessLevel.CONFIDENTIAL, null),
+            hrManager
+        );
+
+        assertThat(updated.accessLevel()).isEqualTo(AccessLevel.CONFIDENTIAL);
+        assertThat(updated.originalName()).isEqualTo("Locked Down.pdf");
+        assertThat(updated.status()).isEqualTo(DocumentStatus.PENDING);
+        assertThat(updated.currentVersion()).isEqualTo(2);
+        assertThat(updated.chunkCount()).isEqualTo(0);
+
+        ArgumentCaptor<DocumentUploadedEvent> eventCaptor = ArgumentCaptor.forClass(DocumentUploadedEvent.class);
+        verify(eventPublisher).publishEvent(eventCaptor.capture());
+        assertThat(eventCaptor.getValue().documentId()).isEqualTo(DOC_ID);
+        assertThat(eventCaptor.getValue().version()).isEqualTo(2);
+        assertThat(eventCaptor.getValue().accessLevel()).isEqualTo(AccessLevel.CONFIDENTIAL);
+        assertThat(eventCaptor.getValue().originalName()).isEqualTo("Locked Down.pdf");
     }
 
     private void drainUploadStream() {
