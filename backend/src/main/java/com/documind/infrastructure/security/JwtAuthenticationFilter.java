@@ -118,7 +118,7 @@ public class JwtAuthenticationFilter extends OncePerRequestFilter {
         CustomUserDetails principal;
         try {
             AuthenticatedTokenClaims claims = jwtService.parseAndValidateAccessToken(token);
-            if (tokenBlacklistService.isBlacklisted(claims.jti())) {
+            if (tokenBlacklistService.isTokenRevoked(claims.jti(), claims.userId(), claims.issuedAt())) {
                 throw new InvalidTokenException(
                     InvalidTokenException.CODE_TOKEN_REVOKED,
                     "Access token has been revoked"

@@ -4,12 +4,14 @@ import com.documind.domain.entity.DocumentEntity;
 import com.documind.domain.enums.AccessLevel;
 import com.documind.domain.enums.DocumentStatus;
 import com.documind.domain.enums.Role;
+import jakarta.persistence.LockModeType;
 import jakarta.persistence.criteria.Predicate;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.Pageable;
 import org.springframework.data.jpa.domain.Specification;
 import org.springframework.data.jpa.repository.JpaRepository;
 import org.springframework.data.jpa.repository.JpaSpecificationExecutor;
+import org.springframework.data.jpa.repository.Lock;
 import org.springframework.data.jpa.repository.Modifying;
 import org.springframework.data.jpa.repository.Query;
 import org.springframework.data.repository.query.Param;
@@ -27,9 +29,15 @@ import java.util.UUID;
  */
 public interface DocumentRepository extends JpaRepository<DocumentEntity, UUID>, JpaSpecificationExecutor<DocumentEntity> {
 
+    boolean existsByDepartmentId(UUID departmentId);
+
     boolean existsByDepartmentIdAndFileHash(UUID departmentId, String fileHash);
 
     Optional<DocumentEntity> findByDepartmentIdAndFileHash(UUID departmentId, String fileHash);
+
+    @Lock(LockModeType.PESSIMISTIC_WRITE)
+    @Query("SELECT d FROM DocumentEntity d WHERE d.id = :id")
+    Optional<DocumentEntity> findByIdForUpdate(@Param("id") UUID id);
 
     List<DocumentEntity> findByDepartmentIdOrderByCreatedAtDesc(UUID departmentId);
 

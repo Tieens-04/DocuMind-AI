@@ -20,20 +20,24 @@ import org.springframework.security.web.context.SecurityContextRepository;
 import org.springframework.stereotype.Component;
 import org.springframework.web.filter.OncePerRequestFilter;
 import org.springframework.web.servlet.HandlerExceptionResolver;
+import org.springframework.web.util.UriUtils;
 
 import java.io.IOException;
+import java.nio.charset.StandardCharsets;
 import java.util.List;
 import java.util.Objects;
 
 /**
  * Opt-in legacy test/dev filter active strictly when {@code documind.security.dev-caller-fallback.enabled=true}
- * and {@code prod} is inactive. Never applies to {@code /api/v1/auth/**} or requests carrying an {@code Authorization} header.
+ * and {@code prod} is inactive. Never applies to {@code /api/v1/auth/**}, {@code /api/v1/admin/**},
+ * or requests carrying an {@code Authorization} header.
  */
 @Component
 @Conditional(DevCallerFallbackEnabledCondition.class)
 public class DevHeaderAuthenticationFilter extends OncePerRequestFilter {
 
     private static final String AUTH_PATH_PREFIX = "/api/v1/auth";
+    private static final String ADMIN_PATH_PREFIX = "/api/v1/admin";
 
     private final DevFallbackCallerContextResolver devFallbackCallerContextResolver;
     private final HandlerExceptionResolver handlerExceptionResolver;
@@ -73,9 +77,7 @@ public class DevHeaderAuthenticationFilter extends OncePerRequestFilter {
             filterChain.doFilter(request, response);
             return;
         }
-        String requestUri = request.getRequestURI();
-        if (requestUri != null
-            && (requestUri.equals(AUTH_PATH_PREFIX) || requestUri.startsWith(AUTH_PATH_PREFIX + "/"))) {
+        if (isProtectedPath(request)) {
             filterChain.doFilter(request, response);
             return;
         }
@@ -100,5 +102,45 @@ public class DevHeaderAuthenticationFilter extends OncePerRequestFilter {
         securityContextRepository.saveContext(context, request, response);
 
         filterChain.doFilter(request, response);
+    }
+
+    private static boolean isProtectedPath(HttpServletRequest request) {
+        if (matchesAnyProtectedPrefix(request.getServletPath())) {
+            return true;
+        }
+        String requestUri = request.getRequestURI();
+        if (requestUri == null) {
+            return false;
+        }
+        if (matchesAnyProtectedPrefix(requestUri)) {
+            return true;
+        }
+        String withoutContext = stripContextPath(requestUri, request.getContextPath());
+        if (matchesAnyProtectedPrefix(withoutContext)) {
+            return true;
+        }
+        try {
+            String decoded = UriUtils.decode(withoutContext, StandardCharsets.UTF_8);
+            return matchesAnyProtectedPrefix(decoded);
+        } catch (IllegalArgumentException ex) {
+            // Fail closed on malformed percent-encoding so dev fallback cannot bypass protected prefixes
+            return true;
+        }
+    }
+
+    private static String stripContextPath(String requestUri, String contextPath) {
+        if (contextPath != null && !contextPath.isEmpty() && requestUri.startsWith(contextPath)) {
+            return requestUri.substring(contextPath.length());
+        }
+        return requestUri;
+    }
+
+    private static boolean matchesAnyProtectedPrefix(String path) {
+        return matchesProtectedPrefix(path, AUTH_PATH_PREFIX)
+            || matchesProtectedPrefix(path, ADMIN_PATH_PREFIX);
+    }
+
+    private static boolean matchesProtectedPrefix(String path, String prefix) {
+        return path != null && (path.equals(prefix) || path.startsWith(prefix + "/"));
     }
 }

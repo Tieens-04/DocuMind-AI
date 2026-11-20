@@ -3,6 +3,7 @@ package com.documind.service.document;
 import com.documind.controller.dto.DocumentResponse;
 import com.documind.controller.dto.DocumentStatusResponse;
 import com.documind.controller.dto.PageResponse;
+import com.documind.controller.dto.UpdateDocumentMetadataRequest;
 import com.documind.domain.entity.AuditLogEntity;
 import com.documind.domain.entity.DepartmentEntity;
 import com.documind.domain.entity.DocumentEntity;
@@ -33,6 +34,7 @@ import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.PageRequest;
 import org.springframework.data.domain.Sort;
+import org.springframework.security.access.prepost.PreAuthorize;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.support.TransactionSynchronization;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
@@ -41,10 +43,13 @@ import org.springframework.web.multipart.MultipartFile;
 
 import java.io.IOException;
 import java.io.InputStream;
+import java.text.Normalizer;
+import java.util.Locale;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.UUID;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Supplier;
 
 /**
@@ -146,6 +151,7 @@ public class DocumentService {
      * Validates RBAC permissions and streams an uploaded document to MinIO outside any DB transaction,
      * then commits metadata, cache invalidation, audit log, and {@link DocumentUploadedEvent} atomically.
      */
+    @PreAuthorize("hasAnyRole('SYSTEM_ADMIN', 'DEPARTMENT_MANAGER')")
     public DocumentResponse uploadDocument(MultipartFile file, AccessLevel accessLevel, CallerContext caller) {
         return uploadDocument(file, accessLevel, null, caller);
     }
@@ -154,6 +160,7 @@ public class DocumentService {
      * Validates RBAC permissions (including optional target department for {@code SYSTEM_ADMIN})
      * and executes two-phase streaming upload + atomic metadata persistence.
      */
+    @PreAuthorize("hasAnyRole('SYSTEM_ADMIN', 'DEPARTMENT_MANAGER')")
     public DocumentResponse uploadDocument(
         MultipartFile file,
         AccessLevel accessLevel,
@@ -213,6 +220,7 @@ public class DocumentService {
      * {@code DEPARTMENT_MANAGER}: {@code PUBLIC} or own department; {@code STANDARD_EMPLOYEE}: {@code PUBLIC}
      * or own-department {@code DEPARTMENT}, never {@code CONFIDENTIAL}) intersected with optional filters.
      */
+    @PreAuthorize("hasAnyRole('SYSTEM_ADMIN', 'DEPARTMENT_MANAGER', 'STANDARD_EMPLOYEE')")
     public PageResponse<DocumentResponse> listDocuments(
         UUID filterDepartmentId,
         DocumentStatus status,
@@ -246,9 +254,22 @@ public class DocumentService {
     }
 
     /**
+     * Returns full metadata for a single document, enforcing role and classification isolation via {@link DocumentVisibilityPolicy}.
+     */
+    @PreAuthorize("hasAnyRole('SYSTEM_ADMIN', 'DEPARTMENT_MANAGER', 'STANDARD_EMPLOYEE')")
+    public DocumentResponse getDocument(UUID documentId, CallerContext caller) {
+        return DocumentResponse.from(loadReadableDocument(documentId, caller));
+    }
+
+    /**
      * Returns ingestion status for a document, enforcing role and classification isolation via {@link DocumentVisibilityPolicy}.
      */
+    @PreAuthorize("hasAnyRole('SYSTEM_ADMIN', 'DEPARTMENT_MANAGER', 'STANDARD_EMPLOYEE')")
     public DocumentStatusResponse getDocumentStatus(UUID documentId, CallerContext caller) {
+        return DocumentStatusResponse.from(loadReadableDocument(documentId, caller));
+    }
+
+    private DocumentEntity loadReadableDocument(UUID documentId, CallerContext caller) {
         if (documentId == null) {
             throw new InvalidDocumentRequestException("Document ID must not be null");
         }
@@ -261,13 +282,144 @@ public class DocumentService {
         if (!DocumentVisibilityPolicy.canRead(caller, document.getDepartmentId(), document.getAccessLevel())) {
             throw new DocumentAccessDeniedException("You do not have permission to access this document");
         }
-        return DocumentStatusResponse.from(document);
+        return document;
+    }
+
+    /**
+     * Updates document metadata ({@code originalName}, {@code accessLevel}, and {@code departmentId} for {@code SYSTEM_ADMIN}).
+     * Relies on the PostgreSQL V6 trigger {@code trg_propagate_document_rbac_to_chunks} to atomically sync
+     * {@code document_chunks.metadata} and increment {@code departments.cache_version} with deadlock-free lock ordering.
+     * If ingestion is actively {@code PROCESSING} when chunk-synced metadata changes, increments {@code currentVersion},
+     * resets status to {@code PENDING}, and republishes {@link DocumentUploadedEvent} so in-flight workers fence cleanly.
+     */
+    @PreAuthorize("hasAnyRole('SYSTEM_ADMIN', 'DEPARTMENT_MANAGER')")
+    public DocumentResponse updateDocumentMetadata(
+        UUID documentId,
+        UpdateDocumentMetadataRequest request,
+        CallerContext caller
+    ) {
+        if (documentId == null) {
+            throw new InvalidDocumentRequestException("Document ID must not be null");
+        }
+        if (request == null
+            || (request.originalName() == null
+                && request.accessLevel() == null
+                && request.departmentId() == null)) {
+            throw new InvalidDocumentRequestException(
+                "At least one updatable field (originalName, accessLevel, departmentId) must be provided"
+            );
+        }
+        requireCaller(caller);
+        if (!caller.canManageDocuments()) {
+            throw new DocumentAccessDeniedException("Insufficient permissions to update documents");
+        }
+        requireCallerDepartment(caller);
+
+        AtomicReference<TransferTarget> transferTargetRef = new AtomicReference<>();
+
+        try {
+            DocumentResponse updated = transactionTemplate().execute(status -> {
+                resolveVerifiedActor(caller, caller.isSystemAdmin() ? null : caller.departmentId());
+                DocumentEntity document = documentRepository().findByIdForUpdate(documentId)
+                    .orElseThrow(() -> new DocumentNotFoundException(documentId));
+
+                if (!caller.isSystemAdmin() && !Objects.equals(caller.departmentId(), document.getDepartmentId())) {
+                    throw new DocumentAccessDeniedException("You do not have permission to update this document");
+                }
+
+                boolean chunkSyncedMetadataChanged = false;
+
+                if (request.departmentId() != null && !Objects.equals(request.departmentId(), document.getDepartmentId())) {
+                    if (!caller.isSystemAdmin()) {
+                        throw new DocumentAccessDeniedException("Only SYSTEM_ADMIN can transfer document department ownership");
+                    }
+                    DepartmentEntity targetDepartment = departmentRepository().findById(request.departmentId())
+                        .orElseThrow(() -> new ResourceNotFoundException("Department not found: " + request.departmentId()));
+                    Optional<DocumentEntity> existingInTarget = documentRepository()
+                        .findByDepartmentIdAndFileHash(targetDepartment.getId(), document.getFileHash());
+                    if (existingInTarget.isPresent()) {
+                        throw new DuplicateDocumentException(
+                            existingInTarget.get().getId(),
+                            document.getFileHash(),
+                            "A document with identical content already exists in the target department"
+                        );
+                    }
+                    transferTargetRef.set(new TransferTarget(targetDepartment.getId(), document.getFileHash()));
+                    document.setDepartment(targetDepartment);
+                    chunkSyncedMetadataChanged = true;
+                }
+
+                if (request.originalName() != null) {
+                    String normalizedName = normalizeAndValidateOriginalName(
+                        request.originalName(),
+                        document.getFileExtension()
+                    );
+                    if (!Objects.equals(normalizedName, document.getOriginalName())) {
+                        document.setOriginalName(normalizedName);
+                        chunkSyncedMetadataChanged = true;
+                    }
+                }
+
+                if (request.accessLevel() != null && request.accessLevel() != document.getAccessLevel()) {
+                    document.setAccessLevel(request.accessLevel());
+                    chunkSyncedMetadataChanged = true;
+                }
+
+                boolean requeueActiveIngestion = document.getStatus() == DocumentStatus.PROCESSING
+                    && chunkSyncedMetadataChanged;
+                if (requeueActiveIngestion) {
+                    int nextVersion = (document.getCurrentVersion() != null ? document.getCurrentVersion() : 1) + 1;
+                    document.setCurrentVersion(nextVersion);
+                    document.setStatus(DocumentStatus.PENDING);
+                    document.setChunkCount(0);
+                    document.setErrorMessage(null);
+                }
+
+                DocumentEntity saved = documentRepository().saveAndFlush(document);
+                if (requeueActiveIngestion) {
+                    eventPublisher.publishEvent(new DocumentUploadedEvent(
+                        saved.getId(),
+                        saved.getDepartmentId(),
+                        saved.getStorageKey(),
+                        saved.getOriginalName(),
+                        saved.getFileExtension(),
+                        saved.getAccessLevel(),
+                        saved.getCurrentVersion()
+                    ));
+                }
+                return DocumentResponse.from(saved);
+            });
+
+            log.info(
+                "SECURITY_AUDIT action=DOC_METADATA_UPDATE actorUserId={} documentId={} departmentId={} accessLevel={}",
+                caller.userId(),
+                updated.id(),
+                updated.departmentId(),
+                updated.accessLevel()
+            );
+            return updated;
+        } catch (DataIntegrityViolationException ex) {
+            TransferTarget transferTarget = transferTargetRef.get();
+            if (transferTarget != null) {
+                Optional<DocumentEntity> winner = documentRepository()
+                    .findByDepartmentIdAndFileHash(transferTarget.departmentId(), transferTarget.fileHash());
+                if (winner.isPresent()) {
+                    throw new DuplicateDocumentException(
+                        winner.get().getId(),
+                        transferTarget.fileHash(),
+                        "A document with identical content already exists in the target department"
+                    );
+                }
+            }
+            throw ex;
+        }
     }
 
     /**
      * Hard-deletes a document (cascading {@code document_chunks}), bumps cache versions, logs {@code DOC_DELETE},
      * and deletes the MinIO object strictly in {@link TransactionSynchronization#afterCommit()}.
      */
+    @PreAuthorize("hasAnyRole('SYSTEM_ADMIN', 'DEPARTMENT_MANAGER')")
     public void deleteDocument(UUID documentId, CallerContext caller) {
         long startedAtNanos = System.nanoTime();
         if (documentId == null) {
@@ -523,6 +675,34 @@ public class DocumentService {
         }
     }
 
+    private static String normalizeAndValidateOriginalName(String rawName, String requiredExtension) {
+        if (rawName == null || rawName.isBlank()) {
+            throw new InvalidDocumentRequestException("Document originalName must not be blank");
+        }
+        String normalized = Normalizer.normalize(rawName.trim(), Normalizer.Form.NFC);
+        if (normalized.length() > 255) {
+            throw new InvalidDocumentRequestException("Document originalName must not exceed 255 characters");
+        }
+        if (normalized.contains("/") || normalized.contains("\\") || normalized.contains("..")) {
+            throw new InvalidDocumentRequestException("Document originalName contains disallowed path characters");
+        }
+        for (int i = 0; i < normalized.length(); i++) {
+            char ch = normalized.charAt(i);
+            if (ch <= 0x1F || ch == 0x7F) {
+                throw new InvalidDocumentRequestException("Document originalName contains control characters");
+            }
+        }
+        String expectedSuffix = "." + Objects.requireNonNull(requiredExtension, "fileExtension must not be null")
+            .toLowerCase(Locale.ROOT);
+        if (!normalized.toLowerCase(Locale.ROOT).endsWith(expectedSuffix)
+            || normalized.length() <= expectedSuffix.length()) {
+            throw new InvalidDocumentRequestException(
+                "Document originalName must preserve the original '" + expectedSuffix + "' file extension"
+            );
+        }
+        return normalized;
+    }
+
     private DocumentRepository documentRepository() {
         return documentRepositorySupplier.get();
     }
@@ -541,6 +721,9 @@ public class DocumentService {
 
     private TransactionTemplate transactionTemplate() {
         return transactionTemplateSupplier.get();
+    }
+
+    private record TransferTarget(UUID departmentId, String fileHash) {
     }
 
     private record StagedUpload(
