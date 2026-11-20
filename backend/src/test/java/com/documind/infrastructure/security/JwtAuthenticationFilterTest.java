@@ -82,7 +82,7 @@ class JwtAuthenticationFilterTest {
         UUID deptId = UUID.randomUUID();
         UserEntity user = buildUser(userId, deptId, "manager.hr@documind.ai", "HR Manager", Role.DEPARTMENT_MANAGER);
         JwtService.IssuedAccessToken issued = jwtService.generateAccessToken(user);
-        when(tokenBlacklistService.isBlacklisted(issued.jti())).thenReturn(false);
+        when(tokenBlacklistService.isTokenRevoked(issued.jti(), userId, FIXED_NOW)).thenReturn(false);
 
         MockHttpServletRequest initialRequest = new MockHttpServletRequest("GET", "/api/v1/chat/stream");
         initialRequest.addHeader(HttpHeaders.AUTHORIZATION, "Bearer " + issued.token());
@@ -105,7 +105,7 @@ class JwtAuthenticationFilterTest {
         assertThat(filter.shouldNotFilterAsyncDispatch()).isFalse();
         filter.doFilter(initialRequest, initialResponse, initialChain);
 
-        verify(tokenBlacklistService, times(1)).isBlacklisted(issued.jti());
+        verify(tokenBlacklistService, times(1)).isTokenRevoked(issued.jti(), userId, FIXED_NOW);
         org.springframework.security.web.context.RequestAttributeSecurityContextRepository repo =
             new org.springframework.security.web.context.RequestAttributeSecurityContextRepository();
         org.springframework.security.core.context.SecurityContext savedContext = repo.loadDeferredContext(initialRequest).get();
@@ -127,14 +127,15 @@ class JwtAuthenticationFilterTest {
         filter.doFilter(asyncRequest, asyncResponse, asyncChain);
 
         // Redis was still only checked once on initial REQUEST dispatch
-        verify(tokenBlacklistService, times(1)).isBlacklisted(issued.jti());
+        verify(tokenBlacklistService, times(1)).isTokenRevoked(issued.jti(), userId, FIXED_NOW);
     }
 
     @Test
     void rejectsBlacklistedTokenWith401ProblemDetailAndWwwAuthenticateHeader() throws Exception {
-        UserEntity user = buildUser(UUID.randomUUID(), UUID.randomUUID(), "user@documind.ai", "User", Role.STANDARD_EMPLOYEE);
+        UUID userId = UUID.randomUUID();
+        UserEntity user = buildUser(userId, UUID.randomUUID(), "user@documind.ai", "User", Role.STANDARD_EMPLOYEE);
         JwtService.IssuedAccessToken issued = jwtService.generateAccessToken(user);
-        when(tokenBlacklistService.isBlacklisted(issued.jti())).thenReturn(true);
+        when(tokenBlacklistService.isTokenRevoked(issued.jti(), userId, FIXED_NOW)).thenReturn(true);
 
         MockHttpServletRequest request = new MockHttpServletRequest("GET", "/api/v1/auth/me");
         request.addHeader(HttpHeaders.AUTHORIZATION, "Bearer " + issued.token());
@@ -247,10 +248,11 @@ class JwtAuthenticationFilterTest {
 
     @Test
     void delegatesToHandlerExceptionResolverFailClosedWhenRedisBlacklistStoreUnavailable() throws Exception {
-        UserEntity user = buildUser(UUID.randomUUID(), UUID.randomUUID(), "u@documind.ai", "U", Role.STANDARD_EMPLOYEE);
+        UUID userId = UUID.randomUUID();
+        UserEntity user = buildUser(userId, UUID.randomUUID(), "u@documind.ai", "U", Role.STANDARD_EMPLOYEE);
         JwtService.IssuedAccessToken issued = jwtService.generateAccessToken(user);
         AuthStateStoreUnavailableException storeDown = new AuthStateStoreUnavailableException("Redis unavailable");
-        when(tokenBlacklistService.isBlacklisted(issued.jti())).thenThrow(storeDown);
+        when(tokenBlacklistService.isTokenRevoked(issued.jti(), userId, FIXED_NOW)).thenThrow(storeDown);
 
         MockHttpServletRequest request = new MockHttpServletRequest("GET", "/api/v1/documents");
         request.addHeader(HttpHeaders.AUTHORIZATION, "Bearer " + issued.token());
@@ -275,6 +277,45 @@ class JwtAuthenticationFilterTest {
         verify(chain).doFilter(request, response);
         verifyNoInteractions(tokenBlacklistService);
         assertThat(SecurityContextHolder.getContext().getAuthentication()).isNull();
+    }
+
+    @Test
+    void devHeaderAuthenticationFilterSkipsAdminEndpoints() throws Exception {
+        com.documind.service.document.DevFallbackCallerContextResolver resolver =
+            mock(com.documind.service.document.DevFallbackCallerContextResolver.class);
+        DevHeaderAuthenticationFilter devFilter = new DevHeaderAuthenticationFilter(resolver, handlerExceptionResolver);
+
+        for (String adminPath : new String[]{
+            "/api/v1/admin",
+            "/api/v1/admin/departments",
+            "/api/v1/admin/users",
+            "/api/v1/%61dmin/users",
+            "/api/v1/%61dmin/departments"
+        }) {
+            MockHttpServletRequest request = new MockHttpServletRequest("GET", adminPath);
+            request.setRequestURI(adminPath);
+            request.addHeader("X-User-Role", "SYSTEM_ADMIN");
+            MockHttpServletResponse response = new MockHttpServletResponse();
+            FilterChain chain = mock(FilterChain.class);
+
+            devFilter.doFilter(request, response, chain);
+
+            verify(chain).doFilter(request, response);
+            assertThat(SecurityContextHolder.getContext().getAuthentication()).isNull();
+        }
+
+        // Also skip when servlet context-path prefixes /api/v1/admin/**
+        MockHttpServletRequest contextPathRequest = new MockHttpServletRequest("GET", "/documind/api/v1/admin/users");
+        contextPathRequest.setContextPath("/documind");
+        contextPathRequest.setServletPath("/api/v1/admin/users");
+        contextPathRequest.setRequestURI("/documind/api/v1/admin/users");
+        contextPathRequest.addHeader("X-User-Role", "SYSTEM_ADMIN");
+        MockHttpServletResponse contextResp = new MockHttpServletResponse();
+        FilterChain contextChain = mock(FilterChain.class);
+        devFilter.doFilter(contextPathRequest, contextResp, contextChain);
+        verify(contextChain).doFilter(contextPathRequest, contextResp);
+        assertThat(SecurityContextHolder.getContext().getAuthentication()).isNull();
+        verifyNoInteractions(resolver);
     }
 
     private static UserEntity buildUser(UUID userId, UUID deptId, String email, String fullName, Role role) {

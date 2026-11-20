@@ -55,6 +55,13 @@ class JwtServiceTest {
         assertThat(claims.role()).isEqualTo(Role.DEPARTMENT_MANAGER);
         assertThat(claims.issuedAt()).isEqualTo(FIXED_NOW);
         assertThat(claims.expiresAt()).isEqualTo(FIXED_NOW.plus(Duration.ofMinutes(15)));
+        assertThat(jwtService.accessTokenTtl()).isEqualTo(Duration.ofMinutes(15));
+
+        // Second token issued at the exact same wall-clock instant receives strictly greater monotonic iatMs
+        JwtService.IssuedAccessToken secondIssued = jwtService.generateAccessToken(user);
+        AuthenticatedTokenClaims secondClaims = jwtService.parseAndValidateAccessToken(secondIssued.token());
+        assertThat(secondClaims.issuedAt()).isAfter(claims.issuedAt());
+        assertThat(secondClaims.issuedAt().toEpochMilli()).isEqualTo(FIXED_NOW.toEpochMilli() + 1L);
     }
 
     @Test

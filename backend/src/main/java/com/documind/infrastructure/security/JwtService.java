@@ -36,20 +36,43 @@ public class JwtService {
     private static final String CLAIM_EMAIL = "email";
     private static final String CLAIM_FULL_NAME = "fullName";
     private static final String CLAIM_ROLE = "role";
+    private static final String CLAIM_ISSUED_AT_MILLIS = "iatMs";
 
     private final JwtProperties properties;
     private final SecretKey signingKey;
     private final JwtParser jwtParser;
     private final Clock clock;
+    private final MonotonicClockMillis monotonicClockMillis;
 
     @Autowired
+    public JwtService(
+        JwtProperties properties,
+        Environment environment,
+        MonotonicClockMillis monotonicClockMillis
+    ) {
+        this(properties, environment, Clock.systemUTC(), monotonicClockMillis);
+    }
+
     public JwtService(JwtProperties properties, Environment environment) {
-        this(properties, environment, Clock.systemUTC());
+        this(properties, environment, Clock.systemUTC(), new MonotonicClockMillis());
     }
 
     public JwtService(JwtProperties properties, Environment environment, Clock clock) {
+        this(properties, environment, clock, new MonotonicClockMillis());
+    }
+
+    public JwtService(
+        JwtProperties properties,
+        Environment environment,
+        Clock clock,
+        MonotonicClockMillis monotonicClockMillis
+    ) {
         this.properties = Objects.requireNonNull(properties, "properties must not be null");
         this.clock = Objects.requireNonNull(clock, "clock must not be null");
+        this.monotonicClockMillis = Objects.requireNonNull(
+            monotonicClockMillis,
+            "monotonicClockMillis must not be null"
+        );
         validateDurations(properties);
         this.signingKey = validateAndBuildSigningKey(properties.secret(), environment);
         this.jwtParser = Jwts.parser()
@@ -68,7 +91,8 @@ public class JwtService {
         UUID departmentId = Objects.requireNonNull(user.getDepartmentId(), "user.departmentId must not be null");
         Role role = Objects.requireNonNull(user.getRole(), "user.role must not be null");
 
-        Instant now = clock.instant();
+        long issuedAtMillis = monotonicClockMillis.nextMillis(clock);
+        Instant now = Instant.ofEpochMilli(issuedAtMillis);
         Instant expiresAt = now.plus(properties.accessTokenTtl());
         String jti = UUID.randomUUID().toString();
 
@@ -82,6 +106,7 @@ public class JwtService {
             .claim(CLAIM_EMAIL, user.getEmail())
             .claim(CLAIM_FULL_NAME, user.getFullName())
             .claim(CLAIM_ROLE, role.name())
+            .claim(CLAIM_ISSUED_AT_MILLIS, issuedAtMillis)
             .signWith(signingKey)
             .compact();
 
@@ -113,6 +138,7 @@ public class JwtService {
             if (issuedAtDate == null || expirationDate == null) {
                 throw new InvalidTokenException(InvalidTokenException.CODE_INVALID_TOKEN, "Access token timestamps are missing");
             }
+            Instant issuedAt = resolveIssuedAt(claims, issuedAtDate);
             return new AuthenticatedTokenClaims(
                 jti,
                 userId,
@@ -120,7 +146,7 @@ public class JwtService {
                 email,
                 fullName,
                 role,
-                issuedAtDate.toInstant(),
+                issuedAt,
                 expirationDate.toInstant()
             );
         } catch (ExpiredJwtException ex) {
@@ -132,8 +158,20 @@ public class JwtService {
         }
     }
 
+    public Duration accessTokenTtl() {
+        return properties.accessTokenTtl();
+    }
+
     public Duration refreshTokenTtl() {
         return properties.refreshTokenTtl();
+    }
+
+    private static Instant resolveIssuedAt(Claims claims, Date issuedAtDate) {
+        Object rawIssuedAtMillis = claims.get(CLAIM_ISSUED_AT_MILLIS);
+        if (rawIssuedAtMillis instanceof Number number) {
+            return Instant.ofEpochMilli(number.longValue());
+        }
+        return issuedAtDate.toInstant();
     }
 
     private static void validateDurations(JwtProperties properties) {
