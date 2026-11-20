@@ -15,7 +15,7 @@ public final class DevCallerFallbackEnabledCondition implements Condition {
 
     static final String PROPERTY_ENABLED = "documind.security.dev-caller-fallback.enabled";
 
-    static boolean isDevFallbackActive(Environment env) {
+    public static boolean isDevFallbackActive(Environment env) {
         return env != null
             && !env.acceptsProfiles(Profiles.of("prod"))
             && env.acceptsProfiles(Profiles.of("dev", "local"))
