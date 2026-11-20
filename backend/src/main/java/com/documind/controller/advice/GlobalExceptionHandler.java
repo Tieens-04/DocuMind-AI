@@ -1,6 +1,7 @@
 package com.documind.controller.advice;
 
 import com.documind.exception.AccountDisabledException;
+import com.documind.exception.AdminConflictException;
 import com.documind.exception.AuthStateStoreUnavailableException;
 import com.documind.exception.AuthenticationRequiredException;
 import com.documind.exception.DocumentAccessDeniedException;
@@ -8,6 +9,7 @@ import com.documind.exception.DocumentNotFoundException;
 import com.documind.exception.DocumentStorageException;
 import com.documind.exception.DocumentTooLargeException;
 import com.documind.exception.DuplicateDocumentException;
+import com.documind.exception.InvalidAdminRequestException;
 import com.documind.exception.InvalidChatRequestException;
 import com.documind.exception.InvalidCredentialsException;
 import com.documind.exception.InvalidDocumentRequestException;
@@ -333,6 +335,44 @@ public class GlobalExceptionHandler {
             "Invalid Chat Request",
             ex.getMessage(),
             "INVALID_CHAT_REQUEST",
+            request
+        );
+        return ResponseEntity.of(problem).build();
+    }
+
+    @ExceptionHandler(InvalidAdminRequestException.class)
+    public ResponseEntity<ProblemDetail> handleInvalidAdminRequest(
+        InvalidAdminRequestException ex,
+        HttpServletRequest request
+    ) {
+        ProblemDetail problem = buildProblem(
+            HttpStatus.BAD_REQUEST,
+            "Invalid Admin Request",
+            ex.getMessage(),
+            "INVALID_ADMIN_REQUEST",
+            request
+        );
+        return ResponseEntity.of(problem).build();
+    }
+
+    @ExceptionHandler(AdminConflictException.class)
+    public ResponseEntity<ProblemDetail> handleAdminConflict(
+        AdminConflictException ex,
+        HttpServletRequest request
+    ) {
+        String title = switch (ex.errorCode()) {
+            case AdminConflictException.CODE_DUPLICATE_DEPARTMENT_CODE -> "Duplicate Department Code";
+            case AdminConflictException.CODE_DEPARTMENT_IN_USE -> "Department In Use";
+            case AdminConflictException.CODE_DUPLICATE_EMAIL -> "Duplicate User Email";
+            case AdminConflictException.CODE_ADMIN_SELF_MODIFICATION_FORBIDDEN -> "Admin Self Modification Forbidden";
+            case AdminConflictException.CODE_LAST_ACTIVE_ADMIN -> "Last Active Admin Protected";
+            default -> "Administrative Conflict";
+        };
+        ProblemDetail problem = buildProblem(
+            HttpStatus.CONFLICT,
+            title,
+            ex.getMessage(),
+            ex.errorCode(),
             request
         );
         return ResponseEntity.of(problem).build();
