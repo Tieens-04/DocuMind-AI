@@ -18,6 +18,7 @@ import com.documind.repository.AuditLogRepository;
 import com.documind.repository.DepartmentRepository;
 import com.documind.repository.UserRepository;
 import com.documind.service.document.CallerContext;
+import com.documind.service.document.DevCallerFallbackEnabledCondition;
 import com.documind.service.document.DevFallbackCallerContextResolver;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -32,8 +33,8 @@ import org.springframework.ai.retry.TransientAiException;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.core.env.Environment;
-import org.springframework.core.env.Profiles;
 import org.springframework.http.HttpStatus;
+import org.springframework.security.access.prepost.PreAuthorize;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.support.TransactionTemplate;
 import org.springframework.web.client.RestClientException;
@@ -45,7 +46,8 @@ import java.util.concurrent.TimeUnit;
 
 /**
  * Orchestrates synchronous grounded RAG question answering with deterministic zero-token refusal,
- * RBAC vector retrieval, optional Groq-to-Gemini failover, and cost/latency audit logging.
+ * {@code SecurityContextHolder}-enforced RBAC vector retrieval, pre-prompt Defense-in-Depth checks,
+ * optional Groq-to-Gemini failover, and cost/latency audit logging.
  */
 @Service
 public class RagChatService {
@@ -56,6 +58,7 @@ public class RagChatService {
 
     private final VectorRetrievalService vectorRetrievalService;
     private final GroundedSystemPromptService groundedSystemPromptService;
+    private final RbacVectorFilterFactory rbacVectorFilterFactory;
     private final ChatClient groqChatClient;
     private final ObjectProvider<ChatClient> geminiChatClientProvider;
     private final ObjectProvider<UserRepository> userRepositoryProvider;
@@ -69,6 +72,7 @@ public class RagChatService {
     public RagChatService(
         VectorRetrievalService vectorRetrievalService,
         GroundedSystemPromptService groundedSystemPromptService,
+        RbacVectorFilterFactory rbacVectorFilterFactory,
         ChatClient groqChatClient,
         @Qualifier("geminiChatClient") ObjectProvider<ChatClient> geminiChatClientProvider,
         ObjectProvider<UserRepository> userRepositoryProvider,
@@ -81,6 +85,7 @@ public class RagChatService {
     ) {
         this.vectorRetrievalService = Objects.requireNonNull(vectorRetrievalService, "vectorRetrievalService must not be null");
         this.groundedSystemPromptService = Objects.requireNonNull(groundedSystemPromptService, "groundedSystemPromptService must not be null");
+        this.rbacVectorFilterFactory = Objects.requireNonNull(rbacVectorFilterFactory, "rbacVectorFilterFactory must not be null");
         this.groqChatClient = Objects.requireNonNull(groqChatClient, "groqChatClient must not be null");
         this.geminiChatClientProvider = Objects.requireNonNull(geminiChatClientProvider, "geminiChatClientProvider must not be null");
         this.userRepositoryProvider = Objects.requireNonNull(userRepositoryProvider, "userRepositoryProvider must not be null");
@@ -96,30 +101,48 @@ public class RagChatService {
      * Executes grounded RAG retrieval and synchronous generation outside any database transaction,
      * short-circuiting with zero LLM tokens whenever retrieval produces no eligible chunks.
      */
+    @PreAuthorize("hasAnyRole('SYSTEM_ADMIN', 'DEPARTMENT_MANAGER', 'STANDARD_EMPLOYEE')")
     public ChatAskResponse ask(String rawQuestion, CallerContext caller) {
+        return ask(rawQuestion, null, caller);
+    }
+
+    /**
+     * Executes grounded RAG retrieval with optional {@code SYSTEM_ADMIN}-only {@code filterDepartmentId}
+     * scoping, dual-layer Java Defense-in-Depth checks, and caller-department FinOps audit attribution.
+     */
+    @PreAuthorize("hasAnyRole('SYSTEM_ADMIN', 'DEPARTMENT_MANAGER', 'STANDARD_EMPLOYEE')")
+    public ChatAskResponse ask(String rawQuestion, UUID filterDepartmentId, CallerContext caller) {
         long startedAtNanos = System.nanoTime();
-        requireCaller(caller);
+        RbacVectorScope rbacScope = rbacVectorFilterFactory.resolveScope(caller, filterDepartmentId);
+        CallerContext verifiedCaller = rbacScope.caller();
         String normalizedQuestion = normalizeAndValidateQuestion(rawQuestion);
-        UserEntity verifiedActor = resolveVerifiedActor(caller);
+        UserEntity verifiedActor = resolveVerifiedActor(verifiedCaller);
+
+        if (rbacScope.filterDepartmentId() != null
+            && !departmentRepositoryProvider.getObject().existsById(rbacScope.filterDepartmentId())) {
+            throw new ResourceNotFoundException("Department not found: " + rbacScope.filterDepartmentId());
+        }
+
+        UUID auditDepartmentId = resolveAuditDepartmentId(rbacScope);
 
         List<RetrievedChunk> chunks;
         try {
-            chunks = vectorRetrievalService.retrieve(normalizedQuestion, caller);
+            chunks = vectorRetrievalService.retrieve(normalizedQuestion, rbacScope);
         } catch (TransientAiException | NonTransientAiException | RestClientException ex) {
             long failureLatencyMs = elapsedMillis(startedAtNanos);
-            recordFailureAuditQuietly(verifiedActor, caller, normalizedQuestion, failureLatencyMs, RagConstants.PROVIDER_OLLAMA);
+            recordFailureAuditQuietly(verifiedActor, auditDepartmentId, verifiedCaller.ipAddress(), normalizedQuestion, failureLatencyMs, RagConstants.PROVIDER_OLLAMA);
             throw new LlmProviderException(RagConstants.PROVIDER_OLLAMA, "Embedding provider failed during vector retrieval", ex);
         } catch (LlmProviderException ex) {
             long failureLatencyMs = elapsedMillis(startedAtNanos);
             String failedProvider = ex.provider() != null ? ex.provider() : RagConstants.PROVIDER_OLLAMA;
-            recordFailureAuditQuietly(verifiedActor, caller, normalizedQuestion, failureLatencyMs, failedProvider);
+            recordFailureAuditQuietly(verifiedActor, auditDepartmentId, verifiedCaller.ipAddress(), normalizedQuestion, failureLatencyMs, failedProvider);
             throw ex;
         }
         if (chunks.isEmpty()) {
             long latencyMs = elapsedMillis(startedAtNanos);
             saveAuditLog(
                 verifiedActor,
-                caller.departmentId(),
+                auditDepartmentId,
                 normalizedQuestion,
                 true,
                 0,
@@ -127,7 +150,7 @@ public class RagChatService {
                 latencyMs,
                 null,
                 HttpStatus.OK.value(),
-                caller.ipAddress()
+                verifiedCaller.ipAddress()
             );
             return new ChatAskResponse(
                 RagConstants.SAFE_REFUSAL_MESSAGE,
@@ -140,7 +163,8 @@ public class RagChatService {
             );
         }
 
-        Message systemMessage = groundedSystemPromptService.buildSystemMessage(chunks);
+        // Layer 2b Pre-Prompt Hard Guard enforced inside GroundedSystemPromptService via rbacScope.assertAllAuthorized
+        Message systemMessage = groundedSystemPromptService.buildSystemMessage(chunks, rbacScope);
         Prompt prompt = new Prompt(List.of(systemMessage, new UserMessage(normalizedQuestion)));
 
         ProviderResult result;
@@ -149,7 +173,7 @@ public class RagChatService {
         } catch (LlmProviderException ex) {
             long failureLatencyMs = elapsedMillis(startedAtNanos);
             String failedProvider = ex.provider() != null ? ex.provider() : RagConstants.PROVIDER_GROQ;
-            recordFailureAuditQuietly(verifiedActor, caller, normalizedQuestion, failureLatencyMs, failedProvider);
+            recordFailureAuditQuietly(verifiedActor, auditDepartmentId, verifiedCaller.ipAddress(), normalizedQuestion, failureLatencyMs, failedProvider);
             throw ex;
         }
 
@@ -162,7 +186,7 @@ public class RagChatService {
 
         saveAuditLog(
             verifiedActor,
-            caller.departmentId(),
+            auditDepartmentId,
             normalizedQuestion,
             llmRefused,
             result.promptTokens(),
@@ -170,7 +194,7 @@ public class RagChatService {
             latencyMs,
             result.provider(),
             HttpStatus.OK.value(),
-            caller.ipAddress()
+            verifiedCaller.ipAddress()
         );
 
         return new ChatAskResponse(
@@ -255,7 +279,6 @@ public class RagChatService {
         return normalized;
     }
 
-    // TODO(DA-12): Consolidate active/role verification into JWT SecurityFilterChain and use UserRepository.getReferenceById for audit FK.
     private UserEntity resolveVerifiedActor(CallerContext caller) {
         UUID userId = caller.userId();
         if (userId == null) {
@@ -263,7 +286,7 @@ public class RagChatService {
         }
         UserEntity user = userRepositoryProvider.getObject().findById(userId)
             .orElseGet(() -> {
-                if (isDevFallbackActive(environment)
+                if (DevCallerFallbackEnabledCondition.isDevFallbackActive(environment)
                     && DevFallbackCallerContextResolver.DEFAULT_DEV_USER_ID.equals(userId)) {
                     return null;
                 }
@@ -287,9 +310,16 @@ public class RagChatService {
         return user;
     }
 
+    private static UUID resolveAuditDepartmentId(RbacVectorScope rbacScope) {
+        return rbacScope.caller().departmentId() != null
+            ? rbacScope.caller().departmentId()
+            : rbacScope.filterDepartmentId();
+    }
+
     private void recordFailureAuditQuietly(
         UserEntity verifiedActor,
-        CallerContext caller,
+        UUID auditDepartmentId,
+        String ipAddress,
         String queryText,
         long latencyMs,
         String failedProvider
@@ -297,7 +327,7 @@ public class RagChatService {
         try {
             saveAuditLog(
                 verifiedActor,
-                caller.departmentId(),
+                auditDepartmentId,
                 queryText,
                 true,
                 0,
@@ -305,7 +335,7 @@ public class RagChatService {
                 latencyMs,
                 failedProvider,
                 HttpStatus.BAD_GATEWAY.value(),
-                caller.ipAddress()
+                ipAddress
             );
         } catch (RuntimeException auditEx) {
             log.warn("Failed to persist failure audit log for chat ask: {}", auditEx.getMessage());
@@ -345,15 +375,6 @@ public class RagChatService {
         });
     }
 
-    private static void requireCaller(CallerContext caller) {
-        if (caller == null || caller.role() == null) {
-            throw new InvalidChatRequestException("Caller context and role must not be null");
-        }
-        if (!caller.isSystemAdmin() && caller.departmentId() == null) {
-            throw new InvalidChatRequestException("Caller departmentId must not be null");
-        }
-    }
-
     private static boolean isSafeRefusalResponse(String answer) {
         String stripped = stripRefusalWrappers(answer);
         int refusalLen = RagConstants.SAFE_REFUSAL_MESSAGE.length();
@@ -390,13 +411,6 @@ public class RagChatService {
             || ch == '”'
             || ch == '`'
             || ch == '*';
-    }
-
-    private static boolean isDevFallbackActive(Environment environment) {
-        return environment != null
-            && !environment.acceptsProfiles(Profiles.of("prod"))
-            && environment.acceptsProfiles(Profiles.of("dev", "local"))
-            && Boolean.parseBoolean(environment.getProperty("documind.security.dev-caller-fallback.enabled", "false"));
     }
 
     private static long elapsedMillis(long startedAtNanos) {

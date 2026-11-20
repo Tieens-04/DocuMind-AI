@@ -36,14 +36,14 @@ public class ChatController {
     @PostMapping("/ask")
     @Operation(
         summary = "Ask grounded RAG question",
-        description = "Retrieves RBAC-scoped chunks from pgvector and answers strictly from document context with citations, or returns a deterministic zero-token refusal"
+        description = "Retrieves RBAC-scoped chunks from pgvector using SecurityContextHolder (with optional departmentId filtering exclusively for SYSTEM_ADMIN), verifies chunks with Java Defense-in-Depth, and answers strictly from document context with citations or returns a deterministic zero-token refusal"
     )
     public ResponseEntity<ChatAskResponse> ask(
         @Valid @RequestBody ChatAskRequest requestBody,
         HttpServletRequest request
     ) {
         CallerContext caller = callerContextResolver.resolve(request);
-        ChatAskResponse response = ragChatService.ask(requestBody.question(), caller);
+        ChatAskResponse response = ragChatService.ask(requestBody.question(), requestBody.departmentId(), caller);
         return ResponseEntity.ok(response);
     }
 }

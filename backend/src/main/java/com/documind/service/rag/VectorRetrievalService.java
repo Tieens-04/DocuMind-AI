@@ -9,7 +9,6 @@ import com.documind.exception.InvalidChatRequestException;
 import com.documind.infrastructure.storage.MinioStorageService;
 import com.documind.repository.DocumentRepository;
 import com.documind.service.document.CallerContext;
-import com.documind.service.document.DocumentVisibilityPolicy;
 import com.documind.service.ingestion.ChunkMetadataKeys;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -18,8 +17,8 @@ import org.springframework.ai.document.DocumentMetadata;
 import org.springframework.ai.vectorstore.SearchRequest;
 import org.springframework.ai.vectorstore.VectorStore;
 import org.springframework.ai.vectorstore.filter.Filter;
-import org.springframework.ai.vectorstore.filter.FilterExpressionBuilder;
 import org.springframework.beans.factory.ObjectProvider;
+import org.springframework.security.access.prepost.PreAuthorize;
 import org.springframework.stereotype.Service;
 
 import java.net.URL;
@@ -28,6 +27,7 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
@@ -38,8 +38,9 @@ import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 
 /**
- * Executes RBAC-filtered semantic similarity retrieval over {@code pgvector} and validates candidate chunks
- * against published document versions before emitting structured citations with MinIO presigned URLs.
+ * Executes RBAC-filtered semantic similarity retrieval over {@code pgvector} using {@link RbacVectorFilterFactory}
+ * and enforces Java-layer Defense-in-Depth verification against both chunk JSONB metadata and published parent
+ * {@link DocumentEntity} records before emitting structured citations with MinIO presigned URLs.
  */
 @Service
 public class VectorRetrievalService {
@@ -52,17 +53,20 @@ public class VectorRetrievalService {
     private final ObjectProvider<VectorStore> vectorStoreProvider;
     private final ObjectProvider<DocumentRepository> documentRepositoryProvider;
     private final MinioStorageService minioStorageService;
+    private final RbacVectorFilterFactory rbacVectorFilterFactory;
     private final RagProperties properties;
 
     public VectorRetrievalService(
         ObjectProvider<VectorStore> vectorStoreProvider,
         ObjectProvider<DocumentRepository> documentRepositoryProvider,
         MinioStorageService minioStorageService,
+        RbacVectorFilterFactory rbacVectorFilterFactory,
         RagProperties properties
     ) {
         this.vectorStoreProvider = Objects.requireNonNull(vectorStoreProvider, "vectorStoreProvider must not be null");
         this.documentRepositoryProvider = Objects.requireNonNull(documentRepositoryProvider, "documentRepositoryProvider must not be null");
         this.minioStorageService = Objects.requireNonNull(minioStorageService, "minioStorageService must not be null");
+        this.rbacVectorFilterFactory = Objects.requireNonNull(rbacVectorFilterFactory, "rbacVectorFilterFactory must not be null");
         this.properties = Objects.requireNonNull(properties, "properties must not be null");
     }
 
@@ -70,16 +74,51 @@ public class VectorRetrievalService {
      * Retrieves up to {@code topK} published, RBAC-authorized chunks exceeding {@code similarityThreshold}
      * without holding a database transaction across embedding HTTP or MinIO operations.
      */
+    @PreAuthorize("hasAnyRole('SYSTEM_ADMIN', 'DEPARTMENT_MANAGER', 'STANDARD_EMPLOYEE')")
     public List<RetrievedChunk> retrieve(String question, CallerContext caller) {
+        return retrieve(question, caller, null);
+    }
+
+    /**
+     * Retrieves up to {@code topK} published, RBAC-authorized chunks scoped by {@code SecurityContextHolder}
+     * and an optional {@code SYSTEM_ADMIN}-only {@code requestedDepartmentId} filter.
+     */
+    @PreAuthorize("hasAnyRole('SYSTEM_ADMIN', 'DEPARTMENT_MANAGER', 'STANDARD_EMPLOYEE')")
+    public List<RetrievedChunk> retrieve(String question, CallerContext caller, UUID requestedDepartmentId) {
+        RbacVectorScope rbacScope = rbacVectorFilterFactory.resolveScope(caller, requestedDepartmentId);
+        return retrieveWithVerifiedScope(question, rbacScope);
+    }
+
+    /**
+     * Retrieves up to {@code topK} published, RBAC-authorized chunks using a pre-resolved {@link RbacVectorScope},
+     * re-validating scope authority against {@code SecurityContextHolder} before executing {@code pgvector} search.
+     */
+    @PreAuthorize("hasAnyRole('SYSTEM_ADMIN', 'DEPARTMENT_MANAGER', 'STANDARD_EMPLOYEE')")
+    public List<RetrievedChunk> retrieve(String question, RbacVectorScope rbacScope) {
+        Objects.requireNonNull(rbacScope, "rbacScope must not be null");
+        RbacVectorScope verifiedScope = rbacVectorFilterFactory.resolveScope(
+            rbacScope.caller(),
+            rbacScope.filterDepartmentId()
+        );
+        return retrieveWithVerifiedScope(question, verifiedScope);
+    }
+
+    /**
+     * Builds the mandatory {@code pgvector} metadata filter for a verified {@link CallerContext}.
+     */
+    public Filter.Expression buildRbacFilter(CallerContext caller) {
+        return RbacVectorFilterFactory.buildFilterExpression(caller, null);
+    }
+
+    private List<RetrievedChunk> retrieveWithVerifiedScope(String question, RbacVectorScope rbacScope) {
         String normalizedQuestion = normalizeQuery(question);
-        Filter.Expression rbacFilter = buildRbacFilter(caller);
         double threshold = properties.retrieval().similarityThreshold();
 
         SearchRequest searchRequest = SearchRequest.builder()
             .query(normalizedQuestion)
             .topK(properties.retrieval().candidateFetchLimit())
             .similarityThreshold(threshold)
-            .filterExpression(rbacFilter)
+            .filterExpression(rbacScope.filterExpression())
             .build();
 
         List<Document> rawHits = vectorStoreProvider.getObject().similaritySearch(searchRequest);
@@ -90,7 +129,7 @@ public class VectorRetrievalService {
         List<ParsedCandidate> candidates = new ArrayList<>(rawHits.size());
         Set<UUID> documentIds = new LinkedHashSet<>();
         for (Document hit : rawHits) {
-            ParsedCandidate parsed = parseCandidate(hit);
+            ParsedCandidate parsed = parseAndAuthorizeCandidate(hit, rbacScope);
             if (parsed != null && parsed.similarityScore() >= threshold) {
                 candidates.add(parsed);
                 documentIds.add(parsed.documentId());
@@ -115,7 +154,7 @@ public class VectorRetrievalService {
                 break;
             }
             DocumentEntity parent = parentsById.get(candidate.documentId());
-            if (!isEligibleChunk(caller, parent, candidate.docVersion())) {
+            if (!isEligibleChunk(rbacScope, parent, candidate)) {
                 continue;
             }
 
@@ -138,6 +177,8 @@ public class VectorRetrievalService {
             verified.add(new RetrievedChunk(
                 candidate.chunkId(),
                 parent.getId(),
+                parent.getDepartmentId(),
+                parent.getAccessLevel(),
                 candidate.chunkIndex(),
                 candidate.content(),
                 citation
@@ -145,41 +186,6 @@ public class VectorRetrievalService {
         }
 
         return List.copyOf(verified);
-    }
-
-    /**
-     * Builds the mandatory {@code pgvector} metadata filter strictly from server-resolved caller identity.
-     */
-    public Filter.Expression buildRbacFilter(CallerContext caller) {
-        if (caller == null || caller.role() == null) {
-            throw new InvalidChatRequestException("Caller context and role must not be null");
-        }
-        FilterExpressionBuilder builder = new FilterExpressionBuilder();
-        return switch (caller.role()) {
-            case SYSTEM_ADMIN -> builder.in(
-                ChunkMetadataKeys.ACCESS_LEVEL,
-                AccessLevel.PUBLIC.name(),
-                AccessLevel.DEPARTMENT.name(),
-                AccessLevel.CONFIDENTIAL.name()
-            ).build();
-            case DEPARTMENT_MANAGER -> {
-                UUID departmentId = requireDepartmentId(caller);
-                yield builder.or(
-                    builder.eq(ChunkMetadataKeys.ACCESS_LEVEL, AccessLevel.PUBLIC.name()),
-                    builder.eq(ChunkMetadataKeys.DEPARTMENT_ID, departmentId.toString())
-                ).build();
-            }
-            case STANDARD_EMPLOYEE -> {
-                UUID departmentId = requireDepartmentId(caller);
-                yield builder.or(
-                    builder.eq(ChunkMetadataKeys.ACCESS_LEVEL, AccessLevel.PUBLIC.name()),
-                    builder.and(
-                        builder.eq(ChunkMetadataKeys.DEPARTMENT_ID, departmentId.toString()),
-                        builder.eq(ChunkMetadataKeys.ACCESS_LEVEL, AccessLevel.DEPARTMENT.name())
-                    )
-                ).build();
-            }
-        };
     }
 
     static String normalizeQuery(String rawQuestion) {
@@ -214,24 +220,41 @@ public class VectorRetrievalService {
         }
     }
 
-    private static boolean isEligibleChunk(CallerContext caller, DocumentEntity parent, int chunkDocVersion) {
+    private static boolean isEligibleChunk(
+        RbacVectorScope rbacScope,
+        DocumentEntity parent,
+        ParsedCandidate candidate
+    ) {
         if (parent == null || parent.getStatus() != DocumentStatus.COMPLETED) {
             return false;
         }
-        if (parent.getCurrentVersion() == null || parent.getCurrentVersion() != chunkDocVersion) {
+        if (parent.getCurrentVersion() == null || parent.getCurrentVersion() != candidate.docVersion()) {
             return false;
         }
-        return DocumentVisibilityPolicy.canRead(caller, parent.getDepartmentId(), parent.getAccessLevel());
-    }
-
-    private static UUID requireDepartmentId(CallerContext caller) {
-        if (caller.departmentId() == null) {
-            throw new InvalidChatRequestException("Caller departmentId must not be null for non-admin queries");
+        boolean parentAuthorized = rbacScope.allows(parent.getDepartmentId(), parent.getAccessLevel());
+        boolean metadataDrifted = !Objects.equals(parent.getDepartmentId(), candidate.departmentId())
+            || parent.getAccessLevel() != candidate.accessLevel();
+        if (!parentAuthorized || metadataDrifted) {
+            log.error(
+                "SECURITY_ALERT action=VECTOR_RBAC_POST_FILTER_DROP reason={} chunkId={} documentId={} actorUserId={} actorRole={} actorDeptId={} filterDeptId={} chunkDeptId={} chunkAccessLevel={} parentDeptId={} parentAccessLevel={}",
+                !parentAuthorized ? "PARENT_UNAUTHORIZED" : "CHUNK_PARENT_METADATA_DRIFT",
+                candidate.chunkId(),
+                candidate.documentId(),
+                rbacScope.caller().userId(),
+                rbacScope.caller().role(),
+                rbacScope.caller().departmentId(),
+                rbacScope.filterDepartmentId(),
+                candidate.departmentId(),
+                candidate.accessLevel(),
+                parent.getDepartmentId(),
+                parent.getAccessLevel()
+            );
+            return false;
         }
-        return caller.departmentId();
+        return true;
     }
 
-    private static ParsedCandidate parseCandidate(Document hit) {
+    private static ParsedCandidate parseAndAuthorizeCandidate(Document hit, RbacVectorScope rbacScope) {
         if (hit == null || hit.getMetadata() == null) {
             return null;
         }
@@ -241,6 +264,33 @@ public class VectorRetrievalService {
         Integer chunkIndex = parseInteger(metadata.get(ChunkMetadataKeys.CHUNK_INDEX));
         if (documentId == null || docVersion == null || docVersion < 1) {
             log.warn("Skipping vector chunk {} with missing/invalid document_id or doc_version", hit.getId());
+            return null;
+        }
+
+        UUID chunkDepartmentId = parseUuid(metadata.get(ChunkMetadataKeys.DEPARTMENT_ID));
+        AccessLevel chunkAccessLevel = parseAccessLevel(metadata.get(ChunkMetadataKeys.ACCESS_LEVEL));
+        if (chunkDepartmentId == null || chunkAccessLevel == null) {
+            log.error(
+                "SECURITY_ALERT action=VECTOR_CHUNK_INVALID_RBAC_METADATA chunkId={} documentId={} actorUserId={} actorRole={}",
+                hit.getId(),
+                documentId,
+                rbacScope.caller().userId(),
+                rbacScope.caller().role()
+            );
+            return null;
+        }
+        if (!rbacScope.allows(chunkDepartmentId, chunkAccessLevel)) {
+            log.error(
+                "SECURITY_ALERT action=VECTOR_RBAC_POST_FILTER_DROP reason=CHUNK_METADATA_UNAUTHORIZED chunkId={} documentId={} actorUserId={} actorRole={} actorDeptId={} filterDeptId={} chunkDeptId={} chunkAccessLevel={}",
+                hit.getId(),
+                documentId,
+                rbacScope.caller().userId(),
+                rbacScope.caller().role(),
+                rbacScope.caller().departmentId(),
+                rbacScope.filterDepartmentId(),
+                chunkDepartmentId,
+                chunkAccessLevel
+            );
             return null;
         }
 
@@ -255,6 +305,8 @@ public class VectorRetrievalService {
         return new ParsedCandidate(
             hit.getId(),
             documentId,
+            chunkDepartmentId,
+            chunkAccessLevel,
             docVersion,
             chunkIndex != null && chunkIndex >= 0 ? chunkIndex : 0,
             pageNumber,
@@ -262,6 +314,20 @@ public class VectorRetrievalService {
             score,
             content
         );
+    }
+
+    private static AccessLevel parseAccessLevel(Object value) {
+        if (value instanceof AccessLevel level) {
+            return level;
+        }
+        if (value instanceof String str && !str.isBlank()) {
+            try {
+                return AccessLevel.valueOf(str.trim().toUpperCase(Locale.ROOT));
+            } catch (IllegalArgumentException ignored) {
+                return null;
+            }
+        }
+        return null;
     }
 
     private static double resolveSimilarityScore(Document hit, Map<String, Object> metadata) {
@@ -359,6 +425,8 @@ public class VectorRetrievalService {
     private record ParsedCandidate(
         String chunkId,
         UUID documentId,
+        UUID departmentId,
+        AccessLevel accessLevel,
         int docVersion,
         int chunkIndex,
         Integer pageNumber,
