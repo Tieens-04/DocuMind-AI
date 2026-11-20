@@ -7,24 +7,37 @@ import com.documind.domain.enums.AccessLevel;
 import com.documind.domain.enums.DocumentStatus;
 import com.documind.domain.enums.Role;
 import com.documind.domain.model.CitationPayload;
+import com.documind.exception.AuthenticationRequiredException;
+import com.documind.exception.DocumentAccessDeniedException;
 import com.documind.exception.DocumentStorageException;
 import com.documind.exception.InvalidChatRequestException;
+import com.documind.infrastructure.security.CustomUserDetails;
 import com.documind.infrastructure.storage.MinioStorageService;
 import com.documind.repository.DocumentRepository;
 import com.documind.service.document.CallerContext;
 import com.documind.service.ingestion.ChunkMetadataKeys;
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.ArgumentCaptor;
 import org.springframework.ai.document.Document;
 import org.springframework.ai.vectorstore.SearchRequest;
 import org.springframework.ai.vectorstore.VectorStore;
 import org.springframework.ai.vectorstore.filter.Filter;
 import org.springframework.beans.factory.ObjectProvider;
+import org.springframework.boot.test.system.CapturedOutput;
+import org.springframework.boot.test.system.OutputCaptureExtension;
+import org.springframework.mock.env.MockEnvironment;
+import org.springframework.security.access.prepost.PreAuthorize;
+import org.springframework.security.authentication.UsernamePasswordAuthenticationToken;
+import org.springframework.security.core.context.SecurityContextHolder;
 
+import java.lang.reflect.Method;
 import java.net.URI;
 import java.net.URL;
 import java.text.Normalizer;
+import java.time.Instant;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -41,30 +54,45 @@ import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
 
+@ExtendWith(OutputCaptureExtension.class)
 class VectorRetrievalServiceTest {
 
     private static final UUID HR_DEPT_ID = UUID.fromString("22222222-2222-2222-2222-222222222222");
     private static final UUID IT_DEPT_ID = UUID.fromString("11111111-1111-1111-1111-111111111111");
+    private static final UUID SALES_DEPT_ID = UUID.fromString("33333333-3333-3333-3333-333333333333");
     private static final UUID USER_ID = UUID.fromString("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb");
+    private static final UUID ADMIN_USER_ID = UUID.fromString("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa");
 
     private VectorStore vectorStore;
     private DocumentRepository documentRepository;
     private MinioStorageService minioStorageService;
+    private RbacVectorFilterFactory rbacVectorFilterFactory;
     private RagProperties properties;
     private VectorRetrievalService retrievalService;
 
     @BeforeEach
     void setUp() {
+        SecurityContextHolder.clearContext();
         vectorStore = mock(VectorStore.class);
         documentRepository = mock(DocumentRepository.class);
         minioStorageService = mock(MinioStorageService.class);
+        MockEnvironment env = new MockEnvironment();
+        env.setActiveProfiles("dev");
+        env.setProperty("documind.security.dev-caller-fallback.enabled", "false");
+        rbacVectorFilterFactory = new RbacVectorFilterFactory(env);
         properties = RagProperties.defaults();
         retrievalService = new VectorRetrievalService(
             providerOf(vectorStore),
             providerOf(documentRepository),
             minioStorageService,
+            rbacVectorFilterFactory,
             properties
         );
+    }
+
+    @AfterEach
+    void tearDown() {
+        SecurityContextHolder.clearContext();
     }
 
     @Test
@@ -136,7 +164,7 @@ class VectorRetrievalServiceTest {
             new Filter.Value(HR_DEPT_ID.toString())
         ));
 
-        CallerContext adminWithoutDept = new CallerContext(USER_ID, null, Role.SYSTEM_ADMIN, "127.0.0.1");
+        CallerContext adminWithoutDept = new CallerContext(ADMIN_USER_ID, null, Role.SYSTEM_ADMIN, "127.0.0.1");
         Filter.Expression adminFilter = retrievalService.buildRbacFilter(adminWithoutDept);
         assertThat(adminFilter.type()).isEqualTo(Filter.ExpressionType.IN);
         assertThat(adminFilter.left()).isEqualTo(new Filter.Key(ChunkMetadataKeys.ACCESS_LEVEL));
@@ -153,8 +181,29 @@ class VectorRetrievalServiceTest {
     }
 
     @Test
+    void retrieveFailsClosedWhenSecurityContextIsMissingOrMismatched() {
+        CallerContext hrEmployee = new CallerContext(USER_ID, HR_DEPT_ID, Role.STANDARD_EMPLOYEE, "127.0.0.1");
+
+        assertThatThrownBy(() -> retrievalService.retrieve("Quy định nghỉ phép?", hrEmployee))
+            .isInstanceOf(AuthenticationRequiredException.class);
+
+        setJwtPrincipal(USER_ID, SALES_DEPT_ID, Role.STANDARD_EMPLOYEE);
+        assertThatThrownBy(() -> retrievalService.retrieve("Quy định nghỉ phép?", hrEmployee))
+            .isInstanceOf(DocumentAccessDeniedException.class);
+
+        assertThatThrownBy(() -> retrievalService.retrieve(
+            "Quy định nghỉ phép?",
+            new CallerContext(USER_ID, SALES_DEPT_ID, Role.STANDARD_EMPLOYEE, "127.0.0.1"),
+            HR_DEPT_ID
+        )).isInstanceOf(DocumentAccessDeniedException.class);
+
+        verifyNoInteractions(vectorStore, documentRepository, minioStorageService);
+    }
+
+    @Test
     void retrieveNormalizesNfcCallsVectorStoreOnceAndFiltersOutProcessingStaleAndUnauthorizedChunks() throws Exception {
         CallerContext hrEmployee = new CallerContext(USER_ID, HR_DEPT_ID, Role.STANDARD_EMPLOYEE, "127.0.0.1");
+        setJwtPrincipal(USER_ID, HR_DEPT_ID, Role.STANDARD_EMPLOYEE);
         UUID validPdfId = UUID.randomUUID();
         UUID processingDocId = UUID.randomUUID();
         UUID staleDocId = UUID.randomUUID();
@@ -188,11 +237,10 @@ class VectorRetrievalServiceTest {
         DocumentEntity validPdfEntity = docEntity(validPdfId, HR_DEPT_ID, AccessLevel.DEPARTMENT, DocumentStatus.COMPLETED, 2, "hr-handbook.pdf", "departments/hr/1/v2/hr-handbook.pdf");
         DocumentEntity processingEntity = docEntity(processingDocId, HR_DEPT_ID, AccessLevel.DEPARTMENT, DocumentStatus.PROCESSING, 1, "draft-policy.pdf", "departments/hr/2/v1/draft-policy.pdf");
         DocumentEntity staleEntity = docEntity(staleDocId, HR_DEPT_ID, AccessLevel.DEPARTMENT, DocumentStatus.COMPLETED, 2, "updated-policy.pdf", "departments/hr/3/v2/updated-policy.pdf");
-        DocumentEntity confidentialEntity = docEntity(confidentialDocId, HR_DEPT_ID, AccessLevel.CONFIDENTIAL, DocumentStatus.COMPLETED, 1, "salary-secret.pdf", "departments/hr/4/v1/salary-secret.pdf");
         DocumentEntity publicMdEntity = docEntity(publicMdId, IT_DEPT_ID, AccessLevel.PUBLIC, DocumentStatus.COMPLETED, 1, "remote-policy.md", "departments/it/5/v1/remote-policy.md");
 
         when(documentRepository.findAllById(anyIterable()))
-            .thenReturn(List.of(validPdfEntity, processingEntity, staleEntity, confidentialEntity, publicMdEntity));
+            .thenReturn(List.of(validPdfEntity, processingEntity, staleEntity, publicMdEntity));
 
         URL pdfSignedUrl = URI.create("http://localhost:9000/documind-documents/hr-handbook.pdf?X-Amz-Signature=abc").toURL();
         URL mdSignedUrl = URI.create("http://localhost:9000/documind-documents/remote-policy.md?X-Amz-Signature=xyz").toURL();
@@ -218,6 +266,8 @@ class VectorRetrievalServiceTest {
 
         RetrievedChunk first = results.get(0);
         assertThat(first.documentId()).isEqualTo(validPdfId);
+        assertThat(first.departmentId()).isEqualTo(HR_DEPT_ID);
+        assertThat(first.accessLevel()).isEqualTo(AccessLevel.DEPARTMENT);
         assertThat(first.citation().fileName()).isEqualTo("hr-handbook.pdf");
         assertThat(first.citation().pageNumber()).isEqualTo(3);
         assertThat(first.citation().similarityScore()).isEqualTo(0.91d);
@@ -225,6 +275,8 @@ class VectorRetrievalServiceTest {
 
         RetrievedChunk second = results.get(1);
         assertThat(second.documentId()).isEqualTo(publicMdId);
+        assertThat(second.departmentId()).isEqualTo(IT_DEPT_ID);
+        assertThat(second.accessLevel()).isEqualTo(AccessLevel.PUBLIC);
         assertThat(second.citation().fileName()).isEqualTo("remote-policy.md");
         assertThat(second.citation().pageNumber()).isNull();
         assertThat(second.citation().sectionHeading()).isEqualTo("Hybrid Policy");
@@ -235,8 +287,190 @@ class VectorRetrievalServiceTest {
     }
 
     @Test
+    void defenseInDepthDropsUnauthorizedMetadataAndDriftedParentChunksWithoutCrashing(CapturedOutput output) {
+        CallerContext salesEmployee = new CallerContext(USER_ID, SALES_DEPT_ID, Role.STANDARD_EMPLOYEE, "127.0.0.1");
+        setJwtPrincipal(USER_ID, SALES_DEPT_ID, Role.STANDARD_EMPLOYEE);
+
+        UUID leakedHrDocId = UUID.randomUUID();
+        UUID driftedDocId = UUID.randomUUID();
+        UUID corruptMetaDocId = UUID.randomUUID();
+        UUID validSalesDocId = UUID.randomUUID();
+
+        // 1. Misbehaving vector store returns HR DEPARTMENT chunk to SALES viewer -> dropped before DB lookup
+        Document leakedHrChunk = chunk(
+            leakedHrDocId, HR_DEPT_ID, AccessLevel.DEPARTMENT, "hr-internal.pdf", 1, 0, 1, null, 0.96d,
+            "Nội bộ phòng HR bí mật không được ghi log."
+        );
+        // 2. Chunk metadata still says PUBLIC, but parent DocumentEntity was reclassified to CONFIDENTIAL (race) -> dropped!
+        Document driftedChunk = chunk(
+            driftedDocId, HR_DEPT_ID, AccessLevel.PUBLIC, "reclassified.pdf", 1, 0, 1, null, 0.94d,
+            "Tài liệu vừa nâng cấp mật tuyệt đối."
+        );
+        // 3. Chunk with corrupt/missing access_level metadata -> dropped!
+        Map<String, Object> corruptMetadata = new LinkedHashMap<>();
+        corruptMetadata.put(ChunkMetadataKeys.DOCUMENT_ID, corruptMetaDocId.toString());
+        corruptMetadata.put(ChunkMetadataKeys.DEPARTMENT_ID, SALES_DEPT_ID.toString());
+        corruptMetadata.put(ChunkMetadataKeys.ACCESS_LEVEL, "UNKNOWN_LEVEL");
+        corruptMetadata.put(ChunkMetadataKeys.DOC_VERSION, 1);
+        corruptMetadata.put(ChunkMetadataKeys.CHUNK_INDEX, 0);
+        Document corruptChunk = Document.builder()
+            .id(UUID.randomUUID().toString())
+            .text("Corrupt metadata secret body")
+            .metadata(corruptMetadata)
+            .score(0.95d)
+            .build();
+        // 4. Legitimate SALES DEPARTMENT chunk -> survives!
+        Document validSalesChunk = chunk(
+            validSalesDocId, SALES_DEPT_ID, AccessLevel.DEPARTMENT, "sales-playbook.pdf", 1, 0, 2, null, 0.85d,
+            "Chính sách hoa hồng phòng kinh doanh."
+        );
+
+        when(vectorStore.similaritySearch(any(SearchRequest.class)))
+            .thenReturn(List.of(leakedHrChunk, driftedChunk, corruptChunk, validSalesChunk));
+        when(documentRepository.findAllById(anyIterable())).thenReturn(List.of(
+            docEntity(driftedDocId, HR_DEPT_ID, AccessLevel.CONFIDENTIAL, DocumentStatus.COMPLETED, 1, "reclassified.pdf", "departments/hr/r/v1/reclassified.pdf"),
+            docEntity(validSalesDocId, SALES_DEPT_ID, AccessLevel.DEPARTMENT, DocumentStatus.COMPLETED, 1, "sales-playbook.pdf", "departments/sales/s/v1/sales-playbook.pdf")
+        ));
+
+        List<RetrievedChunk> results = retrievalService.retrieve("Chính sách kinh doanh?", salesEmployee);
+
+        assertThat(results).hasSize(1);
+        assertThat(results.getFirst().documentId()).isEqualTo(validSalesDocId);
+        assertThat(results.getFirst().departmentId()).isEqualTo(SALES_DEPT_ID);
+        assertThat(results.getFirst().accessLevel()).isEqualTo(AccessLevel.DEPARTMENT);
+
+        assertThat(output.getOut())
+            .contains("SECURITY_ALERT action=VECTOR_RBAC_POST_FILTER_DROP reason=CHUNK_METADATA_UNAUTHORIZED")
+            .contains("SECURITY_ALERT action=VECTOR_CHUNK_INVALID_RBAC_METADATA")
+            .contains("SECURITY_ALERT action=VECTOR_RBAC_POST_FILTER_DROP reason=PARENT_UNAUTHORIZED")
+            .doesNotContain("Nội bộ phòng HR bí mật không được ghi log")
+            .doesNotContain("Tài liệu vừa nâng cấp mật tuyệt đối")
+            .doesNotContain("Corrupt metadata secret body");
+    }
+
+    @Test
+    void defenseInDepthDropsDriftedMetadataEvenWhenParentIsAuthorizedAndLogsSecurityAlert(CapturedOutput output) {
+        // Case 1: HR Manager is authorized for both PUBLIC and CONFIDENTIAL in HR, yet chunk vs parent access_level drift must fail closed
+        CallerContext hrManager = new CallerContext(USER_ID, HR_DEPT_ID, Role.DEPARTMENT_MANAGER, "127.0.0.1");
+        setJwtPrincipal(USER_ID, HR_DEPT_ID, Role.DEPARTMENT_MANAGER);
+
+        UUID accessDriftDocId = UUID.randomUUID();
+        Document accessDriftedChunk = chunk(
+            accessDriftDocId, HR_DEPT_ID, AccessLevel.PUBLIC, "hr-access-drift.pdf", 1, 0, 1, null, 0.94d,
+            "Nội dung mật HR không được rò vào log khi drift accessLevel."
+        );
+        when(vectorStore.similaritySearch(any(SearchRequest.class)))
+            .thenReturn(List.of(accessDriftedChunk));
+        when(documentRepository.findAllById(anyIterable())).thenReturn(List.of(
+            docEntity(accessDriftDocId, HR_DEPT_ID, AccessLevel.CONFIDENTIAL, DocumentStatus.COMPLETED, 1, "hr-access-drift.pdf", "departments/hr/d/v1/hr-access-drift.pdf")
+        ));
+
+        List<RetrievedChunk> hrManagerResults = retrievalService.retrieve("Chính sách lương?", hrManager);
+        assertThat(hrManagerResults).isEmpty();
+
+        // Case 2: SYSTEM_ADMIN global is authorized for all departments, yet chunk vs parent department_id drift must fail closed
+        CallerContext admin = new CallerContext(ADMIN_USER_ID, IT_DEPT_ID, Role.SYSTEM_ADMIN, "127.0.0.1");
+        setJwtPrincipal(ADMIN_USER_ID, IT_DEPT_ID, Role.SYSTEM_ADMIN);
+
+        UUID deptDriftDocId = UUID.randomUUID();
+        Document deptDriftedChunk = chunk(
+            deptDriftDocId, HR_DEPT_ID, AccessLevel.DEPARTMENT, "transferred-doc.pdf", 1, 0, 1, null, 0.92d,
+            "Nội dung chuyển phòng ban không được rò vào log khi drift departmentId."
+        );
+        when(vectorStore.similaritySearch(any(SearchRequest.class)))
+            .thenReturn(List.of(deptDriftedChunk));
+        when(documentRepository.findAllById(anyIterable())).thenReturn(List.of(
+            docEntity(deptDriftDocId, SALES_DEPT_ID, AccessLevel.DEPARTMENT, DocumentStatus.COMPLETED, 1, "transferred-doc.pdf", "departments/sales/t/v1/transferred-doc.pdf")
+        ));
+
+        List<RetrievedChunk> adminResults = retrievalService.retrieve("Tài liệu chuyển phòng?", admin);
+        assertThat(adminResults).isEmpty();
+
+        assertThat(output.getOut())
+            .contains("SECURITY_ALERT action=VECTOR_RBAC_POST_FILTER_DROP reason=CHUNK_PARENT_METADATA_DRIFT")
+            .doesNotContain("Nội dung mật HR không được rò vào log khi drift accessLevel")
+            .doesNotContain("Nội dung chuyển phòng ban không được rò vào log khi drift departmentId");
+    }
+
+    @Test
+    void defenseInDepthReturnsEmptyWhenAllReturnedChunksAreUnauthorizedWithoutQueryingDatabase() {
+        CallerContext salesEmployee = new CallerContext(USER_ID, SALES_DEPT_ID, Role.STANDARD_EMPLOYEE, "127.0.0.1");
+        setJwtPrincipal(USER_ID, SALES_DEPT_ID, Role.STANDARD_EMPLOYEE);
+
+        Document leakedHrChunk = chunk(
+            UUID.randomUUID(), HR_DEPT_ID, AccessLevel.DEPARTMENT, "hr-only.pdf", 1, 0, 1, null, 0.95d,
+            "Tài liệu nội bộ phòng HR."
+        );
+        Document leakedConfidentialChunk = chunk(
+            UUID.randomUUID(), SALES_DEPT_ID, AccessLevel.CONFIDENTIAL, "sales-secret.pdf", 1, 0, 1, null, 0.92d,
+            "Bí mật kinh doanh."
+        );
+
+        when(vectorStore.similaritySearch(any(SearchRequest.class)))
+            .thenReturn(List.of(leakedHrChunk, leakedConfidentialChunk));
+
+        List<RetrievedChunk> results = retrievalService.retrieve("Chính sách nội bộ?", salesEmployee);
+
+        assertThat(results).isEmpty();
+        verifyNoInteractions(documentRepository, minioStorageService);
+    }
+
+    @Test
+    void retrieveSupportsAdminScopedDepartmentFilterAndDropsOutOfScopeChunksInJava() {
+        CallerContext admin = new CallerContext(ADMIN_USER_ID, IT_DEPT_ID, Role.SYSTEM_ADMIN, "127.0.0.1");
+        setJwtPrincipal(ADMIN_USER_ID, IT_DEPT_ID, Role.SYSTEM_ADMIN);
+
+        UUID hrDocId = UUID.randomUUID();
+        UUID salesPublicDocId = UUID.randomUUID();
+        Document hrConfidentialChunk = chunk(
+            hrDocId, HR_DEPT_ID, AccessLevel.CONFIDENTIAL, "hr-comp.pdf", 1, 0, 1, null, 0.91d,
+            "Bảng lương phòng nhân sự."
+        );
+        Document salesPublicChunk = chunk(
+            salesPublicDocId, SALES_DEPT_ID, AccessLevel.PUBLIC, "company-news.pdf", 1, 0, 1, null, 0.93d,
+            "Thông báo chung từ Sales."
+        );
+
+        when(vectorStore.similaritySearch(any(SearchRequest.class)))
+            .thenReturn(List.of(salesPublicChunk, hrConfidentialChunk));
+        when(documentRepository.findAllById(anyIterable())).thenReturn(List.of(
+            docEntity(hrDocId, HR_DEPT_ID, AccessLevel.CONFIDENTIAL, DocumentStatus.COMPLETED, 1, "hr-comp.pdf", "departments/hr/c/v1/hr-comp.pdf")
+        ));
+
+        List<RetrievedChunk> results = retrievalService.retrieve("Bảng lương?", admin, HR_DEPT_ID);
+
+        ArgumentCaptor<SearchRequest> captor = ArgumentCaptor.forClass(SearchRequest.class);
+        verify(vectorStore).similaritySearch(captor.capture());
+        assertThat(captor.getValue().getFilterExpression())
+            .isEqualTo(RbacVectorFilterFactory.buildFilterExpression(admin, HR_DEPT_ID));
+
+        assertThat(results).hasSize(1);
+        assertThat(results.getFirst().documentId()).isEqualTo(hrDocId);
+        assertThat(results.getFirst().departmentId()).isEqualTo(HR_DEPT_ID);
+        assertThat(results.getFirst().accessLevel()).isEqualTo(AccessLevel.CONFIDENTIAL);
+    }
+
+    @Test
+    void retrieveMethodsDeclarePreAuthorizeAnnotation() throws NoSuchMethodException {
+        Method twoArg = VectorRetrievalService.class.getMethod("retrieve", String.class, CallerContext.class);
+        Method threeArg = VectorRetrievalService.class.getMethod("retrieve", String.class, CallerContext.class, UUID.class);
+        Method scopeArg = VectorRetrievalService.class.getMethod("retrieve", String.class, RbacVectorScope.class);
+        for (Method method : List.of(twoArg, threeArg, scopeArg)) {
+            PreAuthorize annotation = method.getAnnotation(PreAuthorize.class);
+            assertThat(annotation)
+                .as("@PreAuthorize must be declared on %s", method)
+                .isNotNull();
+            assertThat(annotation.value())
+                .contains("SYSTEM_ADMIN")
+                .contains("DEPARTMENT_MANAGER")
+                .contains("STANDARD_EMPLOYEE");
+        }
+    }
+
+    @Test
     void retrieveRejectsBlankOrNullByteQuestionsWithoutCallingVectorStore() {
         CallerContext hrEmployee = new CallerContext(USER_ID, HR_DEPT_ID, Role.STANDARD_EMPLOYEE, "127.0.0.1");
+        setJwtPrincipal(USER_ID, HR_DEPT_ID, Role.STANDARD_EMPLOYEE);
         assertThatThrownBy(() -> retrievalService.retrieve("   \n\t ", hrEmployee))
             .isInstanceOf(InvalidChatRequestException.class);
         assertThatThrownBy(() -> retrievalService.retrieve("Câu hỏi\0độc hại", hrEmployee))
@@ -254,15 +488,17 @@ class VectorRetrievalServiceTest {
             providerOf(vectorStore),
             providerOf(documentRepository),
             minioStorageService,
+            rbacVectorFilterFactory,
             customProps
         );
         CallerContext manager = new CallerContext(USER_ID, HR_DEPT_ID, Role.DEPARTMENT_MANAGER, "127.0.0.1");
+        setJwtPrincipal(USER_ID, HR_DEPT_ID, Role.DEPARTMENT_MANAGER);
 
         UUID doc1Id = UUID.randomUUID();
         UUID doc2Id = UUID.randomUUID();
         Document c1 = chunk(doc1Id, HR_DEPT_ID, AccessLevel.DEPARTMENT, "policy.pdf", 1, 0, 2, null, 0.94d, "Page 2 text");
         Document c2 = chunk(doc1Id, HR_DEPT_ID, AccessLevel.DEPARTMENT, "policy.pdf", 1, 1, 5, null, 0.87d, "Page 5 text");
-        Document c3 = chunk(doc2Id, HR_DEPT_ID, AccessLevel.PUBLIC, "guide.pdf", 1, 0, 1, null, 0.75d, "Page 1 guide");
+        Document c3 = chunk(doc2Id, IT_DEPT_ID, AccessLevel.PUBLIC, "guide.pdf", 1, 0, 1, null, 0.75d, "Page 1 guide");
 
         when(vectorStore.similaritySearch(any(SearchRequest.class))).thenReturn(List.of(c1, c2, c3));
         when(documentRepository.findAllById(anyIterable())).thenReturn(List.of(
@@ -294,9 +530,11 @@ class VectorRetrievalServiceTest {
             providerOf(vectorStore),
             providerOf(documentRepository),
             minioStorageService,
+            rbacVectorFilterFactory,
             shortExcerptProps
         );
         CallerContext manager = new CallerContext(USER_ID, HR_DEPT_ID, Role.DEPARTMENT_MANAGER, "127.0.0.1");
+        setJwtPrincipal(USER_ID, HR_DEPT_ID, Role.DEPARTMENT_MANAGER);
 
         UUID docId = UUID.randomUUID();
         String longText = "Quy định thưởng hiệu suất quý năm 2026 dành cho kỹ sư phần mềm \uD83D\uDE00 cùng các phụ cấp bổ sung.";
@@ -348,6 +586,21 @@ class VectorRetrievalServiceTest {
         assertThat(json)
             .contains("\"sectionHeading\":\"Chương 2 > Điều 5\"")
             .doesNotContain("presignedUrl");
+    }
+
+    private static void setJwtPrincipal(UUID userId, UUID departmentId, Role role) {
+        CustomUserDetails principal = new CustomUserDetails(
+            userId,
+            departmentId,
+            role.name().toLowerCase() + "@documind.ai",
+            role.name(),
+            role,
+            "jti-" + userId,
+            Instant.now().plusSeconds(900)
+        );
+        SecurityContextHolder.getContext().setAuthentication(
+            new UsernamePasswordAuthenticationToken(principal, null, principal.getAuthorities())
+        );
     }
 
     private static Document chunk(

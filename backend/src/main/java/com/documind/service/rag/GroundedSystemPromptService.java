@@ -38,7 +38,17 @@ public class GroundedSystemPromptService {
         this.systemPromptTemplate = new SystemPromptTemplate(templateText);
     }
 
-    public Message buildSystemMessage(List<RetrievedChunk> chunks) {
+    /**
+     * Enforces final pre-prompt RBAC authorization via {@link RbacVectorScope#assertAllAuthorized(List)}
+     * before serializing retrieved chunks into {@code <context>} tags.
+     */
+    public Message buildSystemMessage(List<RetrievedChunk> chunks, RbacVectorScope rbacScope) {
+        Objects.requireNonNull(rbacScope, "rbacScope must not be null");
+        rbacScope.assertAllAuthorized(chunks);
+        return buildSystemMessage(chunks);
+    }
+
+    Message buildSystemMessage(List<RetrievedChunk> chunks) {
         if (chunks == null || chunks.isEmpty()) {
             throw new IllegalArgumentException("chunks must not be null or empty");
         }

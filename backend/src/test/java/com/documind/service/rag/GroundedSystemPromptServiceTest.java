@@ -1,11 +1,17 @@
 package com.documind.service.rag;
 
 import com.documind.controller.dto.CitationDto;
+import com.documind.domain.enums.AccessLevel;
+import com.documind.domain.enums.Role;
+import com.documind.exception.DocumentAccessDeniedException;
+import com.documind.service.document.CallerContext;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.ai.chat.messages.Message;
 import org.springframework.ai.chat.messages.SystemMessage;
 
+import java.lang.reflect.Method;
+import java.lang.reflect.Modifier;
 import java.util.List;
 import java.util.UUID;
 
@@ -93,7 +99,73 @@ class GroundedSystemPromptServiceTest {
             .isInstanceOf(IllegalArgumentException.class);
     }
 
+    @Test
+    void buildSystemMessageWithRbacScopeBlocksUnauthorizedChunkBeforeRenderingPrompt() {
+        UUID hrDeptId = UUID.fromString("22222222-2222-2222-2222-222222222222");
+        UUID salesDeptId = UUID.fromString("33333333-3333-3333-3333-333333333333");
+        CallerContext hrEmployee = new CallerContext(
+            UUID.fromString("22222222-2222-3333-4444-555555555553"),
+            hrDeptId,
+            Role.STANDARD_EMPLOYEE,
+            "127.0.0.1"
+        );
+        RbacVectorScope scope = new RbacVectorScope(
+            hrEmployee,
+            null,
+            RbacVectorFilterFactory.buildFilterExpression(hrEmployee, null),
+            RbacVectorFilterFactory.buildCacheScopeKey(hrEmployee, null)
+        );
+
+        RetrievedChunk allowed = chunk(hrDeptId, AccessLevel.DEPARTMENT, "handbook.pdf", 1, null, 0.90d, "Chính sách phép năm.");
+        RetrievedChunk confidential = chunk(hrDeptId, AccessLevel.CONFIDENTIAL, "salary.pdf", 1, null, 0.95d, "Lương giám đốc.");
+        RetrievedChunk foreign = chunk(salesDeptId, AccessLevel.DEPARTMENT, "sales.pdf", 1, null, 0.92d, "Hoa hồng sales.");
+
+        Message validMessage = promptService.buildSystemMessage(List.of(allowed), scope);
+        assertThat(validMessage.getText()).contains("Chính sách phép năm.");
+
+        assertThatThrownBy(() -> promptService.buildSystemMessage(List.of(allowed, confidential), scope))
+            .isInstanceOf(DocumentAccessDeniedException.class);
+        assertThatThrownBy(() -> promptService.buildSystemMessage(List.of(foreign), scope))
+            .isInstanceOf(DocumentAccessDeniedException.class);
+        assertThatThrownBy(() -> promptService.buildSystemMessage(List.of(allowed), null))
+            .isInstanceOf(NullPointerException.class);
+    }
+
+    @Test
+    void unguardedOneArgBuildSystemMessageIsNotPublicWhileScopedOverloadIsPublic() throws NoSuchMethodException {
+        Method unguarded = GroundedSystemPromptService.class.getDeclaredMethod("buildSystemMessage", List.class);
+        Method guarded = GroundedSystemPromptService.class.getDeclaredMethod(
+            "buildSystemMessage",
+            List.class,
+            RbacVectorScope.class
+        );
+        assertThat(Modifier.isPublic(unguarded.getModifiers()))
+            .as("Unguarded buildSystemMessage(List) must not be public outside com.documind.service.rag")
+            .isFalse();
+        assertThat(Modifier.isPublic(guarded.getModifiers())).isTrue();
+    }
+
     private static RetrievedChunk chunk(
+        String fileName,
+        Integer pageNumber,
+        String sectionHeading,
+        double score,
+        String content
+    ) {
+        return chunk(
+            UUID.fromString("22222222-2222-2222-2222-222222222222"),
+            AccessLevel.DEPARTMENT,
+            fileName,
+            pageNumber,
+            sectionHeading,
+            score,
+            content
+        );
+    }
+
+    private static RetrievedChunk chunk(
+        UUID departmentId,
+        AccessLevel accessLevel,
         String fileName,
         Integer pageNumber,
         String sectionHeading,
@@ -110,7 +182,15 @@ class GroundedSystemPromptServiceTest {
             content,
             null
         );
-        return new RetrievedChunk(UUID.randomUUID().toString(), docId, 0, content, citation);
+        return new RetrievedChunk(
+            UUID.randomUUID().toString(),
+            docId,
+            departmentId,
+            accessLevel,
+            0,
+            content,
+            citation
+        );
     }
 
     private static int countOccurrences(String haystack, String needle) {
