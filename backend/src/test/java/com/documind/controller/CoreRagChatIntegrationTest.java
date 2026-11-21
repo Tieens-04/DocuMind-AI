@@ -147,6 +147,8 @@ class CoreRagChatIntegrationTest {
         awaitWorkersIdle();
         deleteAllBucketObjects();
         jdbcTemplate.update("DELETE FROM semantic_cache");
+        jdbcTemplate.update("DELETE FROM chat_messages");
+        jdbcTemplate.update("DELETE FROM chat_sessions");
         jdbcTemplate.update("DELETE FROM audit_logs");
         jdbcTemplate.update("DELETE FROM documents");
         jdbcTemplate.update("UPDATE departments SET cache_version = 1");

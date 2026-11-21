@@ -105,7 +105,7 @@ class ChatControllerTest {
             30,
             42L
         );
-        when(ragChatService.ask("Chính sách nghỉ phép năm?", null, caller)).thenReturn(expected);
+        when(ragChatService.ask("Chính sách nghỉ phép năm?", null, null, caller)).thenReturn(expected);
 
         mockMvc.perform(post("/api/v1/chat/ask")
                 .contentType(MediaType.APPLICATION_JSON)
@@ -122,7 +122,49 @@ class ChatControllerTest {
             .andExpect(jsonPath("$.completionTokens").value(30))
             .andExpect(jsonPath("$.latencyMs").value(42));
 
-        verify(ragChatService).ask("Chính sách nghỉ phép năm?", null, caller);
+        verify(ragChatService).ask("Chính sách nghỉ phép năm?", null, null, caller);
+    }
+
+    @Test
+    void askForwardsSessionIdAndReturnsSessionMetadataAndRewrittenQuery() throws Exception {
+        CallerContext caller = new CallerContext(USER_ID, HR_DEPT_ID, Role.STANDARD_EMPLOYEE, "127.0.0.1");
+        when(callerContextResolver.resolve(any())).thenReturn(caller);
+
+        UUID sessionId = UUID.randomUUID();
+        UUID messageId = UUID.randomUUID();
+        ChatAskResponse multiTurnResp = new ChatAskResponse(
+            sessionId,
+            messageId,
+            "Nhân viên chính thức làm đủ 5 năm được cộng thêm mấy ngày phép năm?",
+            "Được cộng thêm 1 ngày phép [Nguồn: hr-handbook.pdf - Trang 3].",
+            false,
+            List.of(),
+            "groq",
+            195,
+            52,
+            110L
+        );
+        when(ragChatService.ask("Còn làm đủ 5 năm thì sao?", sessionId, null, caller)).thenReturn(multiTurnResp);
+
+        mockMvc.perform(post("/api/v1/chat/ask")
+                .contentType(MediaType.APPLICATION_JSON)
+                .content(objectMapper.writeValueAsString(Map.of(
+                    "question", "Còn làm đủ 5 năm thì sao?",
+                    "sessionId", sessionId.toString()
+                ))))
+            .andExpect(status().isOk())
+            .andExpect(jsonPath("$.sessionId").value(sessionId.toString()))
+            .andExpect(jsonPath("$.messageId").value(messageId.toString()))
+            .andExpect(jsonPath("$.rewrittenQuery").value("Nhân viên chính thức làm đủ 5 năm được cộng thêm mấy ngày phép năm?"))
+            .andExpect(jsonPath("$.promptTokens").value(195));
+
+        verify(ragChatService).ask("Còn làm đủ 5 năm thì sao?", sessionId, null, caller);
+
+        mockMvc.perform(post("/api/v1/chat/ask")
+                .contentType(MediaType.APPLICATION_JSON)
+                .content("{\"question\":\"Hỏi tiếp?\",\"sessionId\":\"not-a-uuid\"}"))
+            .andExpect(status().isBadRequest())
+            .andExpect(jsonPath("$.errorCode").value("MALFORMED_JSON_REQUEST"));
     }
 
     @Test
@@ -139,7 +181,7 @@ class ChatControllerTest {
             25,
             31L
         );
-        when(ragChatService.ask("Chính sách HR?", HR_DEPT_ID, adminCaller)).thenReturn(scopedResponse);
+        when(ragChatService.ask("Chính sách HR?", null, HR_DEPT_ID, adminCaller)).thenReturn(scopedResponse);
 
         mockMvc.perform(post("/api/v1/chat/ask")
                 .contentType(MediaType.APPLICATION_JSON)
@@ -149,10 +191,10 @@ class ChatControllerTest {
                 ))))
             .andExpect(status().isOk())
             .andExpect(jsonPath("$.answer").value(scopedResponse.answer()));
-        verify(ragChatService).ask("Chính sách HR?", HR_DEPT_ID, adminCaller);
+        verify(ragChatService).ask("Chính sách HR?", null, HR_DEPT_ID, adminCaller);
 
         UUID unknownDeptId = UUID.randomUUID();
-        when(ragChatService.ask("Chính sách phòng lạ?", unknownDeptId, adminCaller))
+        when(ragChatService.ask("Chính sách phòng lạ?", null, unknownDeptId, adminCaller))
             .thenThrow(new ResourceNotFoundException("Department not found: " + unknownDeptId));
         mockMvc.perform(post("/api/v1/chat/ask")
                 .contentType(MediaType.APPLICATION_JSON)
@@ -171,7 +213,7 @@ class ChatControllerTest {
 
         CallerContext nonAdminCaller = new CallerContext(USER_ID, HR_DEPT_ID, Role.STANDARD_EMPLOYEE, "127.0.0.1");
         when(callerContextResolver.resolve(any())).thenReturn(nonAdminCaller);
-        when(ragChatService.ask("Chính sách IT?", IT_DEPT_ID, nonAdminCaller))
+        when(ragChatService.ask("Chính sách IT?", null, IT_DEPT_ID, nonAdminCaller))
             .thenThrow(new DocumentAccessDeniedException("Only SYSTEM_ADMIN can filter chat retrieval by departmentId"));
         mockMvc.perform(post("/api/v1/chat/ask")
                 .contentType(MediaType.APPLICATION_JSON)
@@ -256,8 +298,8 @@ class ChatControllerTest {
         );
         String minQuestion = "?";
         String maxQuestion = "a".repeat(4000);
-        when(ragChatService.ask(minQuestion, null, caller)).thenReturn(refusal);
-        when(ragChatService.ask(maxQuestion, null, caller)).thenReturn(refusal);
+        when(ragChatService.ask(minQuestion, null, null, caller)).thenReturn(refusal);
+        when(ragChatService.ask(maxQuestion, null, null, caller)).thenReturn(refusal);
 
         mockMvc.perform(post("/api/v1/chat/ask")
                 .contentType(MediaType.APPLICATION_JSON)
@@ -271,8 +313,8 @@ class ChatControllerTest {
             .andExpect(status().isOk())
             .andExpect(jsonPath("$.abstained").value(true));
 
-        verify(ragChatService).ask(minQuestion, null, caller);
-        verify(ragChatService).ask(maxQuestion, null, caller);
+        verify(ragChatService).ask(minQuestion, null, null, caller);
+        verify(ragChatService).ask(maxQuestion, null, null, caller);
     }
 
     @Test
@@ -280,7 +322,7 @@ class ChatControllerTest {
         CallerContext caller = new CallerContext(USER_ID, HR_DEPT_ID, Role.STANDARD_EMPLOYEE, null);
         when(callerContextResolver.resolve(any())).thenReturn(caller);
 
-        when(ragChatService.ask("blocked", null, caller))
+        when(ragChatService.ask("blocked", null, null, caller))
             .thenThrow(new DocumentAccessDeniedException("User account is inactive"));
         mockMvc.perform(post("/api/v1/chat/ask")
                 .contentType(MediaType.APPLICATION_JSON)
@@ -288,7 +330,7 @@ class ChatControllerTest {
             .andExpect(status().isForbidden())
             .andExpect(jsonPath("$.errorCode").value("DOCUMENT_ACCESS_DENIED"));
 
-        when(ragChatService.ask("invalid", null, caller))
+        when(ragChatService.ask("invalid", null, null, caller))
             .thenThrow(new InvalidChatRequestException("Question contains invalid characters"));
         mockMvc.perform(post("/api/v1/chat/ask")
                 .contentType(MediaType.APPLICATION_JSON)
@@ -296,7 +338,7 @@ class ChatControllerTest {
             .andExpect(status().isBadRequest())
             .andExpect(jsonPath("$.errorCode").value("INVALID_CHAT_REQUEST"));
 
-        when(ragChatService.ask("outage", null, caller))
+        when(ragChatService.ask("outage", null, null, caller))
             .thenThrow(new LlmProviderException("Upstream failure sk-secret-token-123", new RuntimeException("503")));
         mockMvc.perform(post("/api/v1/chat/ask")
                 .contentType(MediaType.APPLICATION_JSON)
