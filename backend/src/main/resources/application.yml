@@ -153,3 +153,7 @@ documind:
     llm:
       max-question-chars: 4000
       fallback-enabled: true
+    memory:
+      history-window-size: 6
+      max-history-message-chars: 1000
+      auto-title-max-chars: 80

@@ -50,6 +50,7 @@ class GroundedSystemPromptServiceTest {
             .contains("<context>")
             .contains("</context>")
             .contains(RagConstants.SAFE_REFUSAL_MESSAGE)
+            .contains("6. Lịch sử hội thoại")
             .contains("[Nguồn: handbook.pdf - Trang 3]")
             .contains("[Nguồn: onboarding.md - Mục Hội nhập]")
             .contains("[Nguồn: notes.txt]")

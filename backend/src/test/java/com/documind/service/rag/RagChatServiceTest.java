@@ -3,11 +3,13 @@ package com.documind.service.rag;
 import com.documind.controller.dto.ChatAskResponse;
 import com.documind.controller.dto.CitationDto;
 import com.documind.domain.entity.AuditLogEntity;
+import com.documind.domain.entity.ChatMessageEntity;
 import com.documind.domain.entity.DepartmentEntity;
 import com.documind.domain.entity.UserEntity;
 import com.documind.domain.enums.AccessLevel;
 import com.documind.domain.enums.AuditActionType;
 import com.documind.domain.enums.CacheTier;
+import com.documind.domain.enums.MessageRole;
 import com.documind.domain.enums.Role;
 import com.documind.exception.AuthenticationRequiredException;
 import com.documind.exception.DocumentAccessDeniedException;
@@ -19,6 +21,7 @@ import com.documind.infrastructure.security.CustomUserDetails;
 import com.documind.repository.AuditLogRepository;
 import com.documind.repository.DepartmentRepository;
 import com.documind.repository.UserRepository;
+import com.documind.service.chat.ChatSessionService;
 import com.documind.service.document.CallerContext;
 import com.documind.service.document.DevFallbackCallerContextResolver;
 import org.junit.jupiter.api.AfterEach;
@@ -27,6 +30,7 @@ import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
 import org.springframework.ai.chat.client.ChatClient;
 import org.springframework.ai.chat.messages.AssistantMessage;
+import org.springframework.ai.chat.messages.Message;
 import org.springframework.ai.chat.messages.SystemMessage;
 import org.springframework.ai.chat.messages.UserMessage;
 import org.springframework.ai.chat.metadata.ChatResponseMetadata;
@@ -328,7 +332,8 @@ class RagChatServiceTest {
         }
         for (Method method : List.of(
             RagChatService.class.getMethod("ask", String.class, CallerContext.class),
-            RagChatService.class.getMethod("ask", String.class, UUID.class, CallerContext.class)
+            RagChatService.class.getMethod("ask", String.class, UUID.class, CallerContext.class),
+            RagChatService.class.getMethod("ask", String.class, UUID.class, UUID.class, CallerContext.class)
         )) {
             PreAuthorize annotation = method.getAnnotation(PreAuthorize.class);
             assertThat(annotation).isNotNull();
@@ -508,6 +513,197 @@ class RagChatServiceTest {
         assertThat(service.ask("Hỏi thử?", devDefaultCaller).abstained()).isTrue();
     }
 
+    @Test
+    void askMultiTurnSkipsRewriteOnTurn1ContextualizesTurn2FiltersAbstainedHistorySumsTokensAndPreventsOrphanOn502() {
+        ChatSessionService sessionService = mock(ChatSessionService.class);
+        QueryContextualizerService contextualizerService = mock(QueryContextualizerService.class);
+        RagChatService service = createMultiTurnService("unconfigured-api-key", ragProperties, sessionService, contextualizerService);
+
+        CallerContext caller = new CallerContext(HR_USER_ID, HR_DEPT_ID, Role.STANDARD_EMPLOYEE, "10.0.0.5");
+        setJwtPrincipal(caller);
+
+        UUID sessionId = UUID.randomUUID();
+        UUID turn1MsgId = UUID.randomUUID();
+        RetrievedChunk chunk = sampleChunk(HR_DEPT_ID, AccessLevel.DEPARTMENT, "handbook.pdf", 3, "12 ngày phép năm, cộng 1 ngày mỗi 5 năm.");
+
+        // 1. Turn 1 with sessionId == null -> skips contextualizer, auto-creates session via recordCompletedTurn
+        when(vectorRetrievalService.retrieve(eq("Nghỉ phép năm bao nhiêu ngày?"), any(RbacVectorScope.class)))
+            .thenReturn(List.of(chunk));
+        when(groqChatModel.call(any(Prompt.class)))
+            .thenReturn(chatResponse("12 ngày phép năm [Nguồn: handbook.pdf - Trang 3].", 100, 25));
+        when(sessionService.recordCompletedTurn(any()))
+            .thenReturn(new ChatSessionService.PersistedTurnResult(sessionId, turn1MsgId));
+
+        ChatAskResponse turn1 = service.ask("Nghỉ phép năm bao nhiêu ngày?", null, null, caller);
+        assertThat(turn1.sessionId()).isEqualTo(sessionId);
+        assertThat(turn1.messageId()).isEqualTo(turn1MsgId);
+        assertThat(turn1.rewrittenQuery()).isNull();
+        verifyNoInteractions(contextualizerService);
+
+        // 2. Turn 2 with existing sessionId (includes 1 grounded turn + 1 abstained turn) -> contextualizes,
+        //    excludes abstained turn from Answer LLM Prompt, sums Rewrite + Answer tokens!
+        ChatMessageEntity u1 = chatMsg(MessageRole.USER, "Nghỉ phép năm bao nhiêu ngày?", false);
+        ChatMessageEntity a1 = chatMsg(MessageRole.ASSISTANT, "12 ngày phép năm.", false);
+        ChatMessageEntity u2Oos = chatMsg(MessageRole.USER, "Có trợ cấp thú cưng không?", false);
+        ChatMessageEntity a2Oos = chatMsg(MessageRole.ASSISTANT, RagConstants.SAFE_REFUSAL_MESSAGE, true);
+        List<ChatMessageEntity> recentHistory = List.of(u1, a1, u2Oos, a2Oos);
+
+        when(sessionService.loadAuthorizedHistoryForTurn(eq(sessionId), eq(HR_USER_ID), any(RbacVectorScope.class)))
+            .thenReturn(recentHistory);
+        String standalone = "Nhân viên chính thức làm đủ 5 năm được cộng thêm mấy ngày nghỉ phép năm?";
+        when(contextualizerService.contextualize("Làm đủ 5 năm thì sao?", recentHistory))
+            .thenReturn(new QueryContextualizerService.ContextualizedQuery(standalone, standalone, 60, 15, RagConstants.PROVIDER_GROQ));
+        when(vectorRetrievalService.retrieve(eq(standalone), any(RbacVectorScope.class)))
+            .thenReturn(List.of(chunk));
+        when(groqChatModel.call(any(Prompt.class))).thenAnswer(inv -> {
+            Prompt prompt = inv.getArgument(0);
+            // System + (u1, a1) + User = 4 messages (abstained pair u2Oos/a2Oos excluded!)
+            List<Message> instructions = prompt.getInstructions();
+            assertThat(instructions).hasSize(4);
+            assertThat(instructions.get(0)).isInstanceOf(SystemMessage.class);
+            assertThat(instructions.get(1).getText()).isEqualTo("Nghỉ phép năm bao nhiêu ngày?");
+            assertThat(instructions.get(2).getText()).isEqualTo("12 ngày phép năm.");
+            assertThat(instructions.get(3).getText()).contains("Làm đủ 5 năm thì sao?");
+            return chatResponse("Cộng thêm 1 ngày phép [Nguồn: handbook.pdf - Trang 3].", 140, 30);
+        });
+        UUID turn2MsgId = UUID.randomUUID();
+        when(sessionService.recordCompletedTurn(any()))
+            .thenReturn(new ChatSessionService.PersistedTurnResult(sessionId, turn2MsgId));
+
+        ChatAskResponse turn2 = service.ask("Làm đủ 5 năm thì sao?", sessionId, null, caller);
+        assertThat(turn2.sessionId()).isEqualTo(sessionId);
+        assertThat(turn2.messageId()).isEqualTo(turn2MsgId);
+        assertThat(turn2.rewrittenQuery()).isEqualTo(standalone);
+        assertThat(turn2.promptTokens()).isEqualTo(200); // 60 rewrite + 140 answer
+        assertThat(turn2.completionTokens()).isEqualTo(45); // 15 rewrite + 30 answer
+
+        // 3. Turn 3 retrieval returns empty -> Answer LLM skipped, rewrite tokens STILL preserved in response & DB
+        String oosStandalone = "Mức thưởng cổ phiếu cho nhân viên thử việc?";
+        when(contextualizerService.contextualize("Còn cổ phiếu thì sao?", recentHistory))
+            .thenReturn(new QueryContextualizerService.ContextualizedQuery(oosStandalone, oosStandalone, 55, 12, RagConstants.PROVIDER_GROQ));
+        when(vectorRetrievalService.retrieve(eq(oosStandalone), any(RbacVectorScope.class)))
+            .thenReturn(List.of());
+        clearInvocations(groqChatModel, sessionService);
+        UUID turn3MsgId = UUID.randomUUID();
+        when(sessionService.loadAuthorizedHistoryForTurn(eq(sessionId), eq(HR_USER_ID), any(RbacVectorScope.class)))
+            .thenReturn(recentHistory);
+        when(sessionService.recordCompletedTurn(any()))
+            .thenReturn(new ChatSessionService.PersistedTurnResult(sessionId, turn3MsgId));
+
+        ChatAskResponse turn3Abstained = service.ask("Còn cổ phiếu thì sao?", sessionId, null, caller);
+        assertThat(turn3Abstained.abstained()).isTrue();
+        assertThat(turn3Abstained.answer()).isEqualTo(RagConstants.SAFE_REFUSAL_MESSAGE);
+        assertThat(turn3Abstained.rewrittenQuery()).isEqualTo(oosStandalone);
+        assertThat(turn3Abstained.promptTokens()).isEqualTo(55);
+        assertThat(turn3Abstained.completionTokens()).isEqualTo(12);
+        verifyNoInteractions(groqChatModel);
+
+        // 4. Turn 4 Answer LLM fails 502 -> recordCompletedTurn NOT called (zero orphan USER message),
+        //    delegates failure audit with rewrite tokens to ChatSessionService
+        clearInvocations(sessionService, auditLogRepository);
+        when(sessionService.loadAuthorizedHistoryForTurn(eq(sessionId), eq(HR_USER_ID), any(RbacVectorScope.class)))
+            .thenReturn(recentHistory);
+        when(vectorRetrievalService.retrieve(eq(standalone), any(RbacVectorScope.class)))
+            .thenReturn(List.of(chunk));
+        when(groqChatModel.call(any(Prompt.class))).thenThrow(new RuntimeException("Groq 503"));
+
+        assertThatThrownBy(() -> service.ask("Làm đủ 5 năm thì sao?", sessionId, null, caller))
+            .isInstanceOf(LlmProviderException.class);
+        verify(sessionService, never()).recordCompletedTurn(any());
+        verify(sessionService).recordFailureAudit(
+            any(UserEntity.class),
+            eq(HR_DEPT_ID),
+            eq(sessionId),
+            eq("Làm đủ 5 năm thì sao?"),
+            eq(60),
+            eq(15),
+            any(Long.class),
+            eq(RagConstants.PROVIDER_GROQ),
+            eq("10.0.0.5")
+        );
+
+        // 5. Unowned sessionId -> fails immediately with 404 before contextualizer/retrieval/LLM
+        clearInvocations(contextualizerService, vectorRetrievalService, groqChatModel, geminiChatModel);
+        UUID unownedSessionId = UUID.randomUUID();
+        when(sessionService.loadAuthorizedHistoryForTurn(eq(unownedSessionId), eq(HR_USER_ID), any(RbacVectorScope.class)))
+            .thenThrow(new ResourceNotFoundException("Chat session not found: " + unownedSessionId));
+        assertThatThrownBy(() -> service.ask("Hỏi phiên người khác?", unownedSessionId, null, caller))
+            .isInstanceOf(ResourceNotFoundException.class);
+        verifyNoInteractions(contextualizerService, vectorRetrievalService, groqChatModel, geminiChatModel);
+
+        // 6. Odd historyWindowSize (leading AssistantMessage) drops orphan leading AssistantMessage so Gemini/Groq prompt starts with USER
+        RagProperties oddWindowProps = new RagProperties(
+            RagProperties.RetrievalProperties.defaults(),
+            RagProperties.LlmProperties.defaults(),
+            new RagProperties.MemoryProperties(5, 1000, 80)
+        );
+        RagChatService oddWindowService = createMultiTurnService("AIza-configured-key", oddWindowProps, sessionService, contextualizerService);
+        ChatMessageEntity orphanLeadingAssistant = chatMsg(MessageRole.ASSISTANT, "Trả lời cũ bị cắt nửa cặp", false);
+        List<ChatMessageEntity> oddHistory = List.of(orphanLeadingAssistant, u1, a1);
+        when(sessionService.loadAuthorizedHistoryForTurn(eq(sessionId), eq(HR_USER_ID), any(RbacVectorScope.class)))
+            .thenReturn(oddHistory);
+        when(contextualizerService.contextualize("Còn tiếp?", oddHistory))
+            .thenReturn(new QueryContextualizerService.ContextualizedQuery("Còn tiếp theo quy định nào?", "Còn tiếp theo quy định nào?", 30, 10, RagConstants.PROVIDER_GROQ));
+        when(vectorRetrievalService.retrieve(eq("Còn tiếp theo quy định nào?"), any(RbacVectorScope.class)))
+            .thenReturn(List.of(chunk));
+        clearInvocations(groqChatModel, geminiChatModel);
+        when(groqChatModel.call(any(Prompt.class))).thenThrow(new RuntimeException("Groq 503"));
+        when(geminiChatModel.call(any(Prompt.class))).thenAnswer(inv -> {
+            Prompt prompt = inv.getArgument(0);
+            List<Message> instructions = prompt.getInstructions();
+            assertThat(instructions).hasSize(4); // System + u1 + a1 + current User (orphanLeadingAssistant dropped!)
+            assertThat(instructions.get(0)).isInstanceOf(SystemMessage.class);
+            assertThat(instructions.get(1)).isInstanceOf(UserMessage.class);
+            assertThat(instructions.get(1).getText()).isEqualTo("Nghỉ phép năm bao nhiêu ngày?");
+            assertThat(instructions.get(2)).isInstanceOf(AssistantMessage.class);
+            assertThat(instructions.get(3)).isInstanceOf(UserMessage.class);
+            return chatResponse("Tiếp theo quy định [Nguồn: handbook.pdf - Trang 3].", 110, 20);
+        });
+
+        ChatAskResponse oddResponse = oddWindowService.ask("Còn tiếp?", sessionId, null, caller);
+        assertThat(oddResponse.modelProvider()).isEqualTo(RagConstants.PROVIDER_GEMINI);
+    }
+
+    private RagChatService createMultiTurnService(
+        String geminiApiKey,
+        RagProperties props,
+        ChatSessionService chatSessionService,
+        QueryContextualizerService queryContextualizerService
+    ) {
+        AiProperties aiProperties = new AiProperties(new AiProperties.GeminiProperties(
+            "https://generativelanguage.googleapis.com/v1beta/openai",
+            "/chat/completions",
+            geminiApiKey,
+            "gemini-3.5-flash",
+            0.1d
+        ));
+        return new RagChatService(
+            vectorRetrievalService,
+            groundedSystemPromptService,
+            rbacVectorFilterFactory,
+            groqChatClient,
+            providerOf(geminiChatClient),
+            providerOf(userRepository),
+            providerOf(departmentRepository),
+            providerOf(auditLogRepository),
+            providerOf(transactionTemplate),
+            providerOf(chatSessionService),
+            providerOf(queryContextualizerService),
+            aiProperties,
+            props,
+            environment
+        );
+    }
+
+    private static ChatMessageEntity chatMsg(MessageRole role, String content, boolean abstained) {
+        ChatMessageEntity entity = new ChatMessageEntity();
+        entity.setId(UUID.randomUUID());
+        entity.setRole(role);
+        entity.setContent(content);
+        entity.setAbstained(abstained);
+        return entity;
+    }
+
     private RagChatService createService(String geminiApiKey, RagProperties props) {
         AiProperties aiProperties = new AiProperties(new AiProperties.GeminiProperties(
             "https://generativelanguage.googleapis.com/v1beta/openai",
@@ -526,6 +722,8 @@ class RagChatServiceTest {
             providerOf(departmentRepository),
             providerOf(auditLogRepository),
             providerOf(transactionTemplate),
+            providerOf(null),
+            providerOf(null),
             aiProperties,
             props,
             environment
