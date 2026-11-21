@@ -12,7 +12,8 @@ import org.springframework.validation.annotation.Validated;
 @ConfigurationProperties(prefix = "documind.rag")
 public record RagProperties(
     RetrievalProperties retrieval,
-    LlmProperties llm
+    LlmProperties llm,
+    MemoryProperties memory
 ) {
 
     public static final int DEFAULT_TOP_K = 5;
@@ -21,15 +22,27 @@ public record RagProperties(
     public static final int DEFAULT_MAX_EXCERPT_CHARS = 500;
     public static final int DEFAULT_MAX_QUESTION_CHARS = 4000;
     public static final boolean DEFAULT_FALLBACK_ENABLED = true;
+    public static final int DEFAULT_HISTORY_WINDOW_SIZE = 6;
+    public static final int DEFAULT_MAX_HISTORY_MESSAGE_CHARS = 1000;
+    public static final int DEFAULT_AUTO_TITLE_MAX_CHARS = 80;
 
     @ConstructorBinding
     public RagProperties {
         retrieval = retrieval != null ? retrieval : RetrievalProperties.defaults();
         llm = llm != null ? llm : LlmProperties.defaults();
+        memory = memory != null ? memory : MemoryProperties.defaults();
+    }
+
+    public RagProperties(RetrievalProperties retrieval, LlmProperties llm) {
+        this(retrieval, llm, MemoryProperties.defaults());
     }
 
     public static RagProperties defaults() {
-        return new RagProperties(RetrievalProperties.defaults(), LlmProperties.defaults());
+        return new RagProperties(
+            RetrievalProperties.defaults(),
+            LlmProperties.defaults(),
+            MemoryProperties.defaults()
+        );
     }
 
     public record RetrievalProperties(
@@ -83,6 +96,34 @@ public record RagProperties(
 
         public static LlmProperties defaults() {
             return new LlmProperties(DEFAULT_MAX_QUESTION_CHARS, DEFAULT_FALLBACK_ENABLED);
+        }
+    }
+
+    public record MemoryProperties(
+        @DefaultValue("6") int historyWindowSize,
+        @DefaultValue("1000") int maxHistoryMessageChars,
+        @DefaultValue("80") int autoTitleMaxChars
+    ) {
+
+        @ConstructorBinding
+        public MemoryProperties {
+            if (historyWindowSize < 1 || historyWindowSize > 20) {
+                throw new IllegalArgumentException("historyWindowSize must be between 1 and 20");
+            }
+            if (maxHistoryMessageChars < 100 || maxHistoryMessageChars > 8000) {
+                throw new IllegalArgumentException("maxHistoryMessageChars must be between 100 and 8000");
+            }
+            if (autoTitleMaxChars < 16 || autoTitleMaxChars > 255) {
+                throw new IllegalArgumentException("autoTitleMaxChars must be between 16 and 255");
+            }
+        }
+
+        public static MemoryProperties defaults() {
+            return new MemoryProperties(
+                DEFAULT_HISTORY_WINDOW_SIZE,
+                DEFAULT_MAX_HISTORY_MESSAGE_CHARS,
+                DEFAULT_AUTO_TITLE_MAX_CHARS
+            );
         }
     }
 }

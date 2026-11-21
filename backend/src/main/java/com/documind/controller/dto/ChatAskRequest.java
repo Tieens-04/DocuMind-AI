@@ -21,6 +21,12 @@ public record ChatAskRequest(
     String question,
 
     @Schema(
+        description = "Optional existing chat session UUID owned by the caller; when omitted, a new session is automatically created for authenticated users",
+        nullable = true
+    )
+    UUID sessionId,
+
+    @Schema(
         description = "Optional target department UUID filter allowed exclusively for SYSTEM_ADMIN; rejected with 403 for non-admin callers",
         nullable = true
     )
@@ -28,6 +34,10 @@ public record ChatAskRequest(
 ) {
 
     public ChatAskRequest(String question) {
-        this(question, null);
+        this(question, null, null);
+    }
+
+    public ChatAskRequest(String question, UUID departmentId) {
+        this(question, null, departmentId);
     }
 }

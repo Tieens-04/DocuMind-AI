@@ -3,34 +3,35 @@ package com.documind.service.rag;
 import com.documind.controller.dto.ChatAskResponse;
 import com.documind.controller.dto.CitationDto;
 import com.documind.domain.entity.AuditLogEntity;
+import com.documind.domain.entity.ChatMessageEntity;
 import com.documind.domain.entity.DepartmentEntity;
 import com.documind.domain.entity.UserEntity;
 import com.documind.domain.enums.AuditActionType;
 import com.documind.domain.enums.CacheTier;
-import com.documind.domain.enums.Role;
-import com.documind.exception.DocumentAccessDeniedException;
+import com.documind.domain.enums.MessageRole;
 import com.documind.exception.InvalidChatRequestException;
 import com.documind.exception.LlmProviderException;
 import com.documind.exception.ResourceNotFoundException;
-import com.documind.infrastructure.ai.AiModelConfig;
 import com.documind.infrastructure.ai.AiProperties;
 import com.documind.repository.AuditLogRepository;
 import com.documind.repository.DepartmentRepository;
 import com.documind.repository.UserRepository;
+import com.documind.service.chat.ChatSessionService;
 import com.documind.service.document.CallerContext;
 import com.documind.service.document.DevCallerFallbackEnabledCondition;
 import com.documind.service.document.DevFallbackCallerContextResolver;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.ai.chat.client.ChatClient;
+import org.springframework.ai.chat.messages.AssistantMessage;
 import org.springframework.ai.chat.messages.Message;
 import org.springframework.ai.chat.messages.UserMessage;
-import org.springframework.ai.chat.metadata.Usage;
 import org.springframework.ai.chat.model.ChatResponse;
 import org.springframework.ai.chat.prompt.Prompt;
 import org.springframework.ai.retry.NonTransientAiException;
 import org.springframework.ai.retry.TransientAiException;
 import org.springframework.beans.factory.ObjectProvider;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.core.env.Environment;
 import org.springframework.http.HttpStatus;
@@ -39,21 +40,22 @@ import org.springframework.stereotype.Service;
 import org.springframework.transaction.support.TransactionTemplate;
 import org.springframework.web.client.RestClientException;
 
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
 import java.util.UUID;
 import java.util.concurrent.TimeUnit;
 
 /**
- * Orchestrates synchronous grounded RAG question answering with deterministic zero-token refusal,
- * {@code SecurityContextHolder}-enforced RBAC vector retrieval, pre-prompt Defense-in-Depth checks,
- * optional Groq-to-Gemini failover, and cost/latency audit logging.
+ * Orchestrates synchronous grounded single-turn and multi-turn RAG question answering with
+ * session memory, follow-up query contextualization (bypassed on Turn 1 for TTFT),
+ * deterministic zero-answer-token refusal, {@code SecurityContextHolder}-enforced RBAC vector retrieval,
+ * pre-prompt Defense-in-Depth checks, optional Groq-to-Gemini failover, and FinOps cost/latency audit logging.
  */
 @Service
 public class RagChatService {
 
     private static final Logger log = LoggerFactory.getLogger(RagChatService.class);
-    private static final int MAX_IP_LENGTH = 45;
     private static final int MAX_REFUSAL_TRAILING_CHARS = 80;
 
     private final VectorRetrievalService vectorRetrievalService;
@@ -65,10 +67,13 @@ public class RagChatService {
     private final ObjectProvider<DepartmentRepository> departmentRepositoryProvider;
     private final ObjectProvider<AuditLogRepository> auditLogRepositoryProvider;
     private final ObjectProvider<TransactionTemplate> transactionTemplateProvider;
+    private final ObjectProvider<ChatSessionService> chatSessionServiceProvider;
+    private final ObjectProvider<QueryContextualizerService> queryContextualizerServiceProvider;
     private final AiProperties aiProperties;
     private final RagProperties ragProperties;
     private final Environment environment;
 
+    @Autowired
     public RagChatService(
         VectorRetrievalService vectorRetrievalService,
         GroundedSystemPromptService groundedSystemPromptService,
@@ -79,6 +84,8 @@ public class RagChatService {
         ObjectProvider<DepartmentRepository> departmentRepositoryProvider,
         ObjectProvider<AuditLogRepository> auditLogRepositoryProvider,
         ObjectProvider<TransactionTemplate> transactionTemplateProvider,
+        ObjectProvider<ChatSessionService> chatSessionServiceProvider,
+        ObjectProvider<QueryContextualizerService> queryContextualizerServiceProvider,
         AiProperties aiProperties,
         RagProperties ragProperties,
         Environment environment
@@ -92,6 +99,8 @@ public class RagChatService {
         this.departmentRepositoryProvider = Objects.requireNonNull(departmentRepositoryProvider, "departmentRepositoryProvider must not be null");
         this.auditLogRepositoryProvider = Objects.requireNonNull(auditLogRepositoryProvider, "auditLogRepositoryProvider must not be null");
         this.transactionTemplateProvider = Objects.requireNonNull(transactionTemplateProvider, "transactionTemplateProvider must not be null");
+        this.chatSessionServiceProvider = Objects.requireNonNull(chatSessionServiceProvider, "chatSessionServiceProvider must not be null");
+        this.queryContextualizerServiceProvider = Objects.requireNonNull(queryContextualizerServiceProvider, "queryContextualizerServiceProvider must not be null");
         this.aiProperties = aiProperties;
         this.ragProperties = Objects.requireNonNull(ragProperties, "ragProperties must not be null");
         this.environment = Objects.requireNonNull(environment, "environment must not be null");
@@ -99,11 +108,11 @@ public class RagChatService {
 
     /**
      * Executes grounded RAG retrieval and synchronous generation outside any database transaction,
-     * short-circuiting with zero LLM tokens whenever retrieval produces no eligible chunks.
+     * short-circuiting with zero answer LLM tokens whenever retrieval produces no eligible chunks.
      */
     @PreAuthorize("hasAnyRole('SYSTEM_ADMIN', 'DEPARTMENT_MANAGER', 'STANDARD_EMPLOYEE')")
     public ChatAskResponse ask(String rawQuestion, CallerContext caller) {
-        return ask(rawQuestion, null, caller);
+        return ask(rawQuestion, null, null, caller);
     }
 
     /**
@@ -112,6 +121,21 @@ public class RagChatService {
      */
     @PreAuthorize("hasAnyRole('SYSTEM_ADMIN', 'DEPARTMENT_MANAGER', 'STANDARD_EMPLOYEE')")
     public ChatAskResponse ask(String rawQuestion, UUID filterDepartmentId, CallerContext caller) {
+        return ask(rawQuestion, null, filterDepartmentId, caller);
+    }
+
+    /**
+     * Executes single-turn or multi-turn grounded RAG question answering with optional session continuation,
+     * Turn-1 rewrite bypass, bounded 6-message query contextualization, RBAC-scoped retrieval, FinOps token
+     * summation (Rewrite + Answer), and atomic post-turn persistence outside LLM network I/O.
+     */
+    @PreAuthorize("hasAnyRole('SYSTEM_ADMIN', 'DEPARTMENT_MANAGER', 'STANDARD_EMPLOYEE')")
+    public ChatAskResponse ask(
+        String rawQuestion,
+        UUID sessionId,
+        UUID filterDepartmentId,
+        CallerContext caller
+    ) {
         long startedAtNanos = System.nanoTime();
         RbacVectorScope rbacScope = rbacVectorFilterFactory.resolveScope(caller, filterDepartmentId);
         CallerContext verifiedCaller = rbacScope.caller();
@@ -123,49 +147,101 @@ public class RagChatService {
             throw new ResourceNotFoundException("Department not found: " + rbacScope.filterDepartmentId());
         }
 
+        ChatSessionService chatSessionService = chatSessionServiceProvider.getIfAvailable();
+        QueryContextualizerService contextualizerService = queryContextualizerServiceProvider.getIfAvailable();
+
+        List<ChatMessageEntity> recentHistory = List.of();
+        if (sessionId != null) {
+            if (chatSessionService == null || verifiedActor == null) {
+                throw new ResourceNotFoundException("Chat session not found: " + sessionId);
+            }
+            recentHistory = chatSessionService.loadAuthorizedHistoryForTurn(sessionId, verifiedActor.getId(), rbacScope);
+        }
+        boolean skipRewrite = recentHistory.isEmpty();
+
+        // Turn 1 bypasses QueryContextualizerService completely (0 rewrite tokens, optimal TTFT)
+        QueryContextualizerService.ContextualizedQuery contextualized =
+            (!skipRewrite && contextualizerService != null)
+                ? contextualizerService.contextualize(normalizedQuestion, recentHistory)
+                : QueryContextualizerService.ContextualizedQuery.skipped(normalizedQuestion);
+
         UUID auditDepartmentId = resolveAuditDepartmentId(rbacScope);
 
         List<RetrievedChunk> chunks;
         try {
-            chunks = vectorRetrievalService.retrieve(normalizedQuestion, rbacScope);
+            chunks = vectorRetrievalService.retrieve(contextualized.effectiveQuery(), rbacScope);
         } catch (TransientAiException | NonTransientAiException | RestClientException ex) {
             long failureLatencyMs = elapsedMillis(startedAtNanos);
-            recordFailureAuditQuietly(verifiedActor, auditDepartmentId, verifiedCaller.ipAddress(), normalizedQuestion, failureLatencyMs, RagConstants.PROVIDER_OLLAMA);
+            recordFailureAuditQuietly(
+                verifiedActor,
+                auditDepartmentId,
+                sessionId,
+                chatSessionService,
+                verifiedCaller.ipAddress(),
+                normalizedQuestion,
+                contextualized.promptTokens(),
+                contextualized.completionTokens(),
+                failureLatencyMs,
+                RagConstants.PROVIDER_OLLAMA
+            );
             throw new LlmProviderException(RagConstants.PROVIDER_OLLAMA, "Embedding provider failed during vector retrieval", ex);
         } catch (LlmProviderException ex) {
             long failureLatencyMs = elapsedMillis(startedAtNanos);
             String failedProvider = ex.provider() != null ? ex.provider() : RagConstants.PROVIDER_OLLAMA;
-            recordFailureAuditQuietly(verifiedActor, auditDepartmentId, verifiedCaller.ipAddress(), normalizedQuestion, failureLatencyMs, failedProvider);
-            throw ex;
-        }
-        if (chunks.isEmpty()) {
-            long latencyMs = elapsedMillis(startedAtNanos);
-            saveAuditLog(
+            recordFailureAuditQuietly(
                 verifiedActor,
                 auditDepartmentId,
+                sessionId,
+                chatSessionService,
+                verifiedCaller.ipAddress(),
                 normalizedQuestion,
+                contextualized.promptTokens(),
+                contextualized.completionTokens(),
+                failureLatencyMs,
+                failedProvider
+            );
+            throw ex;
+        }
+
+        if (chunks.isEmpty()) {
+            long latencyMs = elapsedMillis(startedAtNanos);
+            int totalPromptTokens = contextualized.promptTokens();
+            int totalCompletionTokens = contextualized.completionTokens();
+            String effectiveProvider = contextualized.provider();
+
+            ChatSessionService.PersistedTurnResult persisted = persistCompletedTurnOrAuditOnly(
+                chatSessionService,
+                verifiedActor,
+                auditDepartmentId,
+                sessionId,
+                normalizedQuestion,
+                contextualized.rewrittenQuery(),
+                RagConstants.SAFE_REFUSAL_MESSAGE,
+                List.of(),
                 true,
-                0,
-                0,
+                effectiveProvider,
+                totalPromptTokens,
+                totalCompletionTokens,
                 latencyMs,
-                null,
-                HttpStatus.OK.value(),
                 verifiedCaller.ipAddress()
             );
             return new ChatAskResponse(
+                persisted != null ? persisted.sessionId() : null,
+                persisted != null ? persisted.assistantMessageId() : null,
+                contextualized.rewrittenQuery(),
                 RagConstants.SAFE_REFUSAL_MESSAGE,
                 true,
                 List.of(),
-                null,
-                0,
-                0,
+                effectiveProvider,
+                totalPromptTokens,
+                totalCompletionTokens,
                 latencyMs
             );
         }
 
         // Layer 2b Pre-Prompt Hard Guard enforced inside GroundedSystemPromptService via rbacScope.assertAllAuthorized
         Message systemMessage = groundedSystemPromptService.buildSystemMessage(chunks, rbacScope);
-        Prompt prompt = new Prompt(List.of(systemMessage, new UserMessage(normalizedQuestion)));
+        Prompt prompt = buildAnswerPrompt(systemMessage, recentHistory, normalizedQuestion, contextualized);
 
         ProviderResult result;
         try {
@@ -173,7 +249,18 @@ public class RagChatService {
         } catch (LlmProviderException ex) {
             long failureLatencyMs = elapsedMillis(startedAtNanos);
             String failedProvider = ex.provider() != null ? ex.provider() : RagConstants.PROVIDER_GROQ;
-            recordFailureAuditQuietly(verifiedActor, auditDepartmentId, verifiedCaller.ipAddress(), normalizedQuestion, failureLatencyMs, failedProvider);
+            recordFailureAuditQuietly(
+                verifiedActor,
+                auditDepartmentId,
+                sessionId,
+                chatSessionService,
+                verifiedCaller.ipAddress(),
+                normalizedQuestion,
+                contextualized.promptTokens(),
+                contextualized.completionTokens(),
+                failureLatencyMs,
+                failedProvider
+            );
             throw ex;
         }
 
@@ -184,35 +271,150 @@ public class RagChatService {
             ? List.of()
             : chunks.stream().map(RetrievedChunk::citation).toList();
 
-        saveAuditLog(
+        int totalPromptTokens = contextualized.promptTokens() + result.promptTokens();
+        int totalCompletionTokens = contextualized.completionTokens() + result.completionTokens();
+
+        ChatSessionService.PersistedTurnResult persisted = persistCompletedTurnOrAuditOnly(
+            chatSessionService,
             verifiedActor,
             auditDepartmentId,
+            sessionId,
             normalizedQuestion,
+            contextualized.rewrittenQuery(),
+            finalAnswer,
+            finalCitations,
             llmRefused,
-            result.promptTokens(),
-            result.completionTokens(),
-            latencyMs,
             result.provider(),
-            HttpStatus.OK.value(),
+            totalPromptTokens,
+            totalCompletionTokens,
+            latencyMs,
             verifiedCaller.ipAddress()
         );
 
         return new ChatAskResponse(
+            persisted != null ? persisted.sessionId() : null,
+            persisted != null ? persisted.assistantMessageId() : null,
+            contextualized.rewrittenQuery(),
             finalAnswer,
             llmRefused,
             finalCitations,
             result.provider(),
-            result.promptTokens(),
-            result.completionTokens(),
+            totalPromptTokens,
+            totalCompletionTokens,
             latencyMs
         );
+    }
+
+    private Prompt buildAnswerPrompt(
+        Message systemMessage,
+        List<ChatMessageEntity> recentHistory,
+        String normalizedQuestion,
+        QueryContextualizerService.ContextualizedQuery contextualized
+    ) {
+        if (recentHistory == null || recentHistory.isEmpty()) {
+            return new Prompt(List.of(systemMessage, new UserMessage(normalizedQuestion)));
+        }
+
+        int maxHistoryChars = ragProperties.memory().maxHistoryMessageChars();
+        List<Message> messages = new ArrayList<>(recentHistory.size() + 2);
+        messages.add(systemMessage);
+        appendNonAbstainedHistory(messages, recentHistory, maxHistoryChars);
+
+        String userPromptText = contextualized.wasRewritten()
+            ? normalizedQuestion + "\n[Câu hỏi độc lập đã làm rõ: " + contextualized.effectiveQuery() + "]"
+            : normalizedQuestion;
+        messages.add(new UserMessage(userPromptText));
+        return new Prompt(messages);
+    }
+
+    private static void appendNonAbstainedHistory(
+        List<Message> target,
+        List<ChatMessageEntity> chronologicalHistory,
+        int maxMessageChars
+    ) {
+        int size = chronologicalHistory.size();
+        for (int i = 0; i < size; i++) {
+            ChatMessageEntity current = chronologicalHistory.get(i);
+            if (current == null || current.getContent() == null || current.getContent().isBlank()) {
+                continue;
+            }
+            // Skip abstained assistant turns and any orphan leading ASSISTANT turn (e.g. odd windowSize) so Gemini alternation starts with USER
+            if (current.getRole() == MessageRole.ASSISTANT && (current.isAbstained() || target.size() == 1)) {
+                continue;
+            }
+            if (current.getRole() == MessageRole.USER
+                && i + 1 < size
+                && chronologicalHistory.get(i + 1) != null
+                && chronologicalHistory.get(i + 1).getRole() == MessageRole.ASSISTANT
+                && chronologicalHistory.get(i + 1).isAbstained()) {
+                // Skip the paired USER question whose ASSISTANT turn abstained so prior OOS turns don't pollute context
+                i++;
+                continue;
+            }
+            String boundedContent = QueryContextualizerService.truncateSafe(current.getContent(), maxMessageChars);
+            if (current.getRole() == MessageRole.ASSISTANT) {
+                target.add(new AssistantMessage(boundedContent));
+            } else {
+                target.add(new UserMessage(boundedContent));
+            }
+        }
+    }
+
+    private ChatSessionService.PersistedTurnResult persistCompletedTurnOrAuditOnly(
+        ChatSessionService chatSessionService,
+        UserEntity verifiedActor,
+        UUID auditDepartmentId,
+        UUID sessionId,
+        String normalizedQuestion,
+        String rewrittenQuery,
+        String finalAnswer,
+        List<CitationDto> finalCitations,
+        boolean abstained,
+        String provider,
+        int totalPromptTokens,
+        int totalCompletionTokens,
+        long latencyMs,
+        String ipAddress
+    ) {
+        if (chatSessionService != null && verifiedActor != null) {
+            return chatSessionService.recordCompletedTurn(
+                new ChatSessionService.CompletedTurnCommand(
+                    verifiedActor,
+                    auditDepartmentId,
+                    sessionId,
+                    normalizedQuestion,
+                    rewrittenQuery,
+                    finalAnswer,
+                    finalCitations,
+                    abstained,
+                    provider,
+                    totalPromptTokens,
+                    totalCompletionTokens,
+                    latencyMs,
+                    ipAddress
+                )
+            );
+        }
+        saveAuditLog(
+            verifiedActor,
+            auditDepartmentId,
+            normalizedQuestion,
+            abstained,
+            totalPromptTokens,
+            totalCompletionTokens,
+            latencyMs,
+            provider,
+            HttpStatus.OK.value(),
+            ipAddress
+        );
+        return null;
     }
 
     private ProviderResult invokeChatWithFailover(Prompt prompt) {
         try {
             return invokeSingleProvider(groqChatClient, RagConstants.PROVIDER_GROQ, prompt);
         } catch (RuntimeException primaryFailure) {
-            if (!isGeminiFallbackAvailable()) {
+            if (!QueryContextualizerService.isGeminiConfigured(ragProperties, geminiChatClientProvider, aiProperties)) {
                 if (primaryFailure instanceof LlmProviderException llmEx && llmEx.provider() != null) {
                     throw llmEx;
                 }
@@ -242,30 +444,8 @@ public class RagChatService {
             throw new LlmProviderException(providerName, "Blank answer received from provider: " + providerName);
         }
 
-        int promptTokens = 0;
-        int completionTokens = 0;
-        if (response.getMetadata() != null && response.getMetadata().getUsage() != null) {
-            Usage usage = response.getMetadata().getUsage();
-            if (usage.getPromptTokens() != null) {
-                promptTokens = Math.max(0, usage.getPromptTokens());
-            }
-            if (usage.getCompletionTokens() != null) {
-                completionTokens = Math.max(0, usage.getCompletionTokens());
-            }
-        }
-        return new ProviderResult(providerName, text.trim(), promptTokens, completionTokens);
-    }
-
-    private boolean isGeminiFallbackAvailable() {
-        if (!ragProperties.llm().fallbackEnabled()) {
-            return false;
-        }
-        ChatClient geminiClient = geminiChatClientProvider.getIfAvailable();
-        if (geminiClient == null || aiProperties == null || aiProperties.gemini() == null) {
-            return false;
-        }
-        String apiKey = aiProperties.gemini().apiKey();
-        return apiKey != null && !apiKey.isBlank() && !AiModelConfig.UNCONFIGURED_API_KEY.equals(apiKey.trim());
+        QueryContextualizerService.TokenCounts tokens = QueryContextualizerService.extractTokenCounts(response);
+        return new ProviderResult(providerName, text.trim(), tokens.promptTokens(), tokens.completionTokens());
     }
 
     private String normalizeAndValidateQuestion(String rawQuestion) {
@@ -295,18 +475,7 @@ public class RagChatService {
         if (user == null) {
             return null;
         }
-        if (!user.isActive()) {
-            throw new DocumentAccessDeniedException("User account is inactive");
-        }
-        if (!user.getRole().canAssume(caller.role())) {
-            throw new DocumentAccessDeniedException("Caller role exceeds authenticated user privileges");
-        }
-        if (!caller.isSystemAdmin()
-            && user.getRole() != Role.SYSTEM_ADMIN
-            && caller.departmentId() != null
-            && !Objects.equals(user.getDepartmentId(), caller.departmentId())) {
-            throw new DocumentAccessDeniedException("Caller user does not belong to target department");
-        }
+        ChatSessionService.assertCallerMatchesUser(caller, user);
         return user;
     }
 
@@ -319,19 +488,37 @@ public class RagChatService {
     private void recordFailureAuditQuietly(
         UserEntity verifiedActor,
         UUID auditDepartmentId,
+        UUID sessionId,
+        ChatSessionService chatSessionService,
         String ipAddress,
         String queryText,
+        int promptTokens,
+        int completionTokens,
         long latencyMs,
         String failedProvider
     ) {
         try {
+            if (chatSessionService != null) {
+                chatSessionService.recordFailureAudit(
+                    verifiedActor,
+                    auditDepartmentId,
+                    sessionId,
+                    queryText,
+                    promptTokens,
+                    completionTokens,
+                    latencyMs,
+                    failedProvider,
+                    ipAddress
+                );
+                return;
+            }
             saveAuditLog(
                 verifiedActor,
                 auditDepartmentId,
                 queryText,
                 true,
-                0,
-                0,
+                promptTokens,
+                completionTokens,
                 latencyMs,
                 failedProvider,
                 HttpStatus.BAD_GATEWAY.value(),
@@ -370,12 +557,12 @@ public class RagChatService {
             auditLog.setLatencyMs(Math.max(0L, latencyMs));
             auditLog.setProvider(provider);
             auditLog.setStatusCode(statusCode);
-            auditLog.setIpAddress(truncateIp(ipAddress));
+            auditLog.setIpAddress(ChatSessionService.truncateIp(ipAddress));
             auditLogRepositoryProvider.getObject().save(auditLog);
         });
     }
 
-    private static boolean isSafeRefusalResponse(String answer) {
+    static boolean isSafeRefusalResponse(String answer) {
         String stripped = stripRefusalWrappers(answer);
         int refusalLen = RagConstants.SAFE_REFUSAL_MESSAGE.length();
         if (!stripped.regionMatches(true, 0, RagConstants.SAFE_REFUSAL_MESSAGE, 0, refusalLen)) {
@@ -415,17 +602,6 @@ public class RagChatService {
 
     private static long elapsedMillis(long startedAtNanos) {
         return Math.max(0L, TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startedAtNanos));
-    }
-
-    private static String truncateIp(String ipAddress) {
-        if (ipAddress == null) {
-            return null;
-        }
-        String trimmed = ipAddress.trim();
-        if (trimmed.isEmpty()) {
-            return null;
-        }
-        return trimmed.length() > MAX_IP_LENGTH ? trimmed.substring(0, MAX_IP_LENGTH) : trimmed;
     }
 
     private record ProviderResult(

@@ -18,11 +18,11 @@ import org.springframework.web.bind.annotation.RestController;
 import java.util.Objects;
 
 /**
- * REST API endpoints for synchronous grounded RAG question answering.
+ * REST API endpoints for synchronous grounded multi-turn RAG question answering.
  */
 @RestController
 @RequestMapping("/api/v1/chat")
-@Tag(name = "Chat", description = "Grounded RAG Q&A with RBAC retrieval, source citations, and zero-hallucination fallback")
+@Tag(name = "Chat", description = "Grounded multi-turn RAG Q&A with RBAC retrieval, query contextualization, citations, and zero-hallucination fallback")
 public class ChatController {
 
     private final RagChatService ragChatService;
@@ -36,14 +36,19 @@ public class ChatController {
     @PostMapping("/ask")
     @Operation(
         summary = "Ask grounded RAG question",
-        description = "Retrieves RBAC-scoped chunks from pgvector using SecurityContextHolder (with optional departmentId filtering exclusively for SYSTEM_ADMIN), verifies chunks with Java Defense-in-Depth, and answers strictly from document context with citations or returns a deterministic zero-token refusal"
+        description = "Supports single-turn auto-session creation (skipping query rewrite on Turn 1 for optimal TTFT) and multi-turn follow-up contextualization (last 6 messages), enforces RBAC vector search + Java Defense-in-Depth, and persists the turn atomically"
     )
     public ResponseEntity<ChatAskResponse> ask(
         @Valid @RequestBody ChatAskRequest requestBody,
         HttpServletRequest request
     ) {
         CallerContext caller = callerContextResolver.resolve(request);
-        ChatAskResponse response = ragChatService.ask(requestBody.question(), requestBody.departmentId(), caller);
+        ChatAskResponse response = ragChatService.ask(
+            requestBody.question(),
+            requestBody.sessionId(),
+            requestBody.departmentId(),
+            caller
+        );
         return ResponseEntity.ok(response);
     }
 }
