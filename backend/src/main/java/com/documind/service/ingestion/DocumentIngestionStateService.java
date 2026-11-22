@@ -160,7 +160,11 @@ public class DocumentIngestionStateService {
         }
         Boolean failed = transactionTemplateSupplier.get().execute(status -> {
             int updated = documentRepository().markFailed(documentId, docVersion, errorMessage);
-            chunkVectorRepositorySupplier.get().deleteByDocumentIdAndVersion(documentId, docVersion);
+            DocumentChunkVectorRepository chunkRepo = chunkVectorRepositorySupplier.get();
+            chunkRepo.deleteByDocumentIdAndVersion(documentId, docVersion);
+            if (updated > 0 && docVersion > 1) {
+                chunkRepo.deleteByDocumentIdAndVersionLessThan(documentId, docVersion);
+            }
             return updated > 0;
         });
         return Boolean.TRUE.equals(failed);
@@ -185,7 +189,11 @@ public class DocumentIngestionStateService {
                     IngestionFailureFormatter.INTERRUPTED_ERROR_MESSAGE
                 );
                 if (updated > 0) {
-                    chunkVectorRepositorySupplier.get().deleteByDocumentIdAndVersion(docId, version);
+                    DocumentChunkVectorRepository chunkRepo = chunkVectorRepositorySupplier.get();
+                    chunkRepo.deleteByDocumentIdAndVersion(docId, version);
+                    if (version > 1) {
+                        chunkRepo.deleteByDocumentIdAndVersionLessThan(docId, version);
+                    }
                     return true;
                 }
                 return false;

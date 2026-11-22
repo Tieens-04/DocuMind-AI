@@ -1,5 +1,6 @@
 package com.documind.service.document;
 
+import com.documind.controller.dto.DocumentPreviewUrlResponse;
 import com.documind.controller.dto.DocumentResponse;
 import com.documind.controller.dto.DocumentStatusResponse;
 import com.documind.controller.dto.PageResponse;
@@ -15,6 +16,7 @@ import com.documind.domain.enums.Role;
 import com.documind.domain.event.DocumentUploadedEvent;
 import com.documind.exception.DocumentAccessDeniedException;
 import com.documind.exception.DocumentNotFoundException;
+import com.documind.exception.DocumentStorageException;
 import com.documind.exception.DuplicateDocumentException;
 import com.documind.exception.InvalidDocumentRequestException;
 import com.documind.exception.ResourceNotFoundException;
@@ -43,7 +45,11 @@ import org.springframework.web.multipart.MultipartFile;
 
 import java.io.IOException;
 import java.io.InputStream;
+import java.net.URL;
 import java.text.Normalizer;
+import java.time.Duration;
+import java.time.OffsetDateTime;
+import java.time.ZoneOffset;
 import java.util.Locale;
 import java.util.Objects;
 import java.util.Optional;
@@ -184,7 +190,7 @@ public class DocumentService {
         UserEntity uploadedBy = resolveVerifiedActor(caller, department.getId());
 
         // Phase 1: Validate bounded 64 KiB header and stream once through SHA-256 + 50 MiB guard into MinIO
-        StagedUpload stagedUpload = streamToStorage(file, department.getId());
+        StagedUpload stagedUpload = streamToStorage(file, department.getId(), INITIAL_DOCUMENT_VERSION);
 
         // Phase 2: Short atomic DB commit with compensating S3 deletion on duplicate or failure
         try {
@@ -199,15 +205,12 @@ public class DocumentService {
         } catch (DataIntegrityViolationException ex) {
             minioStorageService.deleteObjectQuietly(stagedUpload.storageKey());
             // Query winner outside the rolled-back transaction (PostgreSQL aborts statements in failed tx)
-            Optional<DocumentEntity> winner = documentRepository()
-                .findByDepartmentIdAndFileHash(department.getId(), stagedUpload.fileHash());
-            if (winner.isPresent()) {
-                throw new DuplicateDocumentException(
-                    winner.get().getId(),
-                    stagedUpload.fileHash(),
-                    "A document with identical content already exists in this department"
-                );
-            }
+            rethrowIfDuplicateHashWinner(
+                department.getId(),
+                stagedUpload.fileHash(),
+                null,
+                "A document with identical content already exists in this department"
+            );
             throw ex;
         } catch (RuntimeException ex) {
             minioStorageService.deleteObjectQuietly(stagedUpload.storageKey());
@@ -269,7 +272,206 @@ public class DocumentService {
         return DocumentStatusResponse.from(loadReadableDocument(documentId, caller));
     }
 
+    /**
+     * Generates a short-lived inline MinIO presigned preview URL after enforcing role and department
+     * visibility via {@link DocumentVisibilityPolicy}. Appends {@code #page=X} for PDF documents when
+     * {@code page} is supplied and ignores the fragment for non-PDF formats.
+     */
+    @PreAuthorize("hasAnyRole('SYSTEM_ADMIN', 'DEPARTMENT_MANAGER', 'STANDARD_EMPLOYEE')")
+    public DocumentPreviewUrlResponse getDocumentPreviewUrl(UUID documentId, Integer page, CallerContext caller) {
+        if (documentId == null) {
+            throw new InvalidDocumentRequestException("Document ID must not be null");
+        }
+        if (page != null && page < 1) {
+            throw new InvalidDocumentRequestException("Preview page must be >= 1");
+        }
+        DocumentEntity document = loadReadableDocument(documentId, caller, "DOC_PREVIEW_URL_DENIED");
+
+        URL baseUrl = minioStorageService.generatePresignedGetUrl(document.getStorageKey(), document.getOriginalName());
+        if (baseUrl == null) {
+            throw new DocumentStorageException("Failed to generate presigned preview URL for document: " + documentId, null);
+        }
+        Duration expiry = minioStorageService.presignedExpiry();
+        OffsetDateTime expiresAt = OffsetDateTime.now(ZoneOffset.UTC).plus(expiry);
+
+        Integer effectivePage = (document.isPdf() && page != null) ? page : null;
+        String previewUrl = MinioStorageService.appendPageFragment(baseUrl.toString(), effectivePage);
+        int currentVersion = document.getCurrentVersion() != null ? document.getCurrentVersion() : INITIAL_DOCUMENT_VERSION;
+
+        log.info(
+            "SECURITY_AUDIT action=DOC_PREVIEW_URL actorUserId={} actorRole={} documentId={} version={} page={}",
+            caller.userId(),
+            caller.role(),
+            document.getId(),
+            currentVersion,
+            effectivePage
+        );
+        return new DocumentPreviewUrlResponse(
+            document.getId(),
+            document.getOriginalName(),
+            document.getMimeType(),
+            document.getFileExtension(),
+            currentVersion,
+            effectivePage,
+            previewUrl,
+            expiresAt
+        );
+    }
+
+    /**
+     * Replaces an existing document with a newly uploaded file version using two-phase non-transactional MinIO
+     * streaming and an atomic pessimistic-locked DB transition to {@code currentVersion + 1} ({@code PENDING}).
+     * Purges obsolete chunks before flushing metadata changes to avoid redundant V6/V7 chunk rewrites and HNSW
+     * top-K starvation, allows same-document hash retries, rejects duplicate hashes matching another document
+     * ({@code 409}), logs {@code DOC_REINDEX}, deletes the superseded MinIO object strictly after commit, and
+     * emits {@link DocumentUploadedEvent} for async re-indexing.
+     */
+    @PreAuthorize("hasAnyRole('SYSTEM_ADMIN', 'DEPARTMENT_MANAGER')")
+    public DocumentResponse replaceDocument(
+        UUID documentId,
+        MultipartFile file,
+        AccessLevel accessLevel,
+        CallerContext caller
+    ) {
+        long startedAtNanos = System.nanoTime();
+        if (documentId == null) {
+            throw new InvalidDocumentRequestException("Document ID must not be null");
+        }
+        requireCaller(caller);
+        if (!caller.canManageDocuments()) {
+            throw new DocumentAccessDeniedException("Insufficient permissions to update documents");
+        }
+        requireCallerDepartment(caller);
+        if (file == null) {
+            throw new InvalidDocumentRequestException("Uploaded file must not be null");
+        }
+
+        // Fast fail outside DB tx before streaming up to 50 MiB to MinIO
+        DocumentEntity preCheckDoc = documentRepository().findById(documentId)
+            .orElseThrow(() -> new DocumentNotFoundException(documentId));
+        if (!caller.isSystemAdmin() && !Objects.equals(caller.departmentId(), preCheckDoc.getDepartmentId())) {
+            throw new DocumentAccessDeniedException("You do not have permission to update this document");
+        }
+        resolveVerifiedActor(caller, caller.isSystemAdmin() ? null : preCheckDoc.getDepartmentId());
+
+        UUID preCheckDeptId = preCheckDoc.getDepartmentId();
+        int candidateStorageVersion = (preCheckDoc.getCurrentVersion() != null
+            ? preCheckDoc.getCurrentVersion()
+            : INITIAL_DOCUMENT_VERSION) + 1;
+
+        // Phase 1: Stream & hash outside any DB transaction (0 HikariCP connections held)
+        StagedUpload stagedUpload = streamToStorage(file, preCheckDeptId, candidateStorageVersion);
+        AtomicReference<UUID> lockedDeptIdRef = new AtomicReference<>(preCheckDeptId);
+
+        // Phase 2: Short atomic DB commit with compensating S3 cleanup on failure or duplicate race
+        try {
+            DocumentResponse replaced = transactionTemplate().execute(status -> persistReplacementMetadata(
+                documentId,
+                stagedUpload,
+                accessLevel,
+                caller,
+                startedAtNanos,
+                lockedDeptIdRef
+            ));
+
+            log.info(
+                "SECURITY_AUDIT action=DOC_REINDEX actorUserId={} documentId={} departmentId={} version={} accessLevel={}",
+                caller.userId(),
+                replaced.id(),
+                replaced.departmentId(),
+                replaced.currentVersion(),
+                replaced.accessLevel()
+            );
+            return replaced;
+        } catch (DataIntegrityViolationException ex) {
+            minioStorageService.deleteObjectQuietly(stagedUpload.storageKey());
+            rethrowIfDuplicateHashWinner(
+                lockedDeptIdRef.get(),
+                stagedUpload.fileHash(),
+                documentId,
+                "A document with identical content already exists in this department"
+            );
+            throw ex;
+        } catch (RuntimeException ex) {
+            minioStorageService.deleteObjectQuietly(stagedUpload.storageKey());
+            throw ex;
+        }
+    }
+
+    private DocumentResponse persistReplacementMetadata(
+        UUID documentId,
+        StagedUpload stagedUpload,
+        AccessLevel accessLevel,
+        CallerContext caller,
+        long startedAtNanos,
+        AtomicReference<UUID> lockedDeptIdRef
+    ) {
+        DocumentEntity locked = documentRepository().findByIdForUpdate(documentId)
+            .orElseThrow(() -> new DocumentNotFoundException(documentId));
+        UUID lockedDeptId = locked.getDepartmentId();
+        lockedDeptIdRef.set(lockedDeptId);
+
+        if (!caller.isSystemAdmin() && !Objects.equals(caller.departmentId(), lockedDeptId)) {
+            throw new DocumentAccessDeniedException("You do not have permission to update this document");
+        }
+        UserEntity actor = resolveVerifiedActor(caller, caller.isSystemAdmin() ? null : lockedDeptId);
+
+        Optional<DocumentEntity> existingHash = documentRepository()
+            .findByDepartmentIdAndFileHash(lockedDeptId, stagedUpload.fileHash());
+        if (existingHash.isPresent() && !Objects.equals(existingHash.get().getId(), locked.getId())) {
+            throw new DuplicateDocumentException(
+                existingHash.get().getId(),
+                stagedUpload.fileHash(),
+                "A document with identical content already exists in this department"
+            );
+        }
+
+        String oldStorageKey = locked.getStorageKey();
+        String oldOriginalName = locked.getOriginalName();
+        AccessLevel oldAccessLevel = locked.getAccessLevel();
+        AccessLevel effectiveAccessLevel = accessLevel != null ? accessLevel : oldAccessLevel;
+        int nextVersion = (locked.getCurrentVersion() != null
+            ? locked.getCurrentVersion()
+            : INITIAL_DOCUMENT_VERSION) + 1;
+        boolean triggerBumpsCacheVersion = !Objects.equals(oldOriginalName, stagedUpload.originalName())
+            || oldAccessLevel != effectiveAccessLevel;
+
+        // Purge obsolete chunks while locked entity is still clean (prevents Hibernate AUTO-flush firing V6/V7
+        // against dead vector rows and prevents dead chunks from starving HNSW top-K while v2 is PENDING/PROCESSING)
+        documentRepository().deleteChunksBeforeVersion(locked.getId(), nextVersion);
+
+        applyStagedUpload(locked, actor, stagedUpload, effectiveAccessLevel, nextVersion);
+        DocumentEntity saved = documentRepository().saveAndFlush(locked);
+        DocumentResponse response = DocumentResponse.from(saved);
+
+        saveAuditLog(
+            actor,
+            saved.getDepartment(),
+            AuditActionType.DOC_REINDEX,
+            saved.getOriginalName(),
+            HTTP_ACCEPTED,
+            caller.ipAddress(),
+            startedAtNanos
+        );
+        // PostgreSQL V6 trigger already bumps cache_version when original_name or access_level changed;
+        // increment explicitly only when both remained unchanged so cache_version always advances by +1.
+        if (!triggerBumpsCacheVersion) {
+            incrementCacheVersion(effectiveAccessLevel, lockedDeptId);
+        }
+
+        if (oldStorageKey != null && !Objects.equals(oldStorageKey, saved.getStorageKey())) {
+            scheduleDeleteAfterCommit(oldStorageKey);
+        }
+
+        publishUploadedEvent(saved);
+        return response;
+    }
+
     private DocumentEntity loadReadableDocument(UUID documentId, CallerContext caller) {
+        return loadReadableDocument(documentId, caller, null);
+    }
+
+    private DocumentEntity loadReadableDocument(UUID documentId, CallerContext caller, String deniedAuditAction) {
         if (documentId == null) {
             throw new InvalidDocumentRequestException("Document ID must not be null");
         }
@@ -280,6 +482,18 @@ public class DocumentService {
         DocumentEntity document = documentRepository().findById(documentId)
             .orElseThrow(() -> new DocumentNotFoundException(documentId));
         if (!DocumentVisibilityPolicy.canRead(caller, document.getDepartmentId(), document.getAccessLevel())) {
+            if (deniedAuditAction != null) {
+                log.warn(
+                    "SECURITY_AUDIT action={} actorUserId={} actorRole={} actorDeptId={} documentId={} docDeptId={} accessLevel={}",
+                    deniedAuditAction,
+                    caller.userId(),
+                    caller.role(),
+                    caller.departmentId(),
+                    document.getId(),
+                    document.getDepartmentId(),
+                    document.getAccessLevel()
+                );
+            }
             throw new DocumentAccessDeniedException("You do not have permission to access this document");
         }
         return document;
@@ -377,15 +591,7 @@ public class DocumentService {
 
                 DocumentEntity saved = documentRepository().saveAndFlush(document);
                 if (requeueActiveIngestion) {
-                    eventPublisher.publishEvent(new DocumentUploadedEvent(
-                        saved.getId(),
-                        saved.getDepartmentId(),
-                        saved.getStorageKey(),
-                        saved.getOriginalName(),
-                        saved.getFileExtension(),
-                        saved.getAccessLevel(),
-                        saved.getCurrentVersion()
-                    ));
+                    publishUploadedEvent(saved);
                 }
                 return DocumentResponse.from(saved);
             });
@@ -401,15 +607,12 @@ public class DocumentService {
         } catch (DataIntegrityViolationException ex) {
             TransferTarget transferTarget = transferTargetRef.get();
             if (transferTarget != null) {
-                Optional<DocumentEntity> winner = documentRepository()
-                    .findByDepartmentIdAndFileHash(transferTarget.departmentId(), transferTarget.fileHash());
-                if (winner.isPresent()) {
-                    throw new DuplicateDocumentException(
-                        winner.get().getId(),
-                        transferTarget.fileHash(),
-                        "A document with identical content already exists in the target department"
-                    );
-                }
+                rethrowIfDuplicateHashWinner(
+                    transferTarget.departmentId(),
+                    transferTarget.fileHash(),
+                    null,
+                    "A document with identical content already exists in the target department"
+                );
             }
             throw ex;
         }
@@ -433,7 +636,7 @@ public class DocumentService {
 
         transactionTemplate().executeWithoutResult(status -> {
             UserEntity auditUser = resolveVerifiedActor(caller, caller.isSystemAdmin() ? null : caller.departmentId());
-            DocumentEntity document = documentRepository().findById(documentId)
+            DocumentEntity document = documentRepository().findByIdForUpdate(documentId)
                 .orElseThrow(() -> new DocumentNotFoundException(documentId));
             if (!caller.isSystemAdmin() && !Objects.equals(caller.departmentId(), document.getDepartmentId())) {
                 throw new DocumentAccessDeniedException("You do not have permission to delete this document");
@@ -457,18 +660,7 @@ public class DocumentService {
             );
             // Increment after delete/audit while entities remain attached (query clears persistence context)
             incrementCacheVersion(accessLevel, documentDepartmentId);
-
-            if (!TransactionSynchronizationManager.isSynchronizationActive()) {
-                throw new IllegalStateException(
-                    "Transaction synchronization must be active when scheduling post-commit storage deletion"
-                );
-            }
-            TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
-                @Override
-                public void afterCommit() {
-                    minioStorageService.deleteObjectQuietly(storageKey);
-                }
-            });
+            scheduleDeleteAfterCommit(storageKey);
         });
     }
 
@@ -485,7 +677,7 @@ public class DocumentService {
         return caller.departmentId();
     }
 
-    private StagedUpload streamToStorage(MultipartFile file, UUID departmentId) {
+    private StagedUpload streamToStorage(MultipartFile file, UUID departmentId, int storageVersion) {
         UUID uploadUuid = UUID.randomUUID();
         String storageKey = null;
         boolean uploadedToStorage = false;
@@ -500,7 +692,7 @@ public class DocumentService {
                 storageKey = minioStorageService.buildStorageKey(
                     departmentId,
                     uploadUuid,
-                    INITIAL_DOCUMENT_VERSION,
+                    storageVersion,
                     validation.sanitizedFileName()
                 );
 
@@ -558,17 +750,7 @@ public class DocumentService {
 
         DocumentEntity entity = new DocumentEntity();
         entity.setDepartment(department);
-        entity.setUploadedBy(uploadedBy);
-        entity.setOriginalName(stagedUpload.originalName());
-        entity.setStorageKey(stagedUpload.storageKey());
-        entity.setFileExtension(stagedUpload.fileExtension());
-        entity.setMimeType(stagedUpload.canonicalMimeType());
-        entity.setFileSizeBytes(stagedUpload.fileSizeBytes());
-        entity.setFileHash(stagedUpload.fileHash());
-        entity.setAccessLevel(accessLevel);
-        entity.setStatus(DocumentStatus.PENDING);
-        entity.setCurrentVersion(INITIAL_DOCUMENT_VERSION);
-        entity.setChunkCount(0);
+        applyStagedUpload(entity, uploadedBy, stagedUpload, accessLevel, INITIAL_DOCUMENT_VERSION);
 
         DocumentEntity saved = documentRepository().saveAndFlush(entity);
         incrementCacheVersion(accessLevel, department.getId());
@@ -581,16 +763,71 @@ public class DocumentService {
             ipAddress,
             startedAtNanos
         );
+        publishUploadedEvent(saved);
+        return DocumentResponse.from(saved);
+    }
+
+    private void applyStagedUpload(
+        DocumentEntity entity,
+        UserEntity uploadedBy,
+        StagedUpload stagedUpload,
+        AccessLevel accessLevel,
+        int version
+    ) {
+        entity.setUploadedBy(uploadedBy);
+        entity.setOriginalName(stagedUpload.originalName());
+        entity.setStorageKey(stagedUpload.storageKey());
+        entity.setFileExtension(stagedUpload.fileExtension());
+        entity.setMimeType(stagedUpload.canonicalMimeType());
+        entity.setFileSizeBytes(stagedUpload.fileSizeBytes());
+        entity.setFileHash(stagedUpload.fileHash());
+        entity.setAccessLevel(accessLevel);
+        entity.setStatus(DocumentStatus.PENDING);
+        entity.setCurrentVersion(version);
+        entity.setChunkCount(0);
+        entity.setErrorMessage(null);
+    }
+
+    private void publishUploadedEvent(DocumentEntity saved) {
         eventPublisher.publishEvent(new DocumentUploadedEvent(
             saved.getId(),
-            department.getId(),
+            saved.getDepartmentId(),
             saved.getStorageKey(),
             saved.getOriginalName(),
             saved.getFileExtension(),
             saved.getAccessLevel(),
             saved.getCurrentVersion()
         ));
-        return DocumentResponse.from(saved);
+    }
+
+    private void scheduleDeleteAfterCommit(String storageKey) {
+        if (!TransactionSynchronizationManager.isSynchronizationActive()) {
+            throw new IllegalStateException(
+                "Transaction synchronization must be active when scheduling post-commit storage deletion"
+            );
+        }
+        TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
+            @Override
+            public void afterCommit() {
+                minioStorageService.deleteObjectQuietly(storageKey);
+            }
+        });
+    }
+
+    private void rethrowIfDuplicateHashWinner(
+        UUID departmentId,
+        String fileHash,
+        UUID excludedDocumentId,
+        String message
+    ) {
+        if (departmentId == null) {
+            return;
+        }
+        Optional<DocumentEntity> winner = documentRepository()
+            .findByDepartmentIdAndFileHash(departmentId, fileHash);
+        if (winner.isPresent() && (excludedDocumentId == null || !Objects.equals(winner.get().getId(), excludedDocumentId))) {
+            throw new DuplicateDocumentException(winner.get().getId(), fileHash, message);
+        }
     }
 
     private UserEntity resolveVerifiedActor(CallerContext caller, UUID targetDepartmentId) {
