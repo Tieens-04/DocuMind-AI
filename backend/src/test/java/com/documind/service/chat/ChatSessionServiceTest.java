@@ -342,6 +342,58 @@ class ChatSessionServiceTest {
     }
 
     @Test
+    void listMessagesOmitsPdfPageFragmentWhenCitedDocumentWasReindexedToNonPdfExtension() throws Exception {
+        CallerContext employee = new CallerContext(HR_EMPLOYEE_USER_ID, HR_DEPT_ID, Role.STANDARD_EMPLOYEE, null);
+        setJwtPrincipal(employee);
+
+        UUID sessionId = UUID.randomUUID();
+        ChatSessionEntity session = new ChatSessionEntity();
+        session.setId(sessionId);
+        session.setTitle("Phiên HR Reindex");
+        when(chatSessionRepository.findByIdAndUserId(sessionId, HR_EMPLOYEE_USER_ID))
+            .thenReturn(Optional.of(session));
+
+        UUID upgradedDocId = UUID.randomUUID();
+        DocumentEntity upgradedDoc = document(
+            upgradedDocId,
+            HR_DEPT_ID,
+            AccessLevel.DEPARTMENT,
+            DocumentStatus.COMPLETED,
+            "hr-handbook-v2.docx",
+            "hr/handbook-v2.docx"
+        );
+        upgradedDoc.setFileExtension("docx");
+
+        ChatMessageEntity assistantMsg = new ChatMessageEntity();
+        assistantMsg.setId(UUID.randomUUID());
+        assistantMsg.setSession(session);
+        assistantMsg.setRole(MessageRole.ASSISTANT);
+        assistantMsg.setContent("Chính sách đã cập nhật.");
+        assistantMsg.setCitations(List.of(
+            new CitationPayload(upgradedDocId, "hr-handbook-v1.pdf", 3, null, 0.90d, "Trích dẫn trang 3.")
+        ));
+        assistantMsg.setCreatedAt(OffsetDateTime.of(2026, 11, 22, 10, 0, 0, 0, ZoneOffset.UTC));
+
+        when(chatMessageRepository.findBySessionIdOrderByCreatedAtAscIdAsc(sessionId))
+            .thenReturn(List.of(assistantMsg));
+        when(documentRepository.findAllById(anyIterable()))
+            .thenReturn(List.of(upgradedDoc));
+        when(minioStorageService.generatePresignedGetUrl("hr/handbook-v2.docx", "hr-handbook-v2.docx"))
+            .thenReturn(URI.create("http://localhost:9000/documind/hr/handbook-v2.docx?sig=live").toURL());
+
+        List<ChatMessageResponse> responses = service.listMessages(sessionId, employee);
+
+        assertThat(responses).hasSize(1);
+        assertThat(responses.getFirst().citations()).hasSize(1);
+        CitationDto hydrated = responses.getFirst().citations().getFirst();
+        assertThat(hydrated.fileName()).isEqualTo("hr-handbook-v2.docx");
+        assertThat(hydrated.pageNumber()).isNull();
+        assertThat(hydrated.presignedUrl())
+            .isEqualTo("http://localhost:9000/documind/hr/handbook-v2.docx?sig=live")
+            .doesNotContain("#page=");
+    }
+
+    @Test
     void deriveAutoTitleHandlesVietnameseNfcWhitespaceCollapsingWordBoundaryAndAstralSurrogatePairs() {
         assertThat(service.deriveAutoTitle(null)).isEqualTo(ChatSessionService.DEFAULT_SESSION_TITLE);
         assertThat(service.deriveAutoTitle("   \n\t  ")).isEqualTo(ChatSessionService.DEFAULT_SESSION_TITLE);

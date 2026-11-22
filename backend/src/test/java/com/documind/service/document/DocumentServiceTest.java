@@ -1,5 +1,6 @@
 package com.documind.service.document;
 
+import com.documind.controller.dto.DocumentPreviewUrlResponse;
 import com.documind.controller.dto.DocumentResponse;
 import com.documind.controller.dto.DocumentStatusResponse;
 import com.documind.controller.dto.PageResponse;
@@ -35,8 +36,11 @@ import jakarta.persistence.criteria.Predicate;
 import jakarta.persistence.criteria.Root;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.ArgumentCaptor;
 import org.mockito.InOrder;
+import org.springframework.boot.test.system.CapturedOutput;
+import org.springframework.boot.test.system.OutputCaptureExtension;
 import org.springframework.context.ApplicationEventPublisher;
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.data.domain.Page;
@@ -57,8 +61,11 @@ import org.springframework.transaction.support.TransactionTemplate;
 
 import java.io.IOException;
 import java.io.InputStream;
+import java.lang.reflect.Method;
+import java.net.URI;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
+import java.time.Duration;
 import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
 import java.util.HexFormat;
@@ -82,10 +89,12 @@ import static org.mockito.Mockito.inOrder;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.spy;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
 
+@ExtendWith(OutputCaptureExtension.class)
 class DocumentServiceTest {
 
     private static final UUID IT_DEPT_ID = UUID.fromString("11111111-1111-1111-1111-111111111111");
@@ -743,7 +752,7 @@ class DocumentServiceTest {
         )).isInstanceOf(DocumentAccessDeniedException.class);
         verifyNoInteractions(documentRepository, minioStorageService);
 
-        when(documentRepository.findById(DOC_ID)).thenReturn(Optional.empty());
+        when(documentRepository.findByIdForUpdate(DOC_ID)).thenReturn(Optional.empty());
         assertThatThrownBy(() -> documentService.deleteDocument(
             DOC_ID, new CallerContext(null, IT_DEPT_ID, Role.DEPARTMENT_MANAGER, "127.0.0.1")
         )).isInstanceOf(DocumentNotFoundException.class);
@@ -751,7 +760,7 @@ class DocumentServiceTest {
 
         // Cross-department manager delete is forbidden even on PUBLIC documents (sanitized message)
         DocumentEntity publicDoc = document(DOC_ID, itDept, AccessLevel.PUBLIC, DocumentStatus.COMPLETED);
-        when(documentRepository.findById(DOC_ID)).thenReturn(Optional.of(publicDoc));
+        when(documentRepository.findByIdForUpdate(DOC_ID)).thenReturn(Optional.of(publicDoc));
         assertThatThrownBy(() -> documentService.deleteDocument(
             DOC_ID, new CallerContext(null, HR_DEPT_ID, Role.DEPARTMENT_MANAGER, "127.0.0.1")
         ))
@@ -766,7 +775,7 @@ class DocumentServiceTest {
         // Happy path: MinIO delete must NOT run before commit, and MUST run after commit
         UserEntity adminUser = user(ADMIN_USER_ID, itDept, Role.SYSTEM_ADMIN, true);
         when(userRepository.findById(ADMIN_USER_ID)).thenReturn(Optional.of(adminUser));
-        when(documentRepository.findById(DOC_ID)).thenReturn(Optional.of(deptDoc));
+        when(documentRepository.findByIdForUpdate(DOC_ID)).thenReturn(Optional.of(deptDoc));
         AtomicBoolean s3DeletedDuringDbDelete = new AtomicBoolean(false);
         doAnswer(inv -> {
             try {
@@ -790,6 +799,8 @@ class DocumentServiceTest {
         assertThat(deleteAuditCaptor.getValue().getDepartment()).isSameAs(itDept);
         assertThat(deleteAuditCaptor.getValue().getStatusCode()).isEqualTo(204);
         assertThat(deleteAuditCaptor.getValue().getIpAddress()).isEqualTo("10.0.0.5");
+        verify(documentRepository, times(3)).findByIdForUpdate(DOC_ID);
+        verify(documentRepository, never()).findById(any());
         verify(documentRepository).delete(deptDoc);
         verify(minioStorageService).deleteObjectQuietly(storageKey);
 
@@ -797,7 +808,7 @@ class DocumentServiceTest {
         clearInvocations(minioStorageService, departmentRepository);
         UUID publicDocId = UUID.fromString("88888888-8888-8888-8888-888888888888");
         DocumentEntity anotherPublicDoc = document(publicDocId, itDept, AccessLevel.PUBLIC, DocumentStatus.COMPLETED);
-        when(documentRepository.findById(publicDocId)).thenReturn(Optional.of(anotherPublicDoc));
+        when(documentRepository.findByIdForUpdate(publicDocId)).thenReturn(Optional.of(anotherPublicDoc));
         documentService.deleteDocument(publicDocId, new CallerContext(ADMIN_USER_ID, HR_DEPT_ID, Role.SYSTEM_ADMIN, "10.0.0.5"));
         verify(departmentRepository).incrementAllCacheVersions();
         verify(minioStorageService).deleteObjectQuietly(anotherPublicDoc.getStorageKey());
@@ -809,7 +820,7 @@ class DocumentServiceTest {
         DepartmentEntity hrDept = department(HR_DEPT_ID, "HR");
         DocumentEntity deptDoc = document(DOC_ID, itDept, AccessLevel.DEPARTMENT, DocumentStatus.COMPLETED);
         UserEntity hrManager = user(HR_USER_ID, hrDept, Role.DEPARTMENT_MANAGER, true);
-        when(documentRepository.findById(DOC_ID)).thenReturn(Optional.of(deptDoc));
+        when(documentRepository.findByIdForUpdate(DOC_ID)).thenReturn(Optional.of(deptDoc));
         when(userRepository.findById(ADMIN_USER_ID)).thenReturn(Optional.empty());
         when(userRepository.findById(HR_USER_ID)).thenReturn(Optional.of(hrManager));
 
@@ -867,7 +878,7 @@ class DocumentServiceTest {
     void deleteDocumentNeverDeletesMinioObjectWhenTransactionRollsBack() {
         DepartmentEntity itDept = department(IT_DEPT_ID, "IT");
         DocumentEntity deptDoc = document(DOC_ID, itDept, AccessLevel.DEPARTMENT, DocumentStatus.COMPLETED);
-        when(documentRepository.findById(DOC_ID)).thenReturn(Optional.of(deptDoc));
+        when(documentRepository.findByIdForUpdate(DOC_ID)).thenReturn(Optional.of(deptDoc));
 
         // Case 1: Runtime exception during transaction body rolls back
         doThrow(new RuntimeException("DB constraint failure")).when(documentRepository).delete(deptDoc);
@@ -1083,6 +1094,399 @@ class DocumentServiceTest {
         assertThat(eventCaptor.getValue().version()).isEqualTo(2);
         assertThat(eventCaptor.getValue().accessLevel()).isEqualTo(AccessLevel.CONFIDENTIAL);
         assertThat(eventCaptor.getValue().originalName()).isEqualTo("Locked Down.pdf");
+    }
+
+    @Test
+    void replaceDocumentUploadsNewVersionBumpsVersionRecordsAuditAndDeletesOldObjectOnlyAfterCommit() throws Exception {
+        DepartmentEntity hrDept = department(HR_DEPT_ID, "HR");
+        UserEntity hrManagerEntity = user(HR_USER_ID, hrDept, Role.DEPARTMENT_MANAGER, true);
+        DocumentEntity existingDoc = document(DOC_ID, hrDept, AccessLevel.DEPARTMENT, DocumentStatus.COMPLETED);
+        String oldStorageKey = "departments/" + HR_DEPT_ID + "/old-upload/v1/draft-v1.docx";
+        existingDoc.setOriginalName("draft-v1.docx");
+        existingDoc.setFileExtension("docx");
+        existingDoc.setMimeType("application/vnd.openxmlformats-officedocument.wordprocessingml.document");
+        existingDoc.setStorageKey(oldStorageKey);
+        existingDoc.setCurrentVersion(1);
+        existingDoc.setChunkCount(14);
+        existingDoc.setErrorMessage("old warning");
+
+        byte[] newPdfBytes = "%PDF-1.4\n1 0 obj\n<<>>\nendobj\n%%EOF\n".getBytes(StandardCharsets.UTF_8);
+        String expectedHash = HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256").digest(newPdfBytes));
+        MockMultipartFile newFile = new MockMultipartFile("file", "policy-v2.pdf", "application/pdf", newPdfBytes);
+
+        when(documentRepository.findById(DOC_ID)).thenReturn(Optional.of(existingDoc));
+        when(documentRepository.findByIdForUpdate(DOC_ID)).thenReturn(Optional.of(existingDoc));
+        when(userRepository.findById(HR_USER_ID)).thenReturn(Optional.of(hrManagerEntity));
+        when(minioStorageService.buildStorageKey(eq(HR_DEPT_ID), any(UUID.class), eq(2), eq("policy-v2.pdf")))
+            .thenReturn("departments/" + HR_DEPT_ID + "/new-upload/v2/policy-v2.pdf");
+        drainUploadStream();
+        when(documentRepository.findByDepartmentIdAndFileHash(HR_DEPT_ID, expectedHash)).thenReturn(Optional.empty());
+        when(documentRepository.saveAndFlush(any(DocumentEntity.class))).thenAnswer(inv -> inv.getArgument(0));
+
+        CallerContext hrManager = new CallerContext(HR_USER_ID, HR_DEPT_ID, Role.DEPARTMENT_MANAGER, "10.0.0.5");
+
+        DocumentResponse replaced = documentService.replaceDocument(DOC_ID, newFile, AccessLevel.PUBLIC, hrManager);
+
+        assertThat(replaced.id()).isEqualTo(DOC_ID);
+        assertThat(replaced.originalName()).isEqualTo("policy-v2.pdf");
+        assertThat(replaced.fileExtension()).isEqualTo("pdf");
+        assertThat(replaced.mimeType()).isEqualTo("application/pdf");
+        assertThat(replaced.fileHash()).isEqualTo(expectedHash);
+        assertThat(replaced.fileSizeBytes()).isEqualTo(newPdfBytes.length);
+        assertThat(replaced.accessLevel()).isEqualTo(AccessLevel.PUBLIC);
+        assertThat(replaced.status()).isEqualTo(DocumentStatus.PENDING);
+        assertThat(replaced.currentVersion()).isEqualTo(2);
+        assertThat(replaced.chunkCount()).isEqualTo(0);
+        assertThat(replaced.errorMessage()).isNull();
+
+        ArgumentCaptor<AuditLogEntity> auditCaptor = ArgumentCaptor.forClass(AuditLogEntity.class);
+        verify(auditLogRepository).save(auditCaptor.capture());
+        assertThat(auditCaptor.getValue().getActionType()).isEqualTo(AuditActionType.DOC_REINDEX);
+        assertThat(auditCaptor.getValue().getStatusCode()).isEqualTo(202);
+        assertThat(auditCaptor.getValue().getQueryText()).isEqualTo("policy-v2.pdf");
+
+        ArgumentCaptor<DocumentUploadedEvent> eventCaptor = ArgumentCaptor.forClass(DocumentUploadedEvent.class);
+        verify(eventPublisher).publishEvent(eventCaptor.capture());
+        assertThat(eventCaptor.getValue().documentId()).isEqualTo(DOC_ID);
+        assertThat(eventCaptor.getValue().version()).isEqualTo(2);
+        assertThat(eventCaptor.getValue().fileExtension()).isEqualTo("pdf");
+        assertThat(eventCaptor.getValue().accessLevel()).isEqualTo(AccessLevel.PUBLIC);
+        assertThat(eventCaptor.getValue().storageKey()).isEqualTo("departments/" + HR_DEPT_ID + "/new-upload/v2/policy-v2.pdf");
+
+        // originalName and accessLevel changed -> PostgreSQL V6 trigger increments cache_version (no double bump in Java)
+        verify(departmentRepository, never()).incrementCacheVersion(any());
+        verify(departmentRepository, never()).incrementAllCacheVersions();
+
+        InOrder postCommitOrder = inOrder(documentRepository, minioStorageService);
+        postCommitOrder.verify(documentRepository).deleteChunksBeforeVersion(DOC_ID, 2);
+        postCommitOrder.verify(documentRepository).saveAndFlush(existingDoc);
+        postCommitOrder.verify(minioStorageService).deleteObjectQuietly(oldStorageKey);
+    }
+
+    @Test
+    void replaceDocumentIncrementsCacheVersionExplicitlyWhenOriginalNameAndAccessLevelAreUnchanged() {
+        DepartmentEntity hrDept = department(HR_DEPT_ID, "HR");
+        DocumentEntity deptDoc = document(DOC_ID, hrDept, AccessLevel.DEPARTMENT, DocumentStatus.COMPLETED);
+        deptDoc.setOriginalName("doc.pdf");
+        deptDoc.setCurrentVersion(1);
+
+        byte[] newPdfBytes = "%PDF-1.4\n%Updated content\n%%EOF\n".getBytes(StandardCharsets.UTF_8);
+        MockMultipartFile sameNameFile = new MockMultipartFile("file", "doc.pdf", "application/pdf", newPdfBytes);
+
+        when(documentRepository.findById(DOC_ID)).thenReturn(Optional.of(deptDoc));
+        when(documentRepository.findByIdForUpdate(DOC_ID)).thenReturn(Optional.of(deptDoc));
+        when(minioStorageService.buildStorageKey(eq(HR_DEPT_ID), any(UUID.class), eq(2), eq("doc.pdf")))
+            .thenReturn("departments/" + HR_DEPT_ID + "/new-upload/v2/doc.pdf");
+        drainUploadStream();
+        when(documentRepository.findByDepartmentIdAndFileHash(eq(HR_DEPT_ID), anyString())).thenReturn(Optional.empty());
+        when(documentRepository.saveAndFlush(any(DocumentEntity.class))).thenAnswer(inv -> inv.getArgument(0));
+
+        CallerContext hrManager = new CallerContext(null, HR_DEPT_ID, Role.DEPARTMENT_MANAGER, "127.0.0.1");
+        DocumentResponse response = documentService.replaceDocument(DOC_ID, sameNameFile, null, hrManager);
+
+        assertThat(response.currentVersion()).isEqualTo(2);
+        assertThat(response.accessLevel()).isEqualTo(AccessLevel.DEPARTMENT);
+        verify(departmentRepository).incrementCacheVersion(HR_DEPT_ID);
+        verify(departmentRepository, never()).incrementAllCacheVersions();
+
+        // PUBLIC doc with unchanged name & accessLevel -> increments ALL departments' cache versions
+        clearInvocations(departmentRepository);
+        DocumentEntity publicDoc = document(DOC_ID, hrDept, AccessLevel.PUBLIC, DocumentStatus.COMPLETED);
+        publicDoc.setOriginalName("doc.pdf");
+        publicDoc.setCurrentVersion(2);
+        when(documentRepository.findById(DOC_ID)).thenReturn(Optional.of(publicDoc));
+        when(documentRepository.findByIdForUpdate(DOC_ID)).thenReturn(Optional.of(publicDoc));
+        when(minioStorageService.buildStorageKey(eq(HR_DEPT_ID), any(UUID.class), eq(3), eq("doc.pdf")))
+            .thenReturn("departments/" + HR_DEPT_ID + "/new-upload/v3/doc.pdf");
+
+        documentService.replaceDocument(DOC_ID, sameNameFile, AccessLevel.PUBLIC, hrManager);
+        verify(departmentRepository).incrementAllCacheVersions();
+    }
+
+    @Test
+    void replaceDocumentAllowsSameFileHashOnSameDocumentForFailedReindexRetry() throws Exception {
+        DepartmentEntity hrDept = department(HR_DEPT_ID, "HR");
+        byte[] pdfBytes = "%PDF-1.4\n1 0 obj\n<<>>\nendobj\n%%EOF\n".getBytes(StandardCharsets.UTF_8);
+        String sameHash = HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256").digest(pdfBytes));
+
+        DocumentEntity failedDoc = document(DOC_ID, hrDept, AccessLevel.DEPARTMENT, DocumentStatus.FAILED);
+        failedDoc.setFileHash(sameHash);
+        failedDoc.setErrorMessage("[EMBEDDING_ERROR] Ollama offline");
+        failedDoc.setCurrentVersion(2);
+
+        MockMultipartFile retryFile = new MockMultipartFile("file", "doc.pdf", "application/pdf", pdfBytes);
+        when(documentRepository.findById(DOC_ID)).thenReturn(Optional.of(failedDoc));
+        when(documentRepository.findByIdForUpdate(DOC_ID)).thenReturn(Optional.of(failedDoc));
+        when(minioStorageService.buildStorageKey(eq(HR_DEPT_ID), any(UUID.class), eq(3), eq("doc.pdf")))
+            .thenReturn("departments/" + HR_DEPT_ID + "/retry/v3/doc.pdf");
+        drainUploadStream();
+        when(documentRepository.findByDepartmentIdAndFileHash(HR_DEPT_ID, sameHash)).thenReturn(Optional.of(failedDoc));
+        when(documentRepository.saveAndFlush(any(DocumentEntity.class))).thenAnswer(inv -> inv.getArgument(0));
+
+        CallerContext hrManager = new CallerContext(null, HR_DEPT_ID, Role.DEPARTMENT_MANAGER, "127.0.0.1");
+        DocumentResponse retried = documentService.replaceDocument(DOC_ID, retryFile, null, hrManager);
+
+        assertThat(retried.status()).isEqualTo(DocumentStatus.PENDING);
+        assertThat(retried.currentVersion()).isEqualTo(3);
+        assertThat(retried.errorMessage()).isNull();
+        verify(eventPublisher).publishEvent(any(DocumentUploadedEvent.class));
+    }
+
+    @Test
+    void replaceDocumentRejectsDuplicateFileHashOfAnotherDocumentAndDeletesStagedObject() throws Exception {
+        DepartmentEntity hrDept = department(HR_DEPT_ID, "HR");
+        DocumentEntity targetDoc = document(DOC_ID, hrDept, AccessLevel.DEPARTMENT, DocumentStatus.COMPLETED);
+        String oldKey = targetDoc.getStorageKey();
+
+        UUID otherDocId = UUID.randomUUID();
+        DocumentEntity otherDoc = document(otherDocId, hrDept, AccessLevel.DEPARTMENT, DocumentStatus.COMPLETED);
+        byte[] dupBytes = "%PDF-1.4\n%Duplicate payload\n%%EOF\n".getBytes(StandardCharsets.UTF_8);
+        String dupHash = HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256").digest(dupBytes));
+        otherDoc.setFileHash(dupHash);
+
+        String stagedKey = "departments/" + HR_DEPT_ID + "/staged/v2/other.pdf";
+        MockMultipartFile dupFile = new MockMultipartFile("file", "other.pdf", "application/pdf", dupBytes);
+
+        when(documentRepository.findById(DOC_ID)).thenReturn(Optional.of(targetDoc));
+        when(documentRepository.findByIdForUpdate(DOC_ID)).thenReturn(Optional.of(targetDoc));
+        when(minioStorageService.buildStorageKey(eq(HR_DEPT_ID), any(UUID.class), eq(2), eq("other.pdf")))
+            .thenReturn(stagedKey);
+        drainUploadStream();
+        when(documentRepository.findByDepartmentIdAndFileHash(HR_DEPT_ID, dupHash)).thenReturn(Optional.of(otherDoc));
+
+        CallerContext hrManager = new CallerContext(null, HR_DEPT_ID, Role.DEPARTMENT_MANAGER, "127.0.0.1");
+        assertThatThrownBy(() -> documentService.replaceDocument(DOC_ID, dupFile, null, hrManager))
+            .isInstanceOf(DuplicateDocumentException.class)
+            .satisfies(ex -> {
+                DuplicateDocumentException dupEx = (DuplicateDocumentException) ex;
+                assertThat(dupEx.existingDocumentId()).isEqualTo(otherDocId);
+                assertThat(dupEx.fileHash()).isEqualTo(dupHash);
+            });
+
+        verify(minioStorageService).deleteObjectQuietly(stagedKey);
+        verify(minioStorageService, never()).deleteObjectQuietly(oldKey);
+        verify(eventPublisher, never()).publishEvent(any());
+
+        // Concurrent DataIntegrityViolationException race also resolves to DuplicateDocumentException and cleans staged key
+        clearInvocations(minioStorageService);
+        when(documentRepository.findByDepartmentIdAndFileHash(HR_DEPT_ID, dupHash))
+            .thenReturn(Optional.empty())
+            .thenReturn(Optional.of(otherDoc));
+        when(documentRepository.saveAndFlush(any(DocumentEntity.class)))
+            .thenThrow(new DataIntegrityViolationException("uq_documents_department_hash"));
+
+        assertThatThrownBy(() -> documentService.replaceDocument(DOC_ID, dupFile, null, hrManager))
+            .isInstanceOf(DuplicateDocumentException.class)
+            .satisfies(ex -> assertThat(((DuplicateDocumentException) ex).existingDocumentId()).isEqualTo(otherDocId));
+        verify(minioStorageService).deleteObjectQuietly(stagedKey);
+        verify(minioStorageService, never()).deleteObjectQuietly(oldKey);
+    }
+
+    @Test
+    void replaceDocumentEnforcesRbacAndNotFoundBeforeStreamingAndKeepsOldObjectOnCommitFailure() {
+        DepartmentEntity hrDept = department(HR_DEPT_ID, "HR");
+        DepartmentEntity itDept = department(IT_DEPT_ID, "IT");
+        DocumentEntity hrPublicDoc = document(DOC_ID, hrDept, AccessLevel.PUBLIC, DocumentStatus.COMPLETED);
+        String oldKey = hrPublicDoc.getStorageKey();
+        byte[] pdfBytes = "%PDF-1.4\n%Valid\n%%EOF\n".getBytes(StandardCharsets.UTF_8);
+        MockMultipartFile file = new MockMultipartFile("file", "v2.pdf", "application/pdf", pdfBytes);
+
+        CallerContext employee = new CallerContext(null, HR_DEPT_ID, Role.STANDARD_EMPLOYEE, "127.0.0.1");
+        CallerContext itManager = new CallerContext(null, IT_DEPT_ID, Role.DEPARTMENT_MANAGER, "127.0.0.1");
+        CallerContext hrManager = new CallerContext(null, HR_DEPT_ID, Role.DEPARTMENT_MANAGER, "127.0.0.1");
+
+        assertThatThrownBy(() -> documentService.replaceDocument(null, file, null, hrManager))
+            .isInstanceOf(InvalidDocumentRequestException.class);
+        assertThatThrownBy(() -> documentService.replaceDocument(DOC_ID, null, null, hrManager))
+            .isInstanceOf(InvalidDocumentRequestException.class);
+        assertThatThrownBy(() -> documentService.replaceDocument(DOC_ID, file, null, employee))
+            .isInstanceOf(DocumentAccessDeniedException.class);
+
+        when(documentRepository.findById(DOC_ID)).thenReturn(Optional.empty());
+        assertThatThrownBy(() -> documentService.replaceDocument(DOC_ID, file, null, hrManager))
+            .isInstanceOf(DocumentNotFoundException.class);
+
+        when(documentRepository.findById(DOC_ID)).thenReturn(Optional.of(hrPublicDoc));
+        assertThatThrownBy(() -> documentService.replaceDocument(DOC_ID, file, null, itManager))
+            .isInstanceOf(DocumentAccessDeniedException.class);
+        verifyNoInteractions(minioStorageService);
+
+        // Concurrent department transfer between Phase 1 and Phase 2 lock -> denies and deletes staged key
+        DocumentEntity transferredToIt = document(DOC_ID, itDept, AccessLevel.DEPARTMENT, DocumentStatus.COMPLETED);
+        String stagedKey = "departments/" + HR_DEPT_ID + "/race/v2/v2.pdf";
+        when(documentRepository.findByIdForUpdate(DOC_ID)).thenReturn(Optional.of(transferredToIt));
+        when(minioStorageService.buildStorageKey(eq(HR_DEPT_ID), any(UUID.class), eq(2), eq("v2.pdf")))
+            .thenReturn(stagedKey);
+        drainUploadStream();
+
+        assertThatThrownBy(() -> documentService.replaceDocument(DOC_ID, file, null, hrManager))
+            .isInstanceOf(DocumentAccessDeniedException.class);
+        verify(minioStorageService).deleteObjectQuietly(stagedKey);
+        verify(minioStorageService, never()).deleteObjectQuietly(oldKey);
+
+        // DB commit failure -> deletes staged key, keeps oldKey intact
+        clearInvocations(minioStorageService);
+        when(documentRepository.findByIdForUpdate(DOC_ID)).thenReturn(Optional.of(hrPublicDoc));
+        when(documentRepository.findByDepartmentIdAndFileHash(eq(HR_DEPT_ID), anyString())).thenReturn(Optional.empty());
+        when(documentRepository.saveAndFlush(any(DocumentEntity.class))).thenAnswer(inv -> inv.getArgument(0));
+        transactionManager.failOnCommit = true;
+
+        assertThatThrownBy(() -> documentService.replaceDocument(DOC_ID, file, null, hrManager))
+            .isInstanceOf(TransactionSystemException.class);
+        verify(minioStorageService).deleteObjectQuietly(stagedKey);
+        verify(minioStorageService, never()).deleteObjectQuietly(oldKey);
+    }
+
+    @Test
+    void replaceDocumentRejectsValidationSizeMimeAndStorageErrorsWithoutMutatingExistingDocument() {
+        DepartmentEntity hrDept = department(HR_DEPT_ID, "HR");
+        DocumentEntity existingDoc = document(DOC_ID, hrDept, AccessLevel.DEPARTMENT, DocumentStatus.COMPLETED);
+        String oldKey = existingDoc.getStorageKey();
+        when(documentRepository.findById(DOC_ID)).thenReturn(Optional.of(existingDoc));
+
+        CallerContext hrManager = new CallerContext(null, HR_DEPT_ID, Role.DEPARTMENT_MANAGER, "127.0.0.1");
+
+        // 400: 0-byte empty file
+        MockMultipartFile emptyFile = new MockMultipartFile("file", "empty.txt", "text/plain", new byte[0]);
+        assertThatThrownBy(() -> documentService.replaceDocument(DOC_ID, emptyFile, null, hrManager))
+            .isInstanceOf(InvalidDocumentRequestException.class);
+
+        // 413: declared size > 50 MiB
+        MockMultipartFile oversizedFile = new MockMultipartFile("file", "huge.pdf", "application/pdf", "%PDF-1.4\n".getBytes(StandardCharsets.UTF_8)) {
+            @Override
+            public long getSize() {
+                return HashingBoundedInputStream.MAX_FILE_SIZE_BYTES + 1L;
+            }
+        };
+        assertThatThrownBy(() -> documentService.replaceDocument(DOC_ID, oversizedFile, null, hrManager))
+            .isInstanceOf(DocumentTooLargeException.class);
+
+        // 415: PNG magic bytes disguised as .pdf
+        byte[] pngHeader = new byte[]{(byte) 0x89, 'P', 'N', 'G', '\r', '\n', 0x1A, '\n', 0, 0, 0, 13};
+        MockMultipartFile spoofedPdf = new MockMultipartFile("file", "spoof.pdf", "application/pdf", pngHeader);
+        assertThatThrownBy(() -> documentService.replaceDocument(DOC_ID, spoofedPdf, null, hrManager))
+            .isInstanceOf(UnsupportedDocumentTypeException.class);
+
+        verifyNoInteractions(minioStorageService);
+
+        // 502: MinIO uploadStream failure leaves existing document and oldStorageKey untouched
+        byte[] validPdf = "%PDF-1.4\n%Valid\n%%EOF\n".getBytes(StandardCharsets.UTF_8);
+        MockMultipartFile validFile = new MockMultipartFile("file", "v2.pdf", "application/pdf", validPdf);
+        when(minioStorageService.buildStorageKey(eq(HR_DEPT_ID), any(UUID.class), eq(2), eq("v2.pdf")))
+            .thenReturn("departments/" + HR_DEPT_ID + "/failed-stage/v2/v2.pdf");
+        doThrow(new DocumentStorageException("MinIO unavailable", null))
+            .when(minioStorageService).uploadStream(anyString(), any(InputStream.class), anyLong(), anyString());
+
+        assertThatThrownBy(() -> documentService.replaceDocument(DOC_ID, validFile, null, hrManager))
+            .isInstanceOf(DocumentStorageException.class);
+
+        verify(documentRepository, never()).findByIdForUpdate(any());
+        verify(documentRepository, never()).saveAndFlush(any());
+        verify(minioStorageService, never()).deleteObjectQuietly(oldKey);
+        verify(eventPublisher, never()).publishEvent(any());
+    }
+
+    @Test
+    void getDocumentPreviewUrlEnforcesRbacAppendsPdfPageFragmentAndValidatesPageParameter(CapturedOutput output) throws Exception {
+        DepartmentEntity hrDept = department(HR_DEPT_ID, "HR");
+        DocumentEntity hrPdf = document(DOC_ID, hrDept, AccessLevel.DEPARTMENT, DocumentStatus.COMPLETED);
+        hrPdf.setOriginalName("hr-policy-v2.pdf");
+        hrPdf.setFileExtension("pdf");
+        hrPdf.setMimeType("application/pdf");
+        hrPdf.setCurrentVersion(2);
+
+        CallerContext hrEmployee = new CallerContext(null, HR_DEPT_ID, Role.STANDARD_EMPLOYEE, "127.0.0.1");
+        CallerContext itEmployee = new CallerContext(null, IT_DEPT_ID, Role.STANDARD_EMPLOYEE, "127.0.0.1");
+        CallerContext itManager = new CallerContext(null, IT_DEPT_ID, Role.DEPARTMENT_MANAGER, "127.0.0.1");
+        CallerContext sysAdmin = new CallerContext(null, IT_DEPT_ID, Role.SYSTEM_ADMIN, "127.0.0.1");
+
+        // Invalid page < 1 fails fast before DB or MinIO
+        assertThatThrownBy(() -> documentService.getDocumentPreviewUrl(DOC_ID, 0, hrEmployee))
+            .isInstanceOf(InvalidDocumentRequestException.class);
+        assertThatThrownBy(() -> documentService.getDocumentPreviewUrl(DOC_ID, -3, hrEmployee))
+            .isInstanceOf(InvalidDocumentRequestException.class);
+        verifyNoInteractions(documentRepository, minioStorageService);
+
+        // Missing doc -> 404
+        when(documentRepository.findById(DOC_ID)).thenReturn(Optional.empty());
+        assertThatThrownBy(() -> documentService.getDocumentPreviewUrl(DOC_ID, 2, hrEmployee))
+            .isInstanceOf(DocumentNotFoundException.class);
+
+        // Cross-department access -> 403 before touching MinIO
+        when(documentRepository.findById(DOC_ID)).thenReturn(Optional.of(hrPdf));
+        assertThatThrownBy(() -> documentService.getDocumentPreviewUrl(DOC_ID, 2, itEmployee))
+            .isInstanceOf(DocumentAccessDeniedException.class);
+        assertThatThrownBy(() -> documentService.getDocumentPreviewUrl(DOC_ID, 2, itManager))
+            .isInstanceOf(DocumentAccessDeniedException.class);
+
+        // Same-department STANDARD_EMPLOYEE on CONFIDENTIAL -> 403
+        hrPdf.setAccessLevel(AccessLevel.CONFIDENTIAL);
+        assertThatThrownBy(() -> documentService.getDocumentPreviewUrl(DOC_ID, 2, hrEmployee))
+            .isInstanceOf(DocumentAccessDeniedException.class);
+        verifyNoInteractions(minioStorageService);
+
+        // Authorized PDF with ?page=4 -> appends #page=4 and returns expiresAt
+        when(minioStorageService.presignedExpiry()).thenReturn(Duration.ofMinutes(15));
+        when(minioStorageService.generatePresignedGetUrl(hrPdf.getStorageKey(), "hr-policy-v2.pdf"))
+            .thenReturn(URI.create("http://localhost:9000/documind-documents/" + hrPdf.getStorageKey() + "?X-Amz-Signature=sig").toURL());
+
+        OffsetDateTime beforeCall = OffsetDateTime.now(ZoneOffset.UTC);
+        DocumentPreviewUrlResponse adminPreview = documentService.getDocumentPreviewUrl(DOC_ID, 4, sysAdmin);
+        OffsetDateTime afterCall = OffsetDateTime.now(ZoneOffset.UTC);
+
+        assertThat(adminPreview.documentId()).isEqualTo(DOC_ID);
+        assertThat(adminPreview.originalName()).isEqualTo("hr-policy-v2.pdf");
+        assertThat(adminPreview.mimeType()).isEqualTo("application/pdf");
+        assertThat(adminPreview.fileExtension()).isEqualTo("pdf");
+        assertThat(adminPreview.currentVersion()).isEqualTo(2);
+        assertThat(adminPreview.pageNumber()).isEqualTo(4);
+        assertThat(adminPreview.previewUrl()).endsWith("?X-Amz-Signature=sig#page=4");
+        assertThat(adminPreview.expiresAt())
+            .isAfterOrEqualTo(beforeCall.plusMinutes(15).minusSeconds(2))
+            .isBeforeOrEqualTo(afterCall.plusMinutes(15).plusSeconds(2));
+
+        // PDF without page -> omits #page fragment
+        DocumentPreviewUrlResponse pdfNoPage = documentService.getDocumentPreviewUrl(DOC_ID, null, sysAdmin);
+        assertThat(pdfNoPage.pageNumber()).isNull();
+        assertThat(pdfNoPage.previewUrl()).doesNotContain("#page=");
+
+        // Non-PDF (DOCX) with ?page=4 -> omits #page fragment and sets pageNumber=null; PUBLIC accessible cross-dept
+        hrPdf.setAccessLevel(AccessLevel.PUBLIC);
+        hrPdf.setOriginalName("guide.docx");
+        hrPdf.setFileExtension("docx");
+        hrPdf.setMimeType("application/vnd.openxmlformats-officedocument.wordprocessingml.document");
+        when(minioStorageService.generatePresignedGetUrl(hrPdf.getStorageKey(), "guide.docx"))
+            .thenReturn(URI.create("http://localhost:9000/documind-documents/" + hrPdf.getStorageKey() + "?X-Amz-Signature=sig2").toURL());
+
+        DocumentPreviewUrlResponse docxPreview = documentService.getDocumentPreviewUrl(DOC_ID, 4, itEmployee);
+        assertThat(docxPreview.pageNumber()).isNull();
+        assertThat(docxPreview.fileExtension()).isEqualTo("docx");
+        assertThat(docxPreview.previewUrl()).doesNotContain("#page=");
+
+        // 502: Storage presigner returning null or throwing DocumentStorageException surfaces cleanly
+        when(minioStorageService.generatePresignedGetUrl(hrPdf.getStorageKey(), "guide.docx")).thenReturn(null);
+        assertThatThrownBy(() -> documentService.getDocumentPreviewUrl(DOC_ID, null, itEmployee))
+            .isInstanceOf(DocumentStorageException.class);
+        when(minioStorageService.generatePresignedGetUrl(hrPdf.getStorageKey(), "guide.docx"))
+            .thenThrow(new DocumentStorageException("Presigner failed", null));
+        assertThatThrownBy(() -> documentService.getDocumentPreviewUrl(DOC_ID, null, itEmployee))
+            .isInstanceOf(DocumentStorageException.class);
+
+        // Verify SECURITY_AUDIT log hygiene: records both allow & deny actions and NEVER logs SigV4 signature
+        assertThat(output.getOut())
+            .contains("SECURITY_AUDIT action=DOC_PREVIEW_URL_DENIED")
+            .contains("SECURITY_AUDIT action=DOC_PREVIEW_URL")
+            .doesNotContain("X-Amz-Signature");
+
+        // Verify method-level @PreAuthorize Defense-in-Depth annotations exist on both DA-17 service methods
+        Method replaceMethod = DocumentService.class.getMethod(
+            "replaceDocument", UUID.class, org.springframework.web.multipart.MultipartFile.class, AccessLevel.class, CallerContext.class
+        );
+        assertThat(replaceMethod.isAnnotationPresent(org.springframework.security.access.prepost.PreAuthorize.class)).isTrue();
+        Method previewMethod = DocumentService.class.getMethod(
+            "getDocumentPreviewUrl", UUID.class, Integer.class, CallerContext.class
+        );
+        assertThat(previewMethod.isAnnotationPresent(org.springframework.security.access.prepost.PreAuthorize.class)).isTrue();
     }
 
     private void drainUploadStream() {

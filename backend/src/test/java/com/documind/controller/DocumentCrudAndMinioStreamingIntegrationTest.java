@@ -16,6 +16,15 @@ import com.documind.infrastructure.storage.HashingBoundedInputStream;
 import com.documind.infrastructure.storage.MinioStorageService;
 import com.documind.infrastructure.storage.StorageProperties;
 import com.documind.infrastructure.vector.DocumentChunkVectorRepository;
+import com.documind.domain.enums.Role;
+import com.documind.infrastructure.security.CustomUserDetails;
+import com.documind.service.document.CallerContext;
+import com.documind.service.rag.RetrievedChunk;
+import com.documind.service.rag.VectorRetrievalService;
+import org.springframework.ai.embedding.EmbeddingModel;
+import org.springframework.security.authentication.UsernamePasswordAuthenticationToken;
+import org.springframework.security.core.context.SecurityContextHolder;
+import java.time.Instant;
 import com.documind.repository.AuditLogRepository;
 import com.documind.repository.DepartmentRepository;
 import com.documind.repository.DocumentRepository;
@@ -147,6 +156,12 @@ class DocumentCrudAndMinioStreamingIntegrationTest {
 
     @Autowired
     private VectorStore vectorStore;
+
+    @Autowired
+    private EmbeddingModel embeddingModel;
+
+    @Autowired
+    private VectorRetrievalService vectorRetrievalService;
 
     @Autowired
     private JdbcTemplate jdbcTemplate;
@@ -934,6 +949,150 @@ class DocumentCrudAndMinioStreamingIntegrationTest {
 
         assertThat(eventCollector.events()).hasSize(1);
         assertThat(eventCollector.events().getFirst().documentId()).isEqualTo(winner.id());
+    }
+
+    @Test
+    void putReplacePurgesPriorChunksImmediatelyPreventingHnswTopKStarvationAndV6ChunkRewrites() {
+        String queryText = "Chính sách phụ cấp đi lại nội bộ phòng HR năm 2026";
+
+        DocumentResponse bigDoc = uploadBytes(
+            "hr-travel-v1.pdf",
+            "application/pdf",
+            "%PDF-1.4\n1 0 obj\n<<>>\nendobj\n%%EOF\n".getBytes(StandardCharsets.UTF_8),
+            HR_DEPT_ID,
+            AccessLevel.DEPARTMENT
+        ).getBody();
+        assertThat(bigDoc).isNotNull();
+
+        DocumentResponse siblingDoc = uploadBytes(
+            "hr-travel-summary.pdf",
+            "application/pdf",
+            "%PDF-1.4\n2 0 obj\n<<>>\nendobj\n%%EOF\n".getBytes(StandardCharsets.UTF_8),
+            HR_DEPT_ID,
+            AccessLevel.DEPARTMENT
+        ).getBody();
+        assertThat(siblingDoc).isNotNull();
+
+        jdbcTemplate.update(
+            "UPDATE documents SET status = 'COMPLETED', chunk_count = 12 WHERE id = ?",
+            bigDoc.id()
+        );
+        jdbcTemplate.update(
+            "UPDATE documents SET status = 'COMPLETED', chunk_count = 1 WHERE id = ?",
+            siblingDoc.id()
+        );
+
+        // Seed 12 v1 chunks (> candidateFetchLimit=10) for bigDoc with cosine similarity = 1.0 to queryText
+        List<Document> bigDocChunks = new ArrayList<>();
+        for (int i = 0; i < 12; i++) {
+            bigDocChunks.add(new Document(
+                UUID.randomUUID().toString(),
+                queryText,
+                Map.of(
+                    "document_id", bigDoc.id().toString(),
+                    "department_id", HR_DEPT_ID.toString(),
+                    "file_name", bigDoc.originalName(),
+                    "access_level", AccessLevel.DEPARTMENT.name(),
+                    "chunk_index", i,
+                    "doc_version", 1,
+                    "page_number", i + 1
+                )
+            ));
+        }
+        vectorStore.add(bigDocChunks);
+
+        // Seed 1 completed chunk for siblingDoc with cosine similarity ~0.90 (ranks #13 behind 12 dead v1 chunks if not purged)
+        UUID siblingChunkId = UUID.randomUUID();
+        vectorStore.add(List.of(new Document(
+            siblingChunkId.toString(),
+            "Tóm tắt phụ cấp đi lại phòng HR: hỗ trợ 1.200.000 VNĐ/tháng.",
+            Map.of(
+                "document_id", siblingDoc.id().toString(),
+                "department_id", HR_DEPT_ID.toString(),
+                "file_name", siblingDoc.originalName(),
+                "access_level", AccessLevel.DEPARTMENT.name(),
+                "chunk_index", 0,
+                "doc_version", 1,
+                "page_number", 1
+            )
+        )));
+        float[] queryVec = embeddingModel.embed(queryText);
+        float[] siblingVec = queryVec.clone();
+        for (int i = 0; i < 50; i++) {
+            siblingVec[i] = -siblingVec[i];
+        }
+        jdbcTemplate.update(
+            "UPDATE document_chunks SET embedding = CAST(? AS vector) WHERE id = ?",
+            formatVectorLiteral(siblingVec),
+            siblingChunkId
+        );
+
+        assertThat(chunkVectorRepository.countByDocumentId(bigDoc.id())).isEqualTo(12L);
+        long cacheVersionBeforePut = departmentRepository.findById(HR_DEPT_ID).orElseThrow().getCacheVersion();
+
+        // Replace bigDoc with v2 (renamed -> exercises PostgreSQL V6 trigger; worker is disabled so status stays PENDING)
+        ResponseEntity<DocumentResponse> putResp = restTemplate.exchange(
+            "/api/v1/documents/" + bigDoc.id(),
+            HttpMethod.PUT,
+            buildMultipartEntity(
+                "hr-travel-v2.pdf",
+                "application/pdf",
+                "%PDF-1.4\n3 0 obj\n<<>>\nendobj\n%%EOF\n".getBytes(StandardCharsets.UTF_8),
+                HR_DEPT_ID,
+                AccessLevel.DEPARTMENT,
+                Role.DEPARTMENT_MANAGER.name(),
+                HR_MANAGER_USER_ID
+            ),
+            DocumentResponse.class
+        );
+        assertThat(putResp.getStatusCode()).isEqualTo(HttpStatus.ACCEPTED);
+        assertThat(putResp.getBody()).isNotNull();
+        assertThat(putResp.getBody().status()).isEqualTo(DocumentStatus.PENDING);
+        assertThat(putResp.getBody().currentVersion()).isEqualTo(2);
+
+        // 1. Dead v1 chunks must be purged immediately during PUT (zero dead chunks left for HNSW/V6)
+        assertThat(chunkVectorRepository.countByDocumentId(bigDoc.id())).isZero();
+
+        // 2. V6 trigger must still advance cache_version by exact +1 even with 0 remaining chunks
+        long cacheVersionAfterPut = departmentRepository.findById(HR_DEPT_ID).orElseThrow().getCacheVersion();
+        assertThat(cacheVersionAfterPut).isEqualTo(cacheVersionBeforePut + 1L);
+
+        // 3. Sibling COMPLETED document must be retrieved immediately without top-10 HNSW starvation
+        CustomUserDetails hrManagerPrincipal = new CustomUserDetails(
+            HR_MANAGER_USER_ID,
+            HR_DEPT_ID,
+            "HR",
+            "manager.hr@documind.ai",
+            Role.DEPARTMENT_MANAGER,
+            UUID.randomUUID().toString(),
+            Instant.now().plusSeconds(3600)
+        );
+        SecurityContextHolder.getContext().setAuthentication(
+            new UsernamePasswordAuthenticationToken(hrManagerPrincipal, null, hrManagerPrincipal.getAuthorities())
+        );
+        try {
+            CallerContext hrManagerCaller = new CallerContext(HR_MANAGER_USER_ID, HR_DEPT_ID, Role.DEPARTMENT_MANAGER, "127.0.0.1");
+            List<RetrievedChunk> hits = vectorRetrievalService.retrieve(queryText, hrManagerCaller);
+            assertThat(hits)
+                .hasSize(1)
+                .first()
+                .satisfies(hit -> assertThat(hit.documentId()).isEqualTo(siblingDoc.id()));
+        } finally {
+            SecurityContextHolder.clearContext();
+        }
+    }
+
+    private static String formatVectorLiteral(float[] vector) {
+        StringBuilder sb = new StringBuilder(vector.length * 10);
+        sb.append('[');
+        for (int i = 0; i < vector.length; i++) {
+            if (i > 0) {
+                sb.append(',');
+            }
+            sb.append(vector[i]);
+        }
+        sb.append(']');
+        return sb.toString();
     }
 
     private static List<MemoryPoolMXBean> oldGenHeapPools() {
