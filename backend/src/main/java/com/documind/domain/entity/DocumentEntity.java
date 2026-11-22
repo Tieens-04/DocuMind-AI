@@ -21,6 +21,7 @@ import org.springframework.data.domain.Persistable;
 
 import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
+import java.util.Locale;
 import java.util.Objects;
 import java.util.UUID;
 
@@ -189,6 +190,13 @@ public class DocumentEntity implements Persistable<UUID> {
 
     public String getFileExtension() {
         return fileExtension;
+    }
+
+    public boolean isPdf() {
+        if (fileExtension != null && !fileExtension.isBlank()) {
+            return "pdf".equalsIgnoreCase(fileExtension.trim());
+        }
+        return originalName != null && originalName.toLowerCase(Locale.ROOT).endsWith(".pdf");
     }
 
     public void setFileExtension(String fileExtension) {

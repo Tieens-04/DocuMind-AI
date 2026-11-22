@@ -163,7 +163,7 @@ public class VectorRetrievalService {
                 id -> generateBasePresignedUrl(parent)
             ).orElse(null);
 
-            String citationUrl = appendPageFragment(baseUrl, candidate.pageNumber());
+            String citationUrl = MinioStorageService.appendPageFragment(baseUrl, candidate.pageNumber());
             String excerpt = buildExcerpt(candidate.content(), maxExcerptChars);
             CitationDto citation = new CitationDto(
                 parent.getId(),
@@ -379,16 +379,6 @@ public class VectorRetrievalService {
         }
         String str = value.toString().trim();
         return str.isEmpty() ? null : str;
-    }
-
-    private static String appendPageFragment(String baseUrl, Integer pageNumber) {
-        if (baseUrl == null || baseUrl.isBlank()) {
-            return null;
-        }
-        if (pageNumber == null) {
-            return baseUrl;
-        }
-        return baseUrl + "#page=" + pageNumber;
     }
 
     private static String buildExcerpt(String rawContent, int maxChars) {

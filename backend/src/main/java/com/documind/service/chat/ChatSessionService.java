@@ -592,11 +592,12 @@ public class ChatSessionService {
                 parent.getId(),
                 id -> generateBasePresignedUrl(parent)
             ).orElse(null);
-            String citationUrl = appendPageFragment(baseUrl, payload.pageNumber());
+            Integer effectivePage = parent.isPdf() ? payload.pageNumber() : null;
+            String citationUrl = MinioStorageService.appendPageFragment(baseUrl, effectivePage);
             result.add(new CitationDto(
                 parent.getId(),
                 parent.getOriginalName(),
-                payload.pageNumber(),
+                effectivePage,
                 payload.sectionHeading(),
                 payload.similarityScore(),
                 payload.excerpt(),
@@ -739,16 +740,6 @@ public class ChatSessionService {
         }
         OffsetDateTime floorMicros = floorExclusive.withOffsetSameInstant(ZoneOffset.UTC).truncatedTo(ChronoUnit.MICROS);
         return now.isAfter(floorMicros) ? now : floorMicros.plus(1, ChronoUnit.MICROS);
-    }
-
-    private static String appendPageFragment(String baseUrl, Integer pageNumber) {
-        if (baseUrl == null || baseUrl.isBlank()) {
-            return null;
-        }
-        if (pageNumber == null) {
-            return baseUrl;
-        }
-        return baseUrl + "#page=" + pageNumber;
     }
 
     public static String truncateIp(String ipAddress) {

@@ -71,6 +71,49 @@ class MinioStorageServiceTest {
         );
         assertThat(sevenArgWithNulls.uploadTimeout()).isEqualTo(Duration.ofSeconds(60));
         assertThat(sevenArgWithNulls.presignedExpiry()).isEqualTo(Duration.ofMinutes(15));
+        assertThat(sevenArgWithNulls.effectivePublicEndpoint()).isEqualTo("http://localhost:9000");
+
+        var blankPublicEndpoint = new StorageProperties(
+            "http://minio:9000", "ak", "sk", "documind-documents", "us-east-1", Duration.ofSeconds(30), Duration.ofMinutes(10), "   "
+        );
+        assertThat(blankPublicEndpoint.effectivePublicEndpoint()).isEqualTo("http://minio:9000");
+
+        var explicitPublicEndpoint = new StorageProperties(
+            "http://minio:9000", "ak", "sk", "documind-documents", "us-east-1", Duration.ofSeconds(30), Duration.ofMinutes(10), "  http://localhost:9000  "
+        );
+        assertThat(explicitPublicEndpoint.effectivePublicEndpoint()).isEqualTo("http://localhost:9000");
+        assertThat(minioStorageService.presignedExpiry()).isEqualTo(Duration.ofMinutes(15));
+    }
+
+    @Test
+    void minioConfigPresignerSignsWithPublicEndpointHostWhileInternalEndpointDiffers() {
+        StorageProperties dockerProps = new StorageProperties(
+            "http://minio:9000",
+            "documind_minio",
+            "documind_minio_secret",
+            "documind-documents",
+            "us-east-1",
+            Duration.ofSeconds(60),
+            Duration.ofMinutes(15),
+            "http://localhost:9000"
+        );
+        MinioConfig config = new MinioConfig();
+        try (S3Presigner realPresigner = config.s3Presigner(dockerProps)) {
+            MinioStorageService realPresignService = new MinioStorageService(s3Client, realPresigner, dockerProps);
+            URL signedUrl = realPresignService.generatePresignedGetUrl(
+                "departments/dept-1/doc-1/v2/policy.pdf",
+                "policy.pdf"
+            );
+
+            assertThat(signedUrl.getProtocol()).isEqualTo("http");
+            assertThat(signedUrl.getHost()).isEqualTo("localhost");
+            assertThat(signedUrl.getPort()).isEqualTo(9000);
+            assertThat(signedUrl.getPath()).isEqualTo("/documind-documents/departments/dept-1/doc-1/v2/policy.pdf");
+            assertThat(signedUrl.getQuery())
+                .contains("X-Amz-Signature=")
+                .contains("X-Amz-Expires=900")
+                .contains("response-content-disposition=");
+        }
     }
 
     @Test
@@ -209,6 +252,19 @@ class MinioStorageServiceTest {
         ArgumentCaptor<GetObjectPresignRequest> presignCaptor = ArgumentCaptor.forClass(GetObjectPresignRequest.class);
         verify(s3Presigner).presignGetObject(presignCaptor.capture());
         assertThat(presignCaptor.getValue().signatureDuration()).isEqualTo(Duration.ofMinutes(5));
+
+        SdkClientException presignFailure = SdkClientException.create("Presigner error");
+        when(s3Presigner.presignGetObject(any(GetObjectPresignRequest.class))).thenThrow(presignFailure);
+        assertThatThrownBy(() -> minioStorageService.generatePresignedGetUrl(storageKey, "quy_che.pdf"))
+            .isInstanceOf(DocumentStorageException.class)
+            .hasCause(presignFailure);
+
+        assertThat(MinioStorageService.appendPageFragment(null, 2)).isNull();
+        assertThat(MinioStorageService.appendPageFragment("   ", 2)).isNull();
+        assertThat(MinioStorageService.appendPageFragment("http://localhost:9000/a.pdf", null))
+            .isEqualTo("http://localhost:9000/a.pdf");
+        assertThat(MinioStorageService.appendPageFragment("http://localhost:9000/a.pdf", 3))
+            .isEqualTo("http://localhost:9000/a.pdf#page=3");
     }
 
     @Test

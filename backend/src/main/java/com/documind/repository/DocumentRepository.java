@@ -39,6 +39,19 @@ public interface DocumentRepository extends JpaRepository<DocumentEntity, UUID>,
     @Query("SELECT d FROM DocumentEntity d WHERE d.id = :id")
     Optional<DocumentEntity> findByIdForUpdate(@Param("id") UUID id);
 
+    /**
+     * Deletes superseded vector chunks for {@code documentId} whose {@code doc_version} is below {@code keepVersion}
+     * without clearing the JPA persistence context, intended for invocation after locking the parent row
+     * {@code FOR UPDATE} and before flushing metadata changes to avoid redundant V6/V7 chunk rewrites and HNSW starvation.
+     */
+    @Transactional
+    @Modifying
+    @Query(
+        value = "DELETE FROM document_chunks WHERE document_id = :documentId AND doc_version < :keepVersion",
+        nativeQuery = true
+    )
+    int deleteChunksBeforeVersion(@Param("documentId") UUID documentId, @Param("keepVersion") int keepVersion);
+
     List<DocumentEntity> findByDepartmentIdOrderByCreatedAtDesc(UUID departmentId);
 
     boolean existsByIdAndCurrentVersionAndStatus(UUID id, Integer currentVersion, DocumentStatus status);

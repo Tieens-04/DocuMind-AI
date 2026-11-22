@@ -544,8 +544,38 @@ class DocumentIngestionWorkerTest {
             IngestionFailureFormatter.INTERRUPTED_ERROR_MESSAGE
         );
         recoveryOrder.verify(chunkRepo).deleteByDocumentIdAndVersion(staleProcessingId, 2);
+        recoveryOrder.verify(chunkRepo).deleteByDocumentIdAndVersionLessThan(staleProcessingId, 2);
 
         assertThat(redrivenLatch.await(3, TimeUnit.SECONDS)).isTrue();
+    }
+
+    @Test
+    void markFailedPurgesPriorVersionsWhenActiveVersionFailsButNotWhenSuperseded() {
+        UUID docId = UUID.randomUUID();
+        DocumentRepository docRepo = mock(DocumentRepository.class);
+        DepartmentRepository deptRepo = mock(DepartmentRepository.class);
+        DocumentChunkVectorRepository chunkRepo = mock(DocumentChunkVectorRepository.class);
+        TransactionTemplate txTemplate = new TransactionTemplate(new NoOpTransactionManager());
+
+        DocumentIngestionStateService stateService = new DocumentIngestionStateService(
+            docRepo,
+            deptRepo,
+            chunkRepo,
+            txTemplate
+        );
+
+        // Active v2 fails -> purges partial v2 chunks AND obsolete v1 chunks (< 2)
+        when(docRepo.markFailed(docId, 2, "[EMPTY_DOCUMENT] blank")).thenReturn(1);
+        assertThat(stateService.markFailed(docId, 2, "[EMPTY_DOCUMENT] blank")).isTrue();
+        verify(chunkRepo).deleteByDocumentIdAndVersion(docId, 2);
+        verify(chunkRepo).deleteByDocumentIdAndVersionLessThan(docId, 2);
+
+        // Superseded v2 worker fails after v3 already claimed row (updated == 0) -> only cleans v2 partial chunks, never < 2
+        UUID supersededDocId = UUID.randomUUID();
+        when(docRepo.markFailed(supersededDocId, 2, "[EMBEDDING_ERROR] transient")).thenReturn(0);
+        assertThat(stateService.markFailed(supersededDocId, 2, "[EMBEDDING_ERROR] transient")).isFalse();
+        verify(chunkRepo).deleteByDocumentIdAndVersion(supersededDocId, 2);
+        verify(chunkRepo, never()).deleteByDocumentIdAndVersionLessThan(supersededDocId, 2);
     }
 
     @Test

@@ -36,7 +36,7 @@ public class MinioConfig {
     @Bean
     public S3Presigner s3Presigner(StorageProperties props) {
         return S3Presigner.builder()
-            .endpointOverride(URI.create(props.endpoint()))
+            .endpointOverride(URI.create(props.effectivePublicEndpoint()))
             .credentialsProvider(credentialsProvider(props))
             .region(resolveRegion(props))
             .serviceConfiguration(S3Configuration.builder()

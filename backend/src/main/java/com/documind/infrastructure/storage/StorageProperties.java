@@ -17,7 +17,8 @@ public record StorageProperties(
     @NotBlank String bucket,
     String region,
     @NotNull Duration uploadTimeout,
-    @NotNull Duration presignedExpiry
+    @NotNull Duration presignedExpiry,
+    String publicEndpoint
 ) {
 
     private static final Duration DEFAULT_UPLOAD_TIMEOUT = Duration.ofSeconds(60);
@@ -27,6 +28,19 @@ public record StorageProperties(
     public StorageProperties {
         uploadTimeout = uploadTimeout != null ? uploadTimeout : DEFAULT_UPLOAD_TIMEOUT;
         presignedExpiry = presignedExpiry != null ? presignedExpiry : DEFAULT_PRESIGNED_EXPIRY;
+        publicEndpoint = (publicEndpoint != null && !publicEndpoint.isBlank()) ? publicEndpoint.trim() : null;
+    }
+
+    public StorageProperties(
+        String endpoint,
+        String accessKey,
+        String secretKey,
+        String bucket,
+        String region,
+        Duration uploadTimeout,
+        Duration presignedExpiry
+    ) {
+        this(endpoint, accessKey, secretKey, bucket, region, uploadTimeout, presignedExpiry, null);
     }
 
     public StorageProperties(
@@ -36,6 +50,10 @@ public record StorageProperties(
         String bucket,
         String region
     ) {
-        this(endpoint, accessKey, secretKey, bucket, region, DEFAULT_UPLOAD_TIMEOUT, DEFAULT_PRESIGNED_EXPIRY);
+        this(endpoint, accessKey, secretKey, bucket, region, DEFAULT_UPLOAD_TIMEOUT, DEFAULT_PRESIGNED_EXPIRY, null);
+    }
+
+    public String effectivePublicEndpoint() {
+        return (publicEndpoint != null && !publicEndpoint.isBlank()) ? publicEndpoint : endpoint;
     }
 }
