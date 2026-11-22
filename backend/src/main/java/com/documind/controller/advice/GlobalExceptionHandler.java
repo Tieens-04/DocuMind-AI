@@ -19,6 +19,7 @@ import com.documind.exception.ResourceNotFoundException;
 import com.documind.exception.UnsupportedDocumentTypeException;
 import com.documind.infrastructure.storage.HashingBoundedInputStream;
 import jakarta.servlet.http.HttpServletRequest;
+import jakarta.servlet.http.HttpServletResponse;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.http.HttpHeaders;
@@ -32,6 +33,8 @@ import org.springframework.web.ErrorResponse;
 import org.springframework.web.bind.MethodArgumentNotValidException;
 import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
+import org.springframework.web.context.request.async.AsyncRequestNotUsableException;
+import org.springframework.web.context.request.async.AsyncRequestTimeoutException;
 import org.springframework.web.method.annotation.MethodArgumentTypeMismatchException;
 import org.springframework.web.multipart.MaxUploadSizeExceededException;
 import org.springframework.web.multipart.MultipartException;
@@ -444,11 +447,54 @@ public class GlobalExceptionHandler {
         return ResponseEntity.of(problem).build();
     }
 
-    @ExceptionHandler(Exception.class)
+    @ExceptionHandler(AsyncRequestNotUsableException.class)
+    public ResponseEntity<Void> handleAsyncRequestNotUsable(
+        AsyncRequestNotUsableException ex,
+        HttpServletRequest request
+    ) {
+        log.debug(
+            "Client disconnected during async/SSE response on {}: {}",
+            request != null ? request.getRequestURI() : "unknown",
+            ex.getMessage()
+        );
+        return null;
+    }
+
+    @ExceptionHandler(AsyncRequestTimeoutException.class)
+    public ResponseEntity<Void> handleAsyncRequestTimeout(
+        AsyncRequestTimeoutException ex,
+        HttpServletRequest request
+    ) {
+        log.debug(
+            "Async/SSE request timed out on {}: {}",
+            request != null ? request.getRequestURI() : "unknown",
+            ex.getMessage()
+        );
+        return null;
+    }
+
     public ResponseEntity<ProblemDetail> handleUnhandledException(
         Exception ex,
         HttpServletRequest request
     ) {
+        return handleUnhandledException(ex, request, null);
+    }
+
+    @ExceptionHandler(Exception.class)
+    public ResponseEntity<ProblemDetail> handleUnhandledException(
+        Exception ex,
+        HttpServletRequest request,
+        HttpServletResponse response
+    ) {
+        if (response != null && response.isCommitted()) {
+            log.debug(
+                "Response already committed on {} when handling {}: {}",
+                request != null ? request.getRequestURI() : "unknown",
+                ex.getClass().getSimpleName(),
+                ex.getMessage()
+            );
+            return null;
+        }
         if (ex instanceof ErrorResponse errorResponse) {
             int rawStatus = errorResponse.getStatusCode().value();
             HttpStatus resolved = HttpStatus.resolve(rawStatus);

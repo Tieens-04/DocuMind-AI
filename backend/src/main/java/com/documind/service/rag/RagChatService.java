@@ -137,26 +137,14 @@ public class RagChatService {
         CallerContext caller
     ) {
         long startedAtNanos = System.nanoTime();
-        RbacVectorScope rbacScope = rbacVectorFilterFactory.resolveScope(caller, filterDepartmentId);
-        CallerContext verifiedCaller = rbacScope.caller();
-        String normalizedQuestion = normalizeAndValidateQuestion(rawQuestion);
-        UserEntity verifiedActor = resolveVerifiedActor(verifiedCaller);
-
-        if (rbacScope.filterDepartmentId() != null
-            && !departmentRepositoryProvider.getObject().existsById(rbacScope.filterDepartmentId())) {
-            throw new ResourceNotFoundException("Department not found: " + rbacScope.filterDepartmentId());
-        }
-
-        ChatSessionService chatSessionService = chatSessionServiceProvider.getIfAvailable();
-        QueryContextualizerService contextualizerService = queryContextualizerServiceProvider.getIfAvailable();
-
-        List<ChatMessageEntity> recentHistory = List.of();
-        if (sessionId != null) {
-            if (chatSessionService == null || verifiedActor == null) {
-                throw new ResourceNotFoundException("Chat session not found: " + sessionId);
-            }
-            recentHistory = chatSessionService.loadAuthorizedHistoryForTurn(sessionId, verifiedActor.getId(), rbacScope);
-        }
+        PreparedChatTurn turn = prepareTurn(rawQuestion, sessionId, filterDepartmentId, caller);
+        RbacVectorScope rbacScope = turn.rbacScope();
+        CallerContext verifiedCaller = turn.verifiedCaller();
+        String normalizedQuestion = turn.normalizedQuestion();
+        UserEntity verifiedActor = turn.verifiedActor();
+        ChatSessionService chatSessionService = turn.chatSessionService();
+        QueryContextualizerService contextualizerService = turn.contextualizerService();
+        List<ChatMessageEntity> recentHistory = turn.recentHistory();
         boolean skipRewrite = recentHistory.isEmpty();
 
         // Turn 1 bypasses QueryContextualizerService completely (0 rewrite tokens, optimal TTFT)
@@ -165,7 +153,7 @@ public class RagChatService {
                 ? contextualizerService.contextualize(normalizedQuestion, recentHistory)
                 : QueryContextualizerService.ContextualizedQuery.skipped(normalizedQuestion);
 
-        UUID auditDepartmentId = resolveAuditDepartmentId(rbacScope);
+        UUID auditDepartmentId = turn.auditDepartmentId();
 
         List<RetrievedChunk> chunks;
         try {
@@ -305,7 +293,46 @@ public class RagChatService {
         );
     }
 
-    private Prompt buildAnswerPrompt(
+    PreparedChatTurn prepareTurn(
+        String rawQuestion,
+        UUID sessionId,
+        UUID filterDepartmentId,
+        CallerContext caller
+    ) {
+        RbacVectorScope rbacScope = rbacVectorFilterFactory.resolveScope(caller, filterDepartmentId);
+        CallerContext verifiedCaller = rbacScope.caller();
+        String normalizedQuestion = normalizeAndValidateQuestion(rawQuestion);
+        UserEntity verifiedActor = resolveVerifiedActor(verifiedCaller);
+
+        if (rbacScope.filterDepartmentId() != null
+            && !departmentRepositoryProvider.getObject().existsById(rbacScope.filterDepartmentId())) {
+            throw new ResourceNotFoundException("Department not found: " + rbacScope.filterDepartmentId());
+        }
+
+        ChatSessionService chatSessionService = chatSessionServiceProvider.getIfAvailable();
+        QueryContextualizerService contextualizerService = queryContextualizerServiceProvider.getIfAvailable();
+
+        List<ChatMessageEntity> recentHistory = List.of();
+        if (sessionId != null) {
+            if (chatSessionService == null || verifiedActor == null) {
+                throw new ResourceNotFoundException("Chat session not found: " + sessionId);
+            }
+            recentHistory = chatSessionService.loadAuthorizedHistoryForTurn(sessionId, verifiedActor.getId(), rbacScope);
+        }
+
+        return new PreparedChatTurn(
+            rbacScope,
+            verifiedCaller,
+            verifiedActor,
+            resolveAuditDepartmentId(rbacScope),
+            normalizedQuestion,
+            List.copyOf(recentHistory),
+            chatSessionService,
+            contextualizerService
+        );
+    }
+
+    Prompt buildAnswerPrompt(
         Message systemMessage,
         List<ChatMessageEntity> recentHistory,
         String normalizedQuestion,
@@ -360,7 +387,7 @@ public class RagChatService {
         }
     }
 
-    private ChatSessionService.PersistedTurnResult persistCompletedTurnOrAuditOnly(
+    ChatSessionService.PersistedTurnResult persistCompletedTurnOrAuditOnly(
         ChatSessionService chatSessionService,
         UserEntity verifiedActor,
         UUID auditDepartmentId,
@@ -448,7 +475,7 @@ public class RagChatService {
         return new ProviderResult(providerName, text.trim(), tokens.promptTokens(), tokens.completionTokens());
     }
 
-    private String normalizeAndValidateQuestion(String rawQuestion) {
+    String normalizeAndValidateQuestion(String rawQuestion) {
         String normalized = VectorRetrievalService.normalizeQuery(rawQuestion);
         int maxQuestionChars = ragProperties.llm().maxQuestionChars();
         if (normalized.length() > maxQuestionChars) {
@@ -459,7 +486,7 @@ public class RagChatService {
         return normalized;
     }
 
-    private UserEntity resolveVerifiedActor(CallerContext caller) {
+    UserEntity resolveVerifiedActor(CallerContext caller) {
         UUID userId = caller.userId();
         if (userId == null) {
             return null;
@@ -479,7 +506,7 @@ public class RagChatService {
         return user;
     }
 
-    private static UUID resolveAuditDepartmentId(RbacVectorScope rbacScope) {
+    static UUID resolveAuditDepartmentId(RbacVectorScope rbacScope) {
         return rbacScope.caller().departmentId() != null
             ? rbacScope.caller().departmentId()
             : rbacScope.filterDepartmentId();
@@ -497,6 +524,34 @@ public class RagChatService {
         long latencyMs,
         String failedProvider
     ) {
+        recordFailureAuditQuietly(
+            verifiedActor,
+            auditDepartmentId,
+            sessionId,
+            chatSessionService,
+            ipAddress,
+            queryText,
+            promptTokens,
+            completionTokens,
+            latencyMs,
+            failedProvider,
+            HttpStatus.BAD_GATEWAY.value()
+        );
+    }
+
+    void recordFailureAuditQuietly(
+        UserEntity verifiedActor,
+        UUID auditDepartmentId,
+        UUID sessionId,
+        ChatSessionService chatSessionService,
+        String ipAddress,
+        String queryText,
+        int promptTokens,
+        int completionTokens,
+        long latencyMs,
+        String failedProvider,
+        int statusCode
+    ) {
         try {
             if (chatSessionService != null) {
                 chatSessionService.recordFailureAudit(
@@ -508,6 +563,7 @@ public class RagChatService {
                     completionTokens,
                     latencyMs,
                     failedProvider,
+                    statusCode,
                     ipAddress
                 );
                 return;
@@ -521,15 +577,15 @@ public class RagChatService {
                 completionTokens,
                 latencyMs,
                 failedProvider,
-                HttpStatus.BAD_GATEWAY.value(),
+                statusCode,
                 ipAddress
             );
         } catch (RuntimeException auditEx) {
-            log.warn("Failed to persist failure audit log for chat ask: {}", auditEx.getMessage());
+            log.warn("Failed to persist failure audit log (status={}): {}", statusCode, auditEx.getMessage());
         }
     }
 
-    private void saveAuditLog(
+    void saveAuditLog(
         UserEntity user,
         UUID departmentId,
         String queryText,
@@ -600,8 +656,20 @@ public class RagChatService {
             || ch == '*';
     }
 
-    private static long elapsedMillis(long startedAtNanos) {
+    static long elapsedMillis(long startedAtNanos) {
         return Math.max(0L, TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startedAtNanos));
+    }
+
+    record PreparedChatTurn(
+        RbacVectorScope rbacScope,
+        CallerContext verifiedCaller,
+        UserEntity verifiedActor,
+        UUID auditDepartmentId,
+        String normalizedQuestion,
+        List<ChatMessageEntity> recentHistory,
+        ChatSessionService chatSessionService,
+        QueryContextualizerService contextualizerService
+    ) {
     }
 
     private record ProviderResult(
