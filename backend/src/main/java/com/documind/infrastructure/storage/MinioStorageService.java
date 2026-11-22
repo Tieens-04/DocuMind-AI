@@ -117,6 +117,20 @@ public class MinioStorageService {
         }
     }
 
+    public Duration presignedExpiry() {
+        return props.presignedExpiry();
+    }
+
+    public static String appendPageFragment(String baseUrl, Integer pageNumber) {
+        if (baseUrl == null || baseUrl.isBlank()) {
+            return null;
+        }
+        if (pageNumber == null) {
+            return baseUrl;
+        }
+        return baseUrl + "#page=" + pageNumber;
+    }
+
     public URL generatePresignedGetUrl(String storageKey, String inlineFileName) {
         return generatePresignedGetUrl(storageKey, inlineFileName, props.presignedExpiry());
     }
