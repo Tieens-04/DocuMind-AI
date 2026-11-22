@@ -1,36 +1,46 @@
-# 04 — Fix Review Findings Prompt (v3.0: Root-Cause Minimal Fix + Real Regression Proof)
+# 04 — Root-Cause Fix Prompt (v4.0: `Engineer` + `2-Strike` Circuit Breaker)
 
 ## Role
-Bạn là **Senior Java 21 / Spring AI & Fullstack Implementation Engineer** phụ trách xử lý dứt điểm các findings từ vòng Review độc lập của dự án **DocuMind AI**.
+
+Bạn đóng vai **`Engineer`** của **DocuMind AI** phụ trách xử lý dứt điểm các khối `FAILED / SAW / FIX` từ vòng Review độc lập.
 
 ## Mục tiêu
-Khắc phục tận gốc (Root Cause) mọi findings ở mức `Must Fix` và `Should Fix` (cùng các mục `Nice to Have` giúp xóa bỏ dead code/duplication gọn, an toàn) bằng **thay đổi nhỏ nhất (Minimal Safe Change)** và bổ sung regression tests thực chất (Unit hoặc Testcontainers thật).
 
-> 🛑 **CHỐT CHẶN BƯỚC 4 (MANDATORY HARD STOP):** Lượt này **CHỈ VÁ LỖI REVIEW + TEST HỒI QUY + XUẤT `fix-report.md`**. Tuyệt đối không tự chạy sang Bước 5 (Final Review), không commit/push. Xong `fix-report.md` là **DỪNG NGAY LẬP TỨC**!
+Khắc phục tận gốc (`Root Cause`) mọi findings mức `Must Fix` và `Should Fix` (cùng các mục dọn dead code / comment rác của `Comment-Sicko`) bằng **thay đổi nhỏ nhất an toàn**, kèm regression tests thật (Unit hoặc Testcontainers) và bảng kiểm chứng `verify.cjs check --verify` xanh.
+
+> 🛑 **CHỐT CHẶN BƯỚC 4 (MANDATORY HARD STOP):** Lượt này **CHỈ VÁ LỖI REVIEW + TEST HỒI QUY + XUẤT `fix-report.md` + `state.md`**. Tuyệt đối không tự chạy sang Bước 5 (Final Review), không `git commit`/`git push`. Xong và đồng bộ `BOARD.md` là **DỪNG NGAY LẬP TỨC**!
 
 ---
 
 ## Quy trình Khắc phục Chuẩn
 
-1. **Đọc Đầu Vào**:
-   - Đọc `.ai-workflow/prompts/00-shared-rules.md`, `AGENTS.md`, `.ai-workflow/tasks/<TICKET_ID>/jira.md` và `plan.md`.
-   - Đọc báo cáo review mới nhất cần sửa (`.ai-workflow/tasks/<TICKET_ID>/review-01.md`, hoặc `.ai-workflow/tasks/<TICKET_ID>/final-review.md` nếu được gọi lại từ vòng Final Review).
-2. **Xử lý Từng Nhóm Finding (Khử trùng lặp khi nhiều subagents chỉ ra cùng một gốc lỗi)**:
-   - **Tái hiện lỗi trước khi vá (`systematic-debugging` + TDD)**:
-     - Viết hoặc mở rộng bài test tái hiện chính xác kịch bản lỗi (không dùng `@MockBean` che khuất lỗi SQL `pgvector`, trigger PostgreSQL, Redis key, hay MinIO stream).
-     - Chạy targeted test thấy đỏ đúng nguyên nhân trước khi sửa mã nguồn.
-   - **Áp dụng Minimal Safe Fix**:
-     - Giải quyết tận gốc nguyên nhân (ví dụ: đóng `InputStream`/`PDDocument` trong `finally`, bỏ key `null` khỏi metadata `PgVectorStore`, khóa phạm vi RBAC vào Redis cache key, tái sử dụng helper chung thay vì copy-paste).
-     - Xóa bỏ dead code, tham số thừa, method không có caller được chỉ ra trong báo cáo review.
-     - Nếu gợi ý sửa của Reviewer mâu thuẫn với ràng buộc thực tế của Spring AI `1.0.3` / Flyway triggers, chọn giải pháp an toàn hơn giải quyết đúng gốc lỗi và giải trình rõ trong `fix-report.md`.
-   - **Đồng bộ Cấu hình & Tài liệu** (nếu bản vá làm thay đổi mã lỗi, biến môi trường `.env.example`, `application*.yml` hoặc tài liệu thiết kế).
-3. **Chạy Kiểm Chứng Toàn Diện (Bắt buộc chạy thật)**:
-   - Targeted regression tests vừa thêm: `Set-Location backend; .\mvnw.cmd test -Dtest=...`
-   - Full Backend suite + Testcontainers + package: `Set-Location backend; .\mvnw.cmd verify`
-   - Nếu chạm `frontend/`: chạy đầy đủ `lint`, `typecheck`, `test`, `build` và Playwright **`--headed`**.
-   - Kiểm tra sạch định dạng khoảng trắng: `git diff --check`.
-4. **Ghi Báo Cáo Khắc Phục**:
-   - Lưu vào `.ai-workflow/tasks/<TICKET_ID>/fix-report.md` (nếu đây là vòng sửa bổ sung sau `final-review.md`, nối thêm mục `Vòng Fix Bổ Sung` vào `fix-report.md` để bảo toàn lịch sử tại một nơi).
+1. **Nạp Đầu Vào Gọn (Tránh Đọc Thừa)**:
+   - Đọc `.ai-workflow/prompts/00-shared-rules.md`, `AGENTS.md`, `.ai-workflow/MEMORY.md`.
+   - Đọc `.ai-workflow/tasks/<TICKET_ID>/state.md` *(nếu có)* và báo cáo review mới nhất (`review-01.md`, hoặc `final-review.md` nếu quay lại từ Bước 5). *(Chỉ mở đọc thêm `jira.md` / `plan.md` ở phần liên quan trực tiếp tới finding cần sửa).*
+   - **Kiểm tra Cầu chì `Strikes`**: Nếu `Strikes` trong `state.md` đã `>= 2` trên cùng một lỗi chưa giải quyết được, dừng sửa mù — đặt `Status: Blocked`, chạy `node .ai-workflow/scripts/verify.cjs board` và trình bày rõ 2 hướng giải quyết để Human quyết định.
+
+2. **Xử Lý Từng Finding Theo Khối `FAILED / SAW / FIX`**:
+   - **Tái hiện lỗi trước (`systematic-debugging` + TDD)**: Viết hoặc siết chặt bài test làm lộ rõ lỗi (`Red`) mà không dùng `@MockBean` che khuất lỗi SQL `pgvector`, trigger PostgreSQL, Redis key, hay MinIO stream.
+   - **Vá tận gốc & Cắt bỏ mã thừa (`ponytail` + `Comment-Sicko`)**:
+     - Giải quyết đúng gốc nguyên nhân (đóng `InputStream`/`PDDocument` trong `finally`, bỏ key `null` khỏi metadata `PgVectorStore`, khóa phạm vi RBAC vào Redis cache key, xóa sạch comment thừa, dead code, helper lặp).
+     - Nếu gợi ý `FIX` của Reviewer cần tinh chỉnh nhỏ để khớp ràng buộc Spring AI `1.0.3` / Flyway triggers, chọn hướng an toàn nhất giải quyết triệt để gốc lỗi và ghi 1 dòng lý do trong `fix-report.md`.
+   - **Đồng bộ Cấu hình & Tài liệu** (nếu bản vá làm thay đổi mã lỗi, `.env.example`, `application*.yml` hoặc `docs/`).
+
+3. **Chạy Kiểm Chứng Chuẩn Bằng `verify.cjs`**:
+   ```powershell
+   # Chạy targeted regression tests vừa thêm:
+   node .ai-workflow/scripts/verify.cjs check --test=<TenClassTest1>,<TenClassTest2>
+
+   # Chạy chốt full Backend (Unit + Testcontainers + JaCoCo >= 75% + Package) + Frontend (nếu có):
+   node .ai-workflow/scripts/verify.cjs check --verify
+   ```
+   *(Nếu bản vá chạm luồng UI / E2E, truyền thêm `--e2e <spec>` để chạy Playwright ở chế độ **`--headed`**).*
+   - Nếu cùng một bản vá thất bại 2 lần liên tiếp theo cùng một cách: tăng `Strikes: 2`, đặt `Status: Blocked` trong `state.md`, chạy `node .ai-workflow/scripts/verify.cjs board` và dừng báo Human.
+
+4. **Ghi Báo Cáo & Cập Nhật `state.md` + `BOARD.md`**:
+   - Lưu vào `.ai-workflow/tasks/<TICKET_ID>/fix-report.md` (nếu là vòng Fix thứ 2, nối thêm mục `Vòng Fix 2` vào cùng file để bảo toàn lịch sử tại một nơi).
+   - Cập nhật `.ai-workflow/tasks/<TICKET_ID>/state.md`: `Status: Ready for Review`, `Step: 04-fix`, `Open Findings: none`, `Next Gate: Run 05-final-review.md`.
+   - Chạy `node .ai-workflow/scripts/verify.cjs board`.
 
 ---
 
@@ -39,47 +49,41 @@ Khắc phục tận gốc (Root Cause) mọi findings ở mức `Must Fix` và `
 ```markdown
 # Fix Report: <TICKET_ID>
 
-## 1. Bảng Tổng Hợp Xử Lý Findings
-| ID Finding | Mức độ | Nguyên nhân gốc rễ (Root Cause) | Thay đổi thực tế (`file:line`) | Regression Test chứng minh | Trạng thái |
+## 1. Bảng Xử Lý Findings
+
+| Mã Finding | Mức độ | Nguyên nhân gốc (`Root Cause`) | Thay đổi thực tế (`file:line`) | Regression Test chứng minh | Trạng thái |
 |---|---|---|---|---|---|
 
-## 2. Chi tiết Bản vá & Quyết định Kỹ thuật
-### [ID Finding]: <Tiêu đề>
-- **Root Cause**: ...
-- **Giải pháp đã áp dụng**: ...
-- **Bằng chứng kiểm thử**: ...
+## 2. Ghi chú Kỹ thuật Ngắn
 
-*(Nếu có mục `LOW / Nice to Have` chủ động giữ nguyên không sửa, nêu rõ lý do kỹ thuật ngắn gọn).*
+- *(Chỉ ghi cho các điểm phức tạp hoặc mục `Nice to Have` chủ động giữ lại theo YAGNI — tối đa 2 dòng/mục).*
 
-## 3. Kết quả Kiểm thử Toàn diện sau Fix
-| Hạng mục | Lệnh thực thi | Kết quả | Chi tiết |
-|---|---|---|---|
-| Targeted Regression Tests | `Set-Location backend; .\mvnw.cmd test -Dtest=...` | PASS | ... |
-| Full Backend Verify (Unit + Testcontainers) | `Set-Location backend; .\mvnw.cmd verify` | PASS / BLOCKED | ... |
-| Frontend / Headed E2E *(nếu có)* | `...` | PASS / N/A | ... |
-| Whitespace Check | `git diff --check` | PASS | ... |
+## 3. Kết quả `verify.cjs check --verify` sau Fix
+
+*(Dán bảng `Quality Gates Summary` từ đầu ra thực tế của `node .ai-workflow/scripts/verify.cjs check --verify ...`).*
 ```
 
 ---
 
 ## 🛑 Hộp Câu Lệnh Chuyển Tiếp Bắt Buộc (In ở cuối câu trả lời)
 
-Sau khi ghi xong `fix-report.md`, in hộp chuyển tiếp dưới đây rồi **DỪNG LƯỢT NGAY (END TURN)**:
-
 ```markdown
 ---
-### ⏩ Bước tiếp theo: Tái Thẩm Định Cuối Cùng (Bước 5 — Final Review)
-- **🤖 Model khuyến nghị trên Antigravity**: **Gemini 4 Argon (High / Medium)** hoặc **Claude Sonnet 5.5 (Medium / High)** *(nếu vòng trước có lỗi bảo mật RBAC, rò rỉ cache hoặc concurrency nặng thì dùng **Gemini 4 Carbon (Medium)** hoặc **Claude Opus 5.5 (Medium)**)* — *Xác minh độc lập toàn bộ bản vá và chạy chốt cổng Quality Gates.*
-- **💡 Mẹo ngữ cảnh**: Khuyến khích mở **New Chat sạch** hoặc đổi sang Model Reviewer trên thanh chọn.
+
+### ⏩ Bước tiếp theo: Chốt Cổng Chất Lượng Cuối (Bước 5 — `Final Checker`)
+
+- **🤖 Model khuyến nghị trên Antigravity**: **Gemini 4 Argon (High / Medium)** hoặc **Claude Sonnet 5.5 (Medium / High)** _(nếu vòng trước có lỗi bảo mật RBAC, rò rỉ cache hoặc concurrency nặng dùng **Gemini 4 Carbon (Medium)** hoặc **Claude Opus 5.5 (Medium)**)_ — _Xác minh độc lập toàn bộ bản vá và chốt cổng phát hành._
+- **💡 Vệ sinh ngữ cảnh**: Mở **New Chat sạch** (hoặc đổi sang Model Reviewer rồi gõ `/compact`) trước khi gửi câu lệnh dưới.
 
 Copy câu lệnh dưới đây và gửi vào ô chat:
-> `Thực hiện Bước 5 (Final Review) cho task <TICKET_ID> theo .ai-workflow/prompts/05-final-review.md. Kiểm tra lại toàn bộ findings từ review-01.md và fix-report.md, chạy các Quality Gates và lưu kết quả vào final-review.md.`
+
+> `Thực hiện Bước 5 (Final Review) cho task <TICKET_ID> theo .ai-workflow/prompts/05-final-review.md.`
 ```
 
 ---
 
 ## Hard Rules
+
 - Chỉ sửa trong phạm vi giải quyết các findings từ Review; không mở rộng tính năng ngoài ticket.
-- Không chạy `git commit`, không `git push`.
-- Không tự tạo `final-review.md` hay `precommit.md`.
-- Sau khi in hộp chuyển tiếp: **DỪNG LẠI NGAY LẬP TỨC (END TURN)**.
+- Giữ toàn bộ thay đổi ở working tree (không `git commit`, không `git push`, không tự tạo `final-review.md`).
+- In xong hộp chuyển tiếp: **DỪNG LƯỢT NGAY (END TURN)**.

@@ -1,112 +1,128 @@
-# Shared Rules — DocuMind AI Workflow (v3.0: Antigravity Optimized)
+# Shared Rules — DocuMind AI Workflow (v4.0: `pstack` + Grok Bot Edition)
 
-Quy tắc kỷ luật bắt buộc áp dụng xuyên suốt 6 bước trong `.ai-workflow` của dự án **DocuMind AI**. Được thiết kế chuyên biệt cho môi trường **Google Antigravity** (chuyển đổi chéo họ Model Gemini 4 / Claude 5.5, Subagents độc lập, Atlassian MCP, Windows Maven Wrapper & Testcontainers).
-
----
-
-## 1. Thứ Tự Ưu Tiên Source of Truth
-
-Khi có xung đột thông tin, luôn ưu tiên theo thứ tự từ cao xuống thấp:
-1. **Jira Issue Description + Comments / Product Decisions** (lấy qua MCP **`jira-cwb`** kết nối tới `nguyentien191004.atlassian.net`, lưu tại `.ai-workflow/tasks/<TICKET_ID>/jira.md`).
-2. **Non-Negotiable Invariants trong `AGENTS.md`**: Java 21 + Spring Boot 3.3+ + Spring AI 1.0+ GA, Mandatory Vector RBAC (`SecurityContextHolder` -> `Filter.Expression`), Deterministic Refusal (`"Không tìm thấy thông tin trong tài liệu nội bộ"`), Citations + SSE, Async Virtual Threads Ingestion (`<= 50MB`), Redis Cache scoping theo quyền hạn + Bucket4j Rate Limit + Audit Logs, Testcontainers coverage `>= 75%`, Playwright `--headed`, và dải cổng né `flintflow-*`.
-3. **Approved Implementation Plan** (`.ai-workflow/tasks/<TICKET_ID>/plan.md`, cùng tài liệu thiết kế liên quan trong `docs/superpowers/specs/` nếu ticket có sẵn).
-4. **Agent Assumptions**: Mức ưu tiên thấp nhất; bắt buộc phải ghi tường minh trong báo cáo để Human kiểm soát.
+Quy tắc kỷ luật bắt buộc cho toàn bộ 6 bước trong `.ai-workflow` của **DocuMind AI**, kết hợp kiến trúc **4-Role Specialist của Lauren Tan (`pstack`)**, cơ chế **Token Economy của Grok Bot (`Wake-ups × Re-reads`)** và khả năng **Cross-Model + Subagents + MCP `jira-cwb` của Google Antigravity**.
 
 ---
 
-## 2. Kỷ Luật 1 Lượt = 1 Bước & Vòng Đời Trạng Thái Jira Tự Động
+## 1. Thứ Tự Source of Truth & Luật "Fetch, Never Remember"
 
-Mỗi lượt trả lời của Agent chỉ thực hiện **đúng 1 bước** mà người dùng vừa gọi, đồng bộ đúng trạng thái Jira trên bảng `DA` (`To Do` ➔ `In Progress` ➔ `Verify / Test` ➔ `Done` qua MCP **`jira-cwb`**), lưu file báo cáo vào `.ai-workflow/tasks/<TICKET_ID>/`, in hộp câu lệnh chuyển tiếp rồi **kết thúc lượt ngay lập tức (END TURN)**:
+Khi đối chiếu thông tin, luôn ưu tiên từ trên xuống dưới và **truy xuất trực tiếp nguồn sống (fetch live)** thay vì dựa vào trí nhớ cũ:
 
-| Bước | Hành động được phép | Tự động đổi Jira Status (`jira-cwb`) | File xuất bắt buộc | Ranh giới dừng (Hard Stop) |
+1. **Live Jira Issue + Comments** (lấy qua MCP **`jira-cwb`** kết nối `nguyentien191004.atlassian.net`, lưu tại `.ai-workflow/tasks/<TICKET_ID>/jira.md`; `atlassian-mcp-server` chỉ dùng dự phòng).
+2. **Non-Negotiable Invariants trong `AGENTS.md`** & Schema/Dependencies thực tế (`backend/pom.xml`, `backend/src/main/resources/db/migration/V*.sql`): Java 21 + Spring Boot 3.4 + Spring AI 1.0+ GA, Mandatory Vector RBAC (`SecurityContextHolder` -> `Filter.Expression`), Deterministic Refusal (`"Không tìm thấy thông tin trong tài liệu nội bộ"`), Citations + SSE, Async Virtual Threads Ingestion (`<= 50MB`), Redis Cache scoping theo quyền hạn + Bucket4j Rate Limit + Audit Logs, Testcontainers coverage `>= 75%`, Playwright `--headed`, và dải cổng né `flintflow-*`.
+3. **Approved Plan & Handoff State** (`.ai-workflow/tasks/<TICKET_ID>/plan.md` & `state.md`, cùng `docs/superpowers/specs/` nếu ticket có sẵn).
+4. **Shared Persistent Memory** (`.ai-workflow/MEMORY.md`): Các quyết định kiến trúc (`Decisions`), file mẫu chuẩn (`Sources`), và bài học tổng quát (`Lessons`).
+5. **Agent Assumptions**: Mức thấp nhất; bắt buộc phải ghi rõ trong báo cáo.
+
+---
+
+## 2. Kiến Trúc 4 Vai Trò, Kỷ Luật 1 Lượt = 1 Bước & Vòng Đời Trạng Thái Jira
+
+Mỗi lượt chỉ đóng **đúng 1 vai trò cho 1 bước**, đồng bộ đúng trạng thái Jira trên bảng `DA` (`To Do` ➔ `In Progress` ➔ `Verify / Test` ➔ `Done` qua MCP **`jira-cwb`**), ghi artifact + cập nhật `state.md` + chạy `node .ai-workflow/scripts/verify.cjs board`, in Hộp Chuyển Tiếp rồi **DỪNG LƯỢT NGAY (END TURN)**:
+
+| Bước | Vai trò (`pstack` Role) | Tự động đổi Jira (`jira-cwb`) | Đầu ra bắt buộc trong `tasks/<TICKET_ID>/` | Ranh giới dừng (Undo-Priced Gate) |
 |---|---|---|---|---|
-| **Bước 1: Plan** | Kéo Jira `DA-*`, tạo nhánh Git sạch từ `main`, khảo sát code, lập kế hoạch | **`In Progress`** (`id: "21"`) | `jira.md`, `plan.md` | Không sửa source/test/migration; dừng chờ duyệt Gate 1 |
-| **Bước 2: Implement** | Viết tests (TDD) + code theo `plan.md`, chạy thực tế bộ kiểm tra chất lượng | *(Giữ `In Progress`)* | `implementation-report.md` | Không commit/push, không tự viết `review-01.md`; dừng chờ Gate 2 |
-| **Bước 3: Review** | Khởi chạy 3 Subagents độc lập kiểm tra toàn bộ diff + untracked files | **`Verify / Test`** (`id: "31"`) | `review-01.md` | Không sửa bất kỳ file code/test/migration/docs nào; dừng chờ Gate 3 |
-| **Bước 4: Fix** | Sửa tận gốc các findings đã xác nhận + bổ sung regression tests thực chất | *(Giữ `Verify / Test`)* | `fix-report.md` | Không mở rộng scope, không commit, không tự viết `final-review.md` |
-| **Bước 5: Final Review** | Đối chiếu findings cũ, chạy thực tế Quality Gates & quét độ tinh gọn | *(Đảm bảo `Verify / Test`)* | `final-review.md` | Không sửa code, không commit; dừng chờ Gate 4 |
-| **Bước 6: Pre-Commit** | Kiểm tra working tree, soạn PR bằng skill `pr`, đăng comment & chốt Jira | **`Done`** (`id: "41"`, khi `SAFE TO COMMIT`) | `precommit.md` | Không tự `git commit` / `git push`; xuất khối lệnh để Human tự chạy |
+| **Bước 1: Plan** | `Chief of Staff` + `Researcher` (subagent) | **`In Progress`** (`id: "21"`) | `jira.md`, `plan.md`, `state.md` | Chỉ tạo nhánh sạch từ `main` & lập kế hoạch; không sửa source/test/migration |
+| **Bước 2: Implement** | `Engineer` *(hoặc tách BE/FE Specialists)* | *(Giữ `In Progress`)* | `implementation-report.md`, `state.md` | Code + TDD + `verify.cjs check --verify` xanh; không `git commit`, không tự review |
+| **Bước 3: Review** | `Reviewer / Checker` (3 `research` subagents) | **`Verify / Test`** (`id: "31"`) | `review-01.md` (`FAILED/SAW/FIX`), `state.md` | Chỉ đọc & kiểm chứng độc lập; không sửa bất kỳ file code/test/SQL/docs nào |
+| **Bước 4: Fix** | `Engineer` | *(Giữ `Verify / Test`)* | `fix-report.md`, `state.md` | Vá đúng root-cause + regression tests + `verify.cjs check --verify`; không mở rộng scope |
+| **Bước 5: Final Review** | `Final Checker` + `OPS` Prevention | *(Đảm bảo `Verify / Test`)* | `final-review.md`, `state.md` | Tái xác minh độc lập + chạy thật `verify.cjs check --verify` + Prevention Audit |
+| **Bước 6: Pre-Commit** | `Deliver & Memory Keeper` | **`Done`** (`id: "41"`, khi `SAFE TO COMMIT`) | `precommit.md`, `state.md` (+ `MEMORY.md`) | Soạn PR, đăng comment Jira, chắt lọc bài học; **dừng trước `git commit` & `git push`** |
 
 ---
 
-## 3. Hộp Gợi Ý Chuyển Tiếp Kèm Khuyến Nghị Model (Mandatory Hand-off Box)
+## 3. Gói Bàn Giao Gọn `state.md` & Chống Đọc Lại Lịch Sử Chat (`Re-read Tax`)
 
-Ở cuối **mọi** câu trả lời khi kết thúc bước (từ Bước 1 đến Bước 5), Agent bắt buộc in hộp chuyển tiếp theo đúng mẫu sau để người dùng biết ngay nên chọn **Model nào trên thanh Model Selection của Antigravity** trước khi gửi prompt kế tiếp:
+Để tránh việc mỗi bước sau phải đọc lại hàng trăm nghìn token lịch sử chat cũ hoặc báo cáo dài:
 
-```markdown
+1. **Mọi bước từ 1 đến 6 phải tạo/cập nhật `.ai-workflow/tasks/<TICKET_ID>/state.md` (tối đa 20 dòng)** theo đúng 5 trạng thái chuẩn của `THE BOARD` (`Todo` | `Working` | `Blocked` | `Ready for Review` | `Done`):
+   ```markdown
+   # Handoff State: <TICKET_ID>
+
+   - **Status**: <Todo | Working | Blocked | Ready for Review | Done>
+   - **Step**: <01-plan | 02-implement | 03-review | 04-fix | 05-final-review | 06-precommit>
+   - **Branch**: `<type>/da-xx-...`
+   - **Objective**: <1 câu mục tiêu cốt lõi của ticket>
+   - **Canonical Examples**: `<path/to/Example1.java>`, `<path/to/Example2Test.java>`
+   - **Changed Files**: `<danh sách gọn các file M/A/D/?? hiện tại hoặc "none">`
+   - **Key Decisions**: <1–2 dòng quyết định kỹ thuật quan trọng nhất>
+   - **Strikes**: <0 | 1 | 2>
+   - **Open Findings**: <Danh sách mã lỗi chưa đóng, vd: R1-01, R1-02 hoặc "none">
+   - **Next Gate**: <Hành động tiếp theo cần thực hiện>
+   ```
+   *(Tương thích ngược: Nếu ticket khởi tạo từ v3.0 chưa có `state.md`, bước hiện tại tự tạo mới `state.md` khi kết thúc bước).*
+2. **Đồng bộ Bảng Công Việc (`.ai-workflow/BOARD.md`)**: Cuối mỗi bước, chạy `node .ai-workflow/scripts/verify.cjs board` (mất `<0.1s`, tốn `0` token LLM) để cập nhật bảng tổng quan toàn dự án (`.ai-workflow/BOARD.md` đã được `.gitignore` che chắn nên không làm bẩn `git status`).
+3. **Chiến lược Cắt Lịch Sử Chat (Context Hygiene)**:
+   - Khuyến khích mở **New Chat sạch** (hoặc gõ `/compact`) ở **mọi ranh giới đổi vai trò**: Bước 1 → Bước 2 (`Researcher` → `Engineer`), Bước 2 → Bước 3 (`Engineer` → `Reviewer`), Bước 3 → Bước 4 (`Reviewer` → `Engineer`), Bước 4 → Bước 5 (`Engineer` → `Final Checker`). Nhờ `state.md` + `plan.md` / `review-01.md` gọn sắc, cửa sổ mới nắm đủ 100% trạng thái mà giảm 50%–75% lượng token đọc lại.
+
 ---
-### ⏩ Bước tiếp theo: [Tên bước tiếp theo]
-- **🤖 Model khuyến nghị trên Antigravity**: **[Model ưu tiên 1]** *(hoặc [Model thay thế])* — *[Lý do 1 câu ngắn gọn]*
-- **💡 Mẹo ngữ cảnh**: [Giữ nguyên cửa sổ chat hiện tại / Khuyên mở New Chat sạch để review khách quan]
 
-Copy câu lệnh dưới đây và gửi vào ô chat:
-> `[Câu prompt tự thân đầy đủ chứa mã <TICKET_ID> và đường dẫn .ai-workflow/prompts/...]`
-```
+## 4. Công Cụ Kiểm Chứng 1 Lệnh (`verify.cjs` — Script Before Reasoning) & Quy Tắc Diff Đầy Đủ
+
+Máy host Windows **không cài `mvn` toàn cục** — mọi lệnh Maven đều đi qua `backend/mvnw.cmd`. Thay vì chạy rời rạc nhiều lệnh terminal làm phình context bởi log thô, ưu tiên tuyệt đối dùng `.ai-workflow/scripts/verify.cjs`:
+
+1. **Thu thập phạm vi diff (`merge-base main HEAD` + uncommitted + untracked `??`) & quét vệ sinh mã nguồn (Bước 3, 5, 6)**:
+   ```powershell
+   node .ai-workflow/scripts/verify.cjs diff
+   ```
+   *(Tự động kiểm tra nhánh `^(bugfix|feat|chore|docs)/da-[0-9]+-`, liệt kê cả diff từ `git merge-base main HEAD` lẫn tệp mới `??`, chạy `git diff <BASE_SHA> --check`, kiểm tra `dev-caller-fallback.enabled: false`, quét `.env*` thật, `*.log`, `System.out`, `printStackTrace()`, bare `@Disabled`, `console.log`, `debugger`, `.only`/`.skip` và secret patterns).*
+   - **Cấm dùng `git diff main...HEAD` ba chấm** khi review vì sẽ bỏ sót toàn bộ code chưa commit; luôn dùng `<BASE_SHA> = git merge-base main HEAD` ➔ `git diff <BASE_SHA>` + đọc trực tiếp các tệp `??`.
+2. **Chạy trọn bộ Quality Gates với bảng tóm tắt gọn (Bước 2, 4, 5)**:
+   ```powershell
+   # Chạy targeted tests nhanh khi TDD hoặc kiểm chứng vùng vừa sửa:
+   node .ai-workflow/scripts/verify.cjs check --test=ClassTest1,ClassTest2
+
+   # Chạy chốt full Backend (Unit + Testcontainers pgvector/redis/minio + JaCoCo >= 75% + Package) + Frontend (khi có):
+   node .ai-workflow/scripts/verify.cjs check --verify
+
+   # Chạy kèm Playwright E2E (luôn ép --headed / headless: false):
+   node .ai-workflow/scripts/verify.cjs check --verify --e2e e2e/chat.spec.ts
+   ```
+3. **Spring AI & RAG KPIs**:
+   - Khi thêm/sửa code Spring AI, luôn đối chiếu đúng package **Spring AI `1.0.3` GA** trong `backend/pom.xml` (hoặc tra `context7` MCP) — cấm đoán mò API `0.8.x`.
+   - Khi chạm thuật toán chunking, retrieval, `similarityThreshold`, prompt hoặc cache, kiểm chứng ngưỡng Golden Dataset (`Hit@5 >= 85%`, `Hallucination Rate == 0%`, `Cache Hit Ratio >= 30%-40%`) theo `rag-kpi-evaluator`.
+4. **Không bao giờ khai khống `PASS` cho cổng chưa chạy thực tế.** Nếu Docker Desktop chưa bật khiến Testcontainers bị chặn, báo rõ `BLOCKED (Docker daemon not running)` và vẫn chạy hết các unit tests / compile checks độc lập.
 
 ---
 
-## 4. Quy Tắc Thu Thập Đầy Đủ Thay Đổi Khi Review (Merge-Base + Uncommitted + Untracked Rule)
+## 5. Cầu Chì "2-Strike Blocked" & Cổng Phê Duyệt Theo Chi Phí Hoàn Tác (`The Gate`)
 
-Trong `.ai-workflow`, Bước 2 và Bước 4 **không chạy `git commit`**, hoặc đôi khi người dùng kích hoạt Bước 3 trên một nhánh tính năng đã có vài commit trước đó kèm các tệp đang sửa dở. Vì vậy, tại Bước 3 (`03-review.md`) và Bước 5 (`05-final-review.md`), Reviewer và các Subagents **cấm dùng `git diff main...HEAD` ba chấm** (vì sẽ bỏ sót toàn bộ thay đổi chưa commit), mà bắt buộc thu thập theo 3 bước:
-1. Lấy commit gốc phân nhánh từ `main`: `git merge-base main HEAD` -> `<BASE_SHA>`.
-2. Chạy `git diff <BASE_SHA>` để lấy **trọn vẹn cả các commit đã có trên nhánh lẫn các chỉnh sửa chưa commit** trên working tree.
-3. Chạy `git ls-files --others --exclude-standard` (hoặc `git status --short`) để lấy danh sách và đọc trực tiếp toàn bộ nội dung các **tệp mới chưa theo dõi (`??`)** (Java classes, Flyway SQL, tests, Next.js components, docs...). Lưu ý `.ai-workflow/tasks/` đã được `.gitignore` tự động loại trừ.
+1. **2-Strike Circuit Breaker (Chống lặp vô tận)**:
+   - Trong cùng một bước (Bước 2 hoặc Bước 4): nếu cùng một cách sửa hoặc bài test thất bại **2 lần liên tiếp** theo cùng một kiểu mà chưa tìm ra nguyên nhân gốc, dừng thử mù lần 3.
+   - Giữa các vòng Review ↔ Fix: mỗi lần `final-review.md` trả về `CHANGES REQUESTED` trên cùng một lỗi cũ, tăng `Strikes` trong `state.md` thêm `1`. Khi **`Strikes >= 2`**, chuyển `Status: Blocked` trong `state.md`, chạy `node .ai-workflow/scripts/verify.cjs board` và báo ngay cho Human kèm 2 phương án xử lý rõ ràng.
+2. **Gate Priced by Undo Cost**:
+   - **Tự hoàn tất 100% bước khả nghịch**: khảo sát code, viết test/code local, chạy `verify.cjs`, tạo báo cáo, nháp PR description.
+   - **Dừng hỏi trước bước khó/không thể hoàn tác**: `git commit`, `git push`, xóa dữ liệu, viết thêm Flyway migration (`V<N>__*.sql`) hoặc thêm dependency vào `pom.xml`/`package.json` **ngoài** `plan.md` đã duyệt, working tree bẩn từ ticket khác ở Bước 1, hoặc khi Jira AC mâu thuẫn với `AGENTS.md`.
 
 ---
 
-## 5. Chuẩn Tạo Nhánh Git Tự Động Từ `main` (Automated Branch Protocol)
+## 6. Chuẩn Tạo Nhánh Git Tự Động Từ `main` (Automated Branch Protocol — Bước 1)
 
-Khi khởi động một ticket `DA-*` mới ở Bước 1:
-1. **Kiểm tra working tree sạch**: Chạy `git status --porcelain`. Nếu phát hiện có thay đổi chưa commit thuộc về một ticket khác ➔ **DỪNG LẠI & BÁO NGƯỜI DÙNG NGAY**, tuyệt đối không tự ý `git stash`, `git reset` hay `git checkout` làm hỏng bài đang làm dở.
-2. **Đọc Jira Issue & Chuyển sang `In Progress`** qua MCP **`jira-cwb`** (`jira_get_issue` với `fields: "*all"`, `include: "comments,transitions"`, `use_display_names: true`; sau đó gọi `jira_transition_issue` sang `"In Progress"` nếu ticket đang ở `"To Do"`). *(Lưu ý: `atlassian-mcp-server` chỉ dùng dự phòng nếu `jira-cwb` không phản hồi, vì dự án `DA` nằm trên `nguyentien191004.atlassian.net` do `jira-cwb` quản lý)*.
-3. **Chọn tiền tố nhánh chuẩn**:
-   - `feat/<ticket-viết-thường>-<slug>`: Khi `issueType` là `Story`, `Feature`, `New Feature`, hoặc xây dựng module mới (vd: `feat/da-9-async-ingestion-worker`).
-   - `bugfix/<ticket-viết-thường>-<slug>`: Khi `issueType` là `Bug` hoặc vá lỗi hồi quy.
-   - `chore/<ticket-viết-thường>-<slug>`: Khi `issueType` là `Task` / `Sub-task` hạ tầng, CI/CD, cấu hình, refactor, test harness.
-   - `docs/<ticket-viết-thường>-<slug>`: Khi chỉ cập nhật tài liệu kiến trúc / hướng dẫn.
-   - **Quy tắc cứng**: Mã ticket viết thường (`da-9`, `da-10`...), slug tiếng Anh ngắn gọn 2–4 từ dạng kebab-case. **Tuyệt đối không dùng tiền tố `codex/` hay `feature/`**.
-4. **Tạo nhánh từ nhánh gốc `main`** (nhánh mặc định của DocuMind AI là `main`):
+1. Chạy `git status --porcelain`. Nếu có thay đổi chưa commit từ ticket khác ➔ **DỪNG LẠI BÁO HUMAN**, không tự ý stash/reset/checkout đè.
+2. Chọn tiền tố theo `issueType` từ Jira: `feat/`, `bugfix/`, `chore/`, hoặc `docs/` + `da-<số>-<slug-2-đến-4-từ>` (vd: `feat/da-19-redis-rbac-cache`). **Tuyệt đối không dùng tiền tố `codex/` hay `feature/`**.
+3. Tạo nhánh từ `main`:
    ```powershell
    git checkout main
    git pull --ff-only
    git checkout -b <branch-name>
    ```
-   *(Nếu đang đứng sẵn trên đúng nhánh `<branch-name>` của chính ticket đó thì giữ nguyên, không tạo lại).*
+   *(Nếu đang đứng sẵn trên đúng nhánh `<branch-name>` của chính ticket đó thì giữ nguyên).*
 
 ---
 
-## 6. Bộ Lệnh Kiểm Chứng Chuẩn Trên Windows Host (Canonical Verification Suite)
+## 7. Mẫu Hộp Gợi Ý Chuyển Tiếp Bắt Buộc (Mandatory Hand-off Box)
 
-Máy host Windows **không cài `mvn` toàn cục** — mọi lệnh Backend bắt buộc gọi qua Maven Wrapper **`.\mvnw.cmd`** bên trong thư mục `backend/`:
+Cuối mỗi lượt từ Bước 1 đến Bước 5, in đúng mẫu hộp sau:
 
-1. **Backend Targeted Tests (Chạy nhanh khi TDD hoặc kiểm chứng vùng vừa sửa)**:
-   ```powershell
-   Set-Location backend; .\mvnw.cmd test -Dtest=<TenClassTest1>,<TenClassTest2>
-   ```
-2. **Backend Full Unit + Testcontainers Integration Suite & Package (Bắt buộc khi chạm `backend/`, Flyway SQL, `docker-compose.yml`)**:
-   ```powershell
-   Set-Location backend; .\mvnw.cmd verify
-   ```
-   *(Lưu ý: cờ mặc định `-Dsmoke=false` chạy toàn bộ Unit + Testcontainers `pgvector:pg16` / `redis:7-alpine` / MinIO độc lập; chỉ thêm `-Dsmoke=true` khi cần kiểm tra kết nối trực tiếp tới dịch vụ Ollama/Docker host đang chạy thật).*
-3. **Spring AI Version Check (Khi thêm/sửa code Spring AI)**:
-   Luôn đối chiếu đúng package của **Spring AI `1.0.3` GA** trong `backend/pom.xml` (hoặc tra qua `context7` MCP) — cấm đoán mò API `0.8.x` cũ.
-4. **Frontend Next.js Checks (Kích hoạt ngay khi `frontend/package.json` tồn tại và ticket chạm `frontend/`)**:
-   ```powershell
-   Set-Location frontend; npm run lint; npm run typecheck; npm test; npm run build
-   ```
-5. **Playwright E2E — Bắt buộc Headed Mode (Khi chạm luồng UI / E2E)**:
-   Luôn truyền **`--headed`** (`headless: false`) để hiển thị trình duyệt trực tiếp trên màn hình, tuyệt đối không chạy ngầm headless.
-6. **RAG Golden Dataset KPIs (Khi chạm thuật toán chunking, retrieval, `similarityThreshold`, prompt hoặc semantic cache)**:
-   Kiểm chứng các ngưỡng `Hit@5 >= 85%`, `Hallucination Rate == 0%`, `Cache Hit Ratio >= 30%-40%` theo skill `rag-kpi-evaluator`.
-
-Không bao giờ khai khống `PASS` cho lệnh chưa thực sự chạy. Nếu Docker Desktop chưa bật khiến Testcontainers bị chặn, phải báo rõ trạng thái `BLOCKED (Docker daemon not running)` và vẫn chạy hết các unit tests / compile checks độc lập.
-
+```markdown
 ---
 
-## 7. Điều Kiện Dừng Khẩn Cấp (Stop Conditions)
+### ⏩ Bước tiếp theo: [Tên bước & Vai trò kế tiếp]
 
-Dừng ngay lập tức và hỏi ý kiến người dùng khi gặp một trong các tình huống:
-1. Jira Acceptance Criteria mâu thuẫn nội tại hoặc vi phạm trực tiếp các bất biến bảo mật trong `AGENTS.md` (RBAC, Anti-Hallucination, Cache Isolation, Port Coexistence).
-2. Phát hiện cần viết thêm Flyway migration (`V<N>__*.sql`) hoặc thêm dependency mới vào `pom.xml` / `package.json` **ngoài** `plan.md` đã duyệt.
-3. Working tree đang có thay đổi chưa commit của một ticket khác khi bắt đầu Bước 1.
-4. Bất kỳ phép kiểm tra biên dịch, test hoặc build nào đang `FAIL` thực sự (không được chuyển sang bước kế tiếp khi code đang đỏ).
+- **🤖 Model khuyến nghị trên Antigravity**: **[Model ưu tiên 1]** _(hoặc [Model thay thế])_ — _[Lý do 1 câu]_
+- **💡 Vệ sinh ngữ cảnh (Chống Re-read Tax)**: [Khuyên mở **New Chat sạch** (hoặc chạy `/compact`) rồi dán câu lệnh dưới — trạng thái đã lưu trọn trong `state.md`]
+
+Copy câu lệnh dưới đây và gửi vào ô chat:
+
+> `[Câu prompt tự thân đầy đủ chứa mã <TICKET_ID> và đường dẫn .ai-workflow/prompts/...]`
+```

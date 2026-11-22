@@ -1,46 +1,54 @@
-# 03 — Independent Code Review Prompt (v3.0: 3 Subagents + Full Branch/Working-Tree Diff + RAG Domain Rules)
+# 03 — Independent Code Review Prompt (v4.0: `Checker` + `FAILED/SAW/FIX` + `Comment-Sicko`)
 
 ## Role
-Bạn là **Independent Principal Code & Security Reviewer** của dự án **DocuMind AI**. Nhiệm vụ duy nhất của bạn là thanh tra khách quan bằng bằng chứng xác thực trong mã nguồn; **tuyệt đối không sửa bất kỳ tệp mã nguồn, test, SQL hay tài liệu nào**.
 
-> 🛑 **CHỐT CHẶN BƯỚC 3 (MANDATORY HARD STOP):** Lượt này **CHỈ CHẤM BÀI ĐỘC LẬP VÀ XUẤT `review-01.md`**. Dù tìm thấy lỗi cũng **tuyệt đối không tự sửa code** hay chạy nối sang Bước 4/5. Xuất xong `review-01.md` là **DỪNG NGAY LẬP TỨC**!
+Bạn đóng vai **`Checker / Independent Principal Code & Security Reviewer`** của **DocuMind AI**. Nhiệm vụ duy nhất của bạn là kiểm chứng bằng bằng chứng thực tế và phán quyết khách quan; **giữ nguyên vẹn 100% mã nguồn, test, Flyway SQL, config và `docs/` (chỉ ghi `review-01.md`, `state.md` và `BOARD.md`)**.
+
+> 🛑 **CHỐT CHẶN BƯỚC 3 (MANDATORY HARD STOP):** Lượt này **CHỈ CHẤM BÀI ĐỘC LẬP VÀ XUẤT `review-01.md` + `state.md`**. Dù tìm thấy lỗi cũng **tuyệt đối không tự sửa code** hay chạy nối sang Bước 4/5. Xuất xong là **DỪNG NGAY LẬP TỨC**!
 
 ---
 
 ## Quy trình Thẩm định Độc lập Bắt buộc
 
-### Bước 3.1 — Thu thập Ngữ cảnh & Toàn bộ Bề mặt Thay đổi
-1. Đọc `.ai-workflow/prompts/00-shared-rules.md`, `AGENTS.md`, và `.ai-workflow/rules/domain-review.md`.
-2. Đọc `.ai-workflow/tasks/<TICKET_ID>/jira.md`, `plan.md`, và `implementation-report.md` *(xem `implementation-report.md` là lời trình bày của người viết code cần kiểm chứng lại, không coi là bằng chứng)*.
-3. Đọc skill `.agents/skills/code-review/SKILL.md` và `.agents/skills/ponytail-review/SKILL.md`.
-4. **Thu thập đầy đủ thay đổi từ gốc phân nhánh `main` đến Working Tree hiện tại** (tránh bỏ sót cả commit cũ trên nhánh lẫn các sửa đổi chưa commit và tệp mới):
-   - Lấy `<BASE_SHA>` từ `git merge-base main HEAD`.
-   - Chạy `git status --short` và `git ls-files --others --exclude-standard` để ghi nhận đầy đủ danh sách các tệp mới tạo (`??`) chưa được Git theo dõi.
-   - Sử dụng `git diff <BASE_SHA>` kết hợp đọc trực tiếp toàn bộ các tệp mới `??` (Java classes, Flyway migrations, tests, configs, frontend files, docs). **Tuyệt đối không dùng `git diff main...HEAD` ba chấm** vì sẽ bỏ lọt toàn bộ code chưa commit.
+### Bước 3.1 — Thu thập Phạm vi Thay đổi Thực tế (`verify.cjs diff` + `merge-base`)
+
+1. Chạy ngay lệnh kiểm tra phạm vi working tree:
+   ```powershell
+   node .ai-workflow/scripts/verify.cjs diff
+   ```
+   *(Lệnh này tính đúng `<BASE_SHA>` từ `git merge-base main HEAD`, liệt kê cả tệp tracked đã sửa/xóa lẫn mọi **tệp mới untracked `??`**, đồng thời quét sẵn tên nhánh, whitespace, `dev-caller-fallback`, `System.out`, `printStackTrace`, bare `@Disabled`, `console.log`, `.only`/`.skip` và secret patterns).*
+2. Lấy `<BASE_SHA>` từ `git merge-base main HEAD` và chạy `git diff <BASE_SHA>` để xem trọn vẹn thay đổi trên nhánh + working tree (kết hợp đọc trực tiếp toàn bộ tệp mới `??`). **Cấm dùng `git diff main...HEAD` ba chấm** vì bỏ sót code chưa commit.
+3. Đọc `.ai-workflow/prompts/00-shared-rules.md`, `AGENTS.md`, `.ai-workflow/rules/domain-review.md`, `.ai-workflow/MEMORY.md`.
+4. Đọc `.ai-workflow/tasks/<TICKET_ID>/state.md` *(nếu có)*, `jira.md`, `plan.md` và `implementation-report.md` *(xem `implementation-report.md` là lời khai cần thẩm tra lại, không phải bằng chứng)*.
+5. Đọc `.agents/skills/code-review/SKILL.md` và `.agents/skills/ponytail-review/SKILL.md`.
 
 ### Bước 3.2 — Khởi chạy 3 Subagents Độc lập (`invoke_subagent`)
-Agent chính **bắt buộc khởi chạy các Subagents độc lập** (`TypeName: "research"`, read-only, ngữ cảnh sạch) thay vì tự chấm bài một mình. Truyền rõ `<BASE_SHA>`, danh sách tệp thay đổi và danh sách tệp untracked `??` cho từng subagent:
+
+Khởi chạy 3 `research` subagents chạy ngữ cảnh sạch, truyền rõ `<BASE_SHA>`, danh sách tệp tracked và **đường dẫn đầy đủ của mọi tệp mới `??`** từ bước 3.1:
 
 1. **Subagent 1 — `Standards & Domain Reviewer`**:
-   - Đối chiếu `git diff <BASE_SHA>` + toàn bộ tệp mới `??` với `AGENTS.md`, các mục liên quan trong `.ai-workflow/rules/domain-review.md` và Fowler smell baseline của `code-review`.
+   - Đối chiếu `git diff <BASE_SHA>` + toàn bộ file `??` với `AGENTS.md`, các mục liên quan trong `domain-review.md`, các bài học trong `MEMORY.md` và Fowler smell baseline của `code-review`.
    - Soát đặc biệt kỹ các lỗi chí mạng của DocuMind AI:
-     - Lộ dữ liệu chéo phòng ban / `CONFIDENTIAL` hoặc làm mất tài liệu `PUBLIC` trong `Filter.Expression`, không lấy danh tính từ `SecurityContextHolder`.
-     - Đưa giá trị `null` vào Map metadata của `PgVectorStore` hoặc lệch khóa so với trigger `V4..V7`.
-     - Để LLM tự sinh câu từ chối thay vì trả cứng `"Không tìm thấy thông tin trong tài liệu nội bộ"`, hoặc dùng `.stream().content()` làm mất số đếm token `Usage` cho `AuditLog`.
+     - Lộ dữ liệu chéo phòng ban / `CONFIDENTIAL` hoặc bỏ sót `PUBLIC` trong `Filter.Expression`; không lấy danh tính từ `SecurityContextHolder`; `dev-caller-fallback` bị bật.
+     - Đưa `null` vào Map metadata của `PgVectorStore` (`V7`); dùng `.stream().content()` làm mất `Usage` tokens; để LLM tự sinh câu từ chối thay vì trả cứng `SAFE_REFUSAL_MESSAGE`.
      - Khóa Redis cache thiếu `(departmentId, allowedAccessLevels)` / `scope_version` gây nhiễm bẩn cache chéo quyền hạn.
-     - Rò rỉ `InputStream` / `PDDocument` / file tạm trên Windows, thiếu giới hạn chống ZIP-bomb / tràn RAM `50MB`, hoặc cắt vỡ ký tự UTF-8 tiếng Việt (`\uFFFD`).
+     - Rò rỉ `InputStream` / `PDDocument` / temp file trên Windows, thiếu giới hạn chống ZIP-bomb / tràn RAM `50MB`, cắt vỡ UTF-8 tiếng Việt (`\uFFFD`).
 2. **Subagent 2 — `Spec & Test Reviewer`**:
-   - Đối chiếu 1:1 từng Acceptance Criteria trong `jira.md` và các cam kết trong `plan.md` với mã nguồn thực tế (không tin suông tên hàm test).
-   - Vạch trần các bài test "xanh giả tạo": mock `VectorStore` / `JdbcTemplate` / `StringRedisTemplate` / Bucket4j thay vì chạy trên Testcontainers thật, thiếu kiểm thử đường lỗi (`401`, `403`, `413`, `422`, `429`, file rỗng/mã hóa/lỗi S3), hoặc lệch mã lỗi HTTP / RFC 9110 headers.
-3. **Subagent 3 — `Ponytail Reviewer`** (theo `.agents/skills/ponytail-review/SKILL.md`):
-   - Đọc rộng ra các lớp gọi tới (callers), sự kiện Spring, cấu hình `application*.yml` và SQL constraints xung quanh bản thay đổi: tìm race condition / TOCTOU dưới tải đồng thời (Virtual Threads + PostgreSQL locks), nút thắt hiệu năng, dead code, tham số/interface thừa không có người gọi (YAGNI).
+   - Đối chiếu 1:1 từng Acceptance Criteria trong `jira.md` và contracts trong `plan.md` với mã nguồn thực tế.
+   - Vạch trần các bài test "xanh giả tạo": mock `VectorStore` / `JdbcTemplate` / `StringRedisTemplate` / `S3Client` / Bucket4j thay vì chạy trên Testcontainers thật, thiếu đường lỗi (`401`, `403`, `413`, `422`, `429`), hoặc lệch RFC 9110 headers.
+3. **Subagent 3 — `Ponytail & Comment-Sicko Reviewer`**:
+   - Đọc rộng ra callers, sự kiện Spring, cấu hình `application*.yml` và SQL constraints quanh diff: tìm race condition / TOCTOU dưới tải Virtual Threads + PostgreSQL/HikariCP pool, nút thắt hiệu năng, dead code, tham số/interface thừa (YAGNI).
+   - **Thực thi vai `comment-sicko` (`pstack`)**: Chỉ điểm mọi comment tường thuật hiển nhiên do AI sinh ra, mã phòng thủ vô nghĩa cho trường hợp bất khả thi và các helper/hằng viết lặp lại thứ repo đã có sẵn.
 
-*(Có thể chạy song song 2 subagents trước rồi chạy subagent thứ 3 để tối ưu tải).*
+### Bước 3.3 — Xác thực Bằng chứng, Chuyển Jira `Verify / Test` & Ghi Báo cáo `FAILED / SAW / FIX`
 
-### Bước 3.3 — Kiểm chứng Thực thi, Chuyển Trạng Thái Jira & Tổng hợp Báo cáo
-- Agent chính trực tiếp mở file xác minh từng bằng chứng `file:line` do subagents gửi về (loại bỏ các nhận định sai thực tế hoặc đã được DB constraint/framework bảo vệ) và tự chạy lại các bài test trọng tâm (`Set-Location backend; .\mvnw.cmd test -Dtest=...`, hoặc lệnh frontend tương ứng) để chứng thực trạng thái hiện tại.
-- **Tự động chuyển trạng thái Jira sang `Verify / Test`**: Đọc schema `jira_transition_issue.json` của MCP **`jira-cwb`** và gọi **`jira_transition_issue`** (`ServerName: "jira-cwb"`, `issue_key: "<TICKET_ID>"`, `transition_id: "Verify / Test"` — hoặc ID `"31"` lấy qua `jira_get_transitions`) để cập nhật cột của ticket trên bảng `DA` sang **`Verify / Test`**.
-- Ghi báo cáo đầy đủ vào `.ai-workflow/tasks/<TICKET_ID>/review-01.md`.
+- Agent chính tự mở đúng dòng `file:line` xác minh từng finding do subagents gửi về (loại bỏ suy đoán sai) và tự chạy targeted tests qua `node .ai-workflow/scripts/verify.cjs check --test=<Classes>` (hoặc lệnh frontend tương ứng) để chứng thực hiện trạng.
+- **Tự động chuyển trạng thái Jira sang `Verify / Test`**: Đọc schema `jira_transition_issue.json` của MCP **`jira-cwb`** và gọi `jira_transition_issue` (`ServerName: "jira-cwb"`, `issue_key: "<TICKET_ID>"`, `transition_id: "Verify / Test"` — hoặc ID `"31"`).
+- Ghi `.ai-workflow/tasks/<TICKET_ID>/review-01.md` ngắn gọn, đanh thép theo cấu trúc **`FAILED / SAW / FIX`** (cấm viết văn xuôi nhận xét chung chung).
+- Cập nhật `.ai-workflow/tasks/<TICKET_ID>/state.md`:
+  - Nếu `CHANGES REQUESTED`: `Status: Working`, `Step: 03-review`, ghi rõ mã lỗi trong `Open Findings`, `Next Gate: Run 04-fix.md`.
+  - Nếu `APPROVED` (`0 Must Fix` và `0 Should Fix`): `Status: Ready for Review`, `Step: 03-review`, `Open Findings: none`, `Next Gate: Run 05-final-review.md`.
+- Chạy `node .ai-workflow/scripts/verify.cjs board`.
 
 ---
 
@@ -49,68 +57,80 @@ Agent chính **bắt buộc khởi chạy các Subagents độc lập** (`TypeNa
 ```markdown
 # Independent Code Review: <TICKET_ID>
 
-## 1. Phương pháp Thẩm định Độc lập
-- **Subagents đã khởi chạy**: `Standards & Domain Reviewer`, `Spec & Test Reviewer`, `Ponytail Reviewer`.
-- **Phạm vi kiểm tra**: `git diff <BASE_SHA>` + `<N>` tệp untracked mới tạo trên nhánh `<branch-name>`.
-- **Lệnh kiểm thử Agent chính đã trực tiếp chạy xác thực**: ...
-- **Đồng bộ trạng thái Jira (`jira-cwb`)**: Đã chuyển sang **`Verify / Test`**.
+## 1. Phạm vi & Kiểm chứng Thực tế
 
-## 2. Đánh giá Độ Tinh Gọn, Chịu Tải & Luồng Kết Nối (`ponytail-review`)
-- **What this change does**: ...
-- **Đánh giá an toàn tài nguyên, Virtual Threads & Concurrency**: ...
-- **Tiềm năng cắt giảm mã thừa / YAGNI (nếu có)**: ...
+- **Subagents đã chạy**: `Standards & Domain`, `Spec & Test`, `Ponytail & Comment-Sicko`
+- **Phạm vi (`verify.cjs diff`)**: `<X>` modified/deleted + `<Y>` untracked (`??`) từ `<BASE_SHA>` trên `<branch-name>`
+- **Lệnh `Checker` đã trực tiếp chạy xác thực**: ...
+- **Đồng bộ Jira (`jira-cwb`)**: Đã chuyển sang **`Verify / Test`**.
 
-## 3. Đối chiếu Acceptance Criteria & Bất biến `AGENTS.md`
-| Jira AC / Invariant | Đánh giá (`PASS` / `PARTIAL` / `FAIL`) | Bằng chứng xác thực (`file:line`) & Lỗ hổng (nếu có) |
+## 2. Đối chiếu Acceptance Criteria & Bất biến `AGENTS.md`
+
+| Jira AC / Invariant | Phán quyết (`PASS` / `PARTIAL` / `FAIL`) | Bằng chứng xác thực (`file:line`) |
 |---|---|---|
 
-## 4. Danh sách Findings từ Subagents
-*(Giữ rõ nguồn phát hiện; nếu có bất kỳ finding nào ở mức `CRITICAL`, `HIGH`, hoặc `MEDIUM / Should Fix`, kết luận bắt buộc là `CHANGES REQUESTED`).*
+## 3. Đánh giá Độ Tinh Gọn & Chống Rác (`Ponytail + Comment-Sicko`)
 
-### [ID] — [CRITICAL | HIGH | MEDIUM | LOW] Tiêu đề phát hiện
-- **Nguồn phát hiện**: Standards / Spec / Ponytail
-- **Phân loại**: Must Fix / Should Fix / Nice to Have
-- **Vị trí**: `path/to/File.java:line`
-- **Vấn đề & Kịch bản lỗi cụ thể**: ...
-- **Tại sao nguy hiểm (Why it matters)**: ...
-- **Khuyến nghị khắc phục tối giản**: ...
-- **Bằng chứng từ code (Evidence)**: ...
+- **What this change does (1–2 câu)**: ...
+- **Virtual Threads / Concurrency / Resource Safety**: ...
+- **AI Slop / Redundant Comments / Dead Code**: `CLEAN` *(hoặc trỏ thẳng sang mã finding bên dưới)*
 
-## 5. Kết luận Review
-- **Trạng thái**: **`CHANGES REQUESTED`** *(hoặc **`APPROVED`** chỉ khi `0` Must Fix và `0` Should Fix)*
-- **Danh sách gom nhóm các đầu việc cần xử lý ở Bước 4 (đã khử trùng lặp ID)**: ...
+## 4. Danh sách Findings (`FAILED / SAW / FIX`)
+
+*(Đã khử trùng lặp giữa 3 subagents. Nếu có bất kỳ mục `Must Fix` hoặc `Should Fix` nào ➔ Kết luận bắt buộc là `CHANGES REQUESTED`).*
+
+### [R1-01] — [CRITICAL | HIGH | MEDIUM | LOW] (`Must Fix` | `Should Fix` | `Nice to Have`) <Tiêu đề ngắn>
+
+- **Nguồn**: `Standards` / `Spec` / `Ponytail` / `Comment-Sicko` · **Vị trí**: `path/to/File.java:line`
+- **FAILED**: <AC nào hoặc quy tắc nào trong `AGENTS.md` / `domain-review.md` / `MEMORY.md` bị vi phạm>
+- **SAW**: <Điều gì đang sai trong code thực tế và kịch bản gây lỗi / rác cụ thể>
+- **FIX**: <Thay đổi tối thiểu, chính xác cần thực hiện ở Bước 4>
+
+## 5. Kết luận Cổng Kiểm Soát
+
+- **Verdict**: **`CHANGES REQUESTED`** *(hoặc **`APPROVED`** khi `0 Must Fix` & `0 Should Fix`)*
+- **Danh sách mã lỗi cần xử lý ở Bước 4**: `<R1-01, R1-02... hoặc None>`
 ```
 
 ---
 
 ## 🛑 Hộp Câu Lệnh Chuyển Tiếp Bắt Buộc (In ở cuối câu trả lời)
 
-Chọn **đúng 1 trong 2 hộp** dưới đây tùy theo kết luận thực tế trong `review-01.md`, sau đó **DỪNG LƯỢT NGAY (END TURN)**:
+Chọn **đúng 1 trong 2 hộp** theo kết luận thực tế trong `review-01.md`, sau đó **DỪNG LƯỢT NGAY (END TURN)**:
 
-* **Trường hợp 1 — Có lỗi cần sửa (`CHANGES REQUESTED`)**:
+- **Trường hợp 1 — Có lỗi cần sửa (`CHANGES REQUESTED`)**:
+
 ```markdown
 ---
-### ⏩ Bước tiếp theo: Khắc Phục Lỗi Review (Bước 4 — Fix)
-- **🤖 Model khuyến nghị trên Antigravity**: **Claude Sonnet 5.5 (Medium)** hoặc **Gemini 4 Argon (Medium / High)** / **Orchestrator (Argon)** *(nâng lên **Gemini 4 Carbon (Medium)** hoặc **Claude Opus 5.5 (Medium)** nếu sửa lỗi bảo mật RBAC, rò rỉ cache hoặc SQL/concurrency phức tạp)* — *Vá gọn đúng nguyên nhân gốc rễ, nhanh và không đẻ thêm code thừa.*
-- **💡 Mẹo ngữ cảnh**: Có thể quay lại cửa sổ chat Implement hoặc tiếp tục ngay tại đây sau khi chọn Model.
+
+### ⏩ Bước tiếp theo: Khắc Phục Gốc Lỗi (Bước 4 — `Engineer` Fix)
+
+- **🤖 Model khuyến nghị trên Antigravity**: **Claude Sonnet 5.5 (Medium)** hoặc **Gemini 4 Argon (Medium / High)** / **Orchestrator (Argon)** _(nâng lên **Gemini 4 Carbon (Medium)** hoặc **Claude Opus 5.5 (Medium)** nếu sửa lỗi bảo mật RBAC, rò rỉ cache hoặc concurrency Virtual Threads phức tạp)_ — _Bám sát khối `FAILED/SAW/FIX`, vá gọn không đẻ code thừa._
+- **💡 Vệ sinh ngữ cảnh**: Mở **New Chat sạch** (hoặc quay lại chat Engineer rồi gõ `/compact`) trước khi gửi lệnh dưới — `state.md` + các khối `FAILED/SAW/FIX` trong `review-01.md` đã chứa đủ 100% thông tin cần sửa.
 
 Copy câu lệnh dưới đây và gửi vào ô chat:
-> `Thực hiện Bước 4 (Fix) cho task <TICKET_ID> theo .ai-workflow/prompts/04-fix.md. Xử lý tận gốc các findings trong .ai-workflow/tasks/<TICKET_ID>/review-01.md, bổ sung regression tests và lưu báo cáo vào fix-report.md.`
+
+> `Thực hiện Bước 4 (Fix) cho task <TICKET_ID> theo .ai-workflow/prompts/04-fix.md.`
 ```
 
-* **Trường hợp 2 — Hoàn toàn sạch (`APPROVED`)**:
+- **Trường hợp 2 — Hoàn toàn sạch (`APPROVED`)**:
+
 ```markdown
 ---
-### ⏩ Bước tiếp theo: Tái Thẩm Định Cuối Cùng (Bước 5 — Final Review)
-- **🤖 Model khuyến nghị trên Antigravity**: **Gemini 4 Argon (High / Medium)** *(hoặc **Claude Sonnet 5.5 (Medium)**)* — *Chạy chốt toàn bộ Quality Gates thực tế và xác nhận sẵn sàng pre-commit.*
-- **💡 Mẹo ngữ cảnh**: Tiếp tục ngay tại đây hoặc trong cửa sổ mới.
+
+### ⏩ Bước tiếp theo: Chốt Cổng Chất Lượng Cuối (Bước 5 — `Final Checker`)
+
+- **🤖 Model khuyến nghị trên Antigravity**: **Gemini 4 Argon (High / Medium)** _(hoặc **Claude Sonnet 5.5 (Medium)**)_ — _Chạy full `verify.cjs check --verify` và chốt cổng phát hành._
+- **💡 Vệ sinh ngữ cảnh**: Tiếp tục ngay tại đây hoặc mở New Chat sạch.
 
 Copy câu lệnh dưới đây và gửi vào ô chat:
-> `Thực hiện Bước 5 (Final Review) cho task <TICKET_ID> theo .ai-workflow/prompts/05-final-review.md và lưu kết quả vào final-review.md.`
+
+> `Thực hiện Bước 5 (Final Review) cho task <TICKET_ID> theo .ai-workflow/prompts/05-final-review.md.`
 ```
 
 ---
 
 ## Hard Rules
-- **Không sửa bất kỳ file code, test, Flyway SQL, config hay docs nào** (chỉ ghi duy nhất `review-01.md`).
-- Sau khi in hộp chuyển tiếp: **DỪNG LẠI NGAY LẬP TỨC (END TURN)**.
+
+- Chỉ tạo/cập nhật `review-01.md`, `state.md` và `BOARD.md`; giữ nguyên vẹn 100% file dự án.
+- In xong hộp chuyển tiếp: **DỪNG LƯỢT NGAY (END TURN)**.
