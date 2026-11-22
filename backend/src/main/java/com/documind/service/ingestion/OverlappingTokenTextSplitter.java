@@ -53,11 +53,15 @@ public class OverlappingTokenTextSplitter extends TextSplitter {
         this.maxChunks = maxChunks;
     }
 
-    public int countTokens(String text) {
+    public static int countCl100kTokens(String text) {
         if (text == null || text.isEmpty()) {
             return 0;
         }
         return SHARED_CL100K_ENCODING.countTokens(text);
+    }
+
+    public int countTokens(String text) {
+        return countCl100kTokens(text);
     }
 
     @Override

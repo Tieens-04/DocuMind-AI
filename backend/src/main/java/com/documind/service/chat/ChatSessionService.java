@@ -412,6 +412,37 @@ public class ChatSessionService {
         String failedProvider,
         String ipAddress
     ) {
+        recordFailureAudit(
+            actor,
+            auditDepartmentId,
+            sessionId,
+            queryText,
+            promptTokens,
+            completionTokens,
+            latencyMs,
+            failedProvider,
+            HttpStatus.BAD_GATEWAY.value(),
+            ipAddress
+        );
+    }
+
+    /**
+     * Records a non-200 failure or client-abort ({@code 499} / {@code 502} / {@code 504}) {@link AuditLogEntity}
+     * while locking any existing target session so concurrent deletion cannot trigger foreign-key violations on commit.
+     */
+    @PreAuthorize("hasAnyRole('SYSTEM_ADMIN', 'DEPARTMENT_MANAGER', 'STANDARD_EMPLOYEE')")
+    public void recordFailureAudit(
+        UserEntity actor,
+        UUID auditDepartmentId,
+        UUID sessionId,
+        String queryText,
+        int promptTokens,
+        int completionTokens,
+        long latencyMs,
+        String failedProvider,
+        int statusCode,
+        String ipAddress
+    ) {
         transactionTemplateProvider.getObject().executeWithoutResult(status -> {
             ChatSessionEntity session = (sessionId != null && actor != null)
                 ? chatSessionRepositoryProvider.getObject()
@@ -431,7 +462,7 @@ public class ChatSessionService {
                 completionTokens,
                 latencyMs,
                 failedProvider,
-                HttpStatus.BAD_GATEWAY.value(),
+                statusCode,
                 ipAddress
             ));
         });

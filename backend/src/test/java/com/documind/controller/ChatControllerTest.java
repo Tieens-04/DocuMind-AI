@@ -3,6 +3,11 @@ package com.documind.controller;
 import com.documind.controller.advice.GlobalExceptionHandler;
 import com.documind.controller.dto.ChatAskResponse;
 import com.documind.controller.dto.CitationDto;
+import com.documind.controller.dto.chat.ChatStreamCitationsEvent;
+import com.documind.controller.dto.chat.ChatStreamDoneEvent;
+import com.documind.controller.dto.chat.ChatStreamTokenEvent;
+import com.documind.controller.dto.chat.ChatTokenUsageDto;
+import com.documind.domain.enums.CacheTier;
 import com.documind.domain.enums.Role;
 import com.documind.exception.DocumentAccessDeniedException;
 import com.documind.exception.InvalidChatRequestException;
@@ -12,6 +17,7 @@ import com.documind.service.document.CallerContext;
 import com.documind.service.document.CallerContextResolver;
 import com.documind.service.document.ProdCallerContextResolver;
 import com.documind.service.rag.RagChatService;
+import com.documind.service.rag.RagChatStreamService;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
@@ -23,13 +29,17 @@ import org.springframework.http.converter.json.Jackson2ObjectMapperBuilder;
 import org.springframework.http.converter.json.MappingJackson2HttpMessageConverter;
 import org.springframework.http.converter.json.ProblemDetailJacksonMixin;
 import org.springframework.test.web.servlet.MockMvc;
+import org.springframework.test.web.servlet.MvcResult;
 import org.springframework.test.web.servlet.setup.MockMvcBuilders;
 import org.springframework.validation.beanvalidation.LocalValidatorFactoryBean;
+import org.springframework.web.context.request.async.AsyncRequestTimeoutException;
+import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
 
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 
+import static org.assertj.core.api.Assertions.assertThat;
 import static org.hamcrest.Matchers.containsString;
 import static org.hamcrest.Matchers.not;
 import static org.mockito.ArgumentMatchers.any;
@@ -37,9 +47,12 @@ import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
+import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.asyncDispatch;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
+import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.content;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.header;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
+import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.request;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
 class ChatControllerTest {
@@ -50,6 +63,7 @@ class ChatControllerTest {
     private static final UUID ADMIN_USER_ID = UUID.fromString("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa");
 
     private RagChatService ragChatService;
+    private RagChatStreamService ragChatStreamService;
     private CallerContextResolver callerContextResolver;
     private ObjectMapper objectMapper;
     private LocalValidatorFactoryBean validator;
@@ -58,6 +72,7 @@ class ChatControllerTest {
     @BeforeEach
     void setUp() {
         ragChatService = mock(RagChatService.class);
+        ragChatStreamService = mock(RagChatStreamService.class);
         callerContextResolver = mock(CallerContextResolver.class);
         objectMapper = Jackson2ObjectMapperBuilder.json()
             .mixIn(ProblemDetail.class, ProblemDetailJacksonMixin.class)
@@ -67,7 +82,7 @@ class ChatControllerTest {
         validator.afterPropertiesSet();
 
         mockMvc = MockMvcBuilders
-            .standaloneSetup(new ChatController(ragChatService, callerContextResolver))
+            .standaloneSetup(new ChatController(ragChatService, ragChatStreamService, callerContextResolver))
             .setControllerAdvice(new GlobalExceptionHandler())
             .setMessageConverters(new MappingJackson2HttpMessageConverter(objectMapper))
             .setValidator(validator)
@@ -265,7 +280,7 @@ class ChatControllerTest {
         try (LocalValidatorFactoryBean localValidator = new LocalValidatorFactoryBean()) {
             localValidator.afterPropertiesSet();
             MockMvc failClosedMvc = MockMvcBuilders
-                .standaloneSetup(new ChatController(ragChatService, new ProdCallerContextResolver()))
+                .standaloneSetup(new ChatController(ragChatService, ragChatStreamService, new ProdCallerContextResolver()))
                 .setControllerAdvice(new GlobalExceptionHandler())
                 .setMessageConverters(new MappingJackson2HttpMessageConverter(objectMapper))
                 .setValidator(localValidator)
@@ -346,5 +361,146 @@ class ChatControllerTest {
             .andExpect(status().isBadGateway())
             .andExpect(jsonPath("$.errorCode").value("LLM_PROVIDER_UNAVAILABLE"))
             .andExpect(jsonPath("$.detail", not(containsString("sk-secret-token-123"))));
+    }
+
+    @Test
+    void streamReturnsTypedSseEventsWithNoBufferingHeaders() throws Exception {
+        CallerContext caller = new CallerContext(USER_ID, HR_DEPT_ID, Role.STANDARD_EMPLOYEE, "127.0.0.1");
+        when(callerContextResolver.resolve(any())).thenReturn(caller);
+
+        UUID docId = UUID.randomUUID();
+        UUID sessionId = UUID.randomUUID();
+        UUID messageId = UUID.randomUUID();
+        CitationDto citation = new CitationDto(
+            docId,
+            "hr-policy.pdf",
+            2,
+            "Nghỉ phép",
+            0.89d,
+            "12 ngày phép năm.",
+            "http://localhost:9000/documind-documents/hr-policy.pdf#page=2"
+        );
+
+        SseEmitter emitter = new SseEmitter(5_000L);
+        emitter.send(SseEmitter.event()
+            .name("citations")
+            .data(new ChatStreamCitationsEvent(List.of(citation), null), MediaType.APPLICATION_JSON));
+        emitter.send(SseEmitter.event()
+            .name("token")
+            .data(new ChatStreamTokenEvent("Theo chính sách "), MediaType.APPLICATION_JSON));
+        emitter.send(SseEmitter.event()
+            .name("done")
+            .data(new ChatStreamDoneEvent(
+                sessionId,
+                messageId,
+                false,
+                "groq",
+                false,
+                CacheTier.NONE,
+                new ChatTokenUsageDto(120, 24, 144),
+                310L
+            ), MediaType.APPLICATION_JSON));
+        emitter.complete();
+
+        when(ragChatStreamService.openStream("Chính sách nghỉ phép?", sessionId, null, caller)).thenReturn(emitter);
+
+        MvcResult mvcResult = mockMvc.perform(post("/api/v1/chat/stream")
+                .contentType(MediaType.APPLICATION_JSON)
+                .accept(MediaType.TEXT_EVENT_STREAM)
+                .content(objectMapper.writeValueAsString(Map.of(
+                    "question", "Chính sách nghỉ phép?",
+                    "sessionId", sessionId.toString()
+                ))))
+            .andExpect(request().asyncStarted())
+            .andReturn();
+
+        MvcResult dispatched = mockMvc.perform(asyncDispatch(mvcResult))
+            .andExpect(status().isOk())
+            .andExpect(content().contentTypeCompatibleWith(MediaType.TEXT_EVENT_STREAM))
+            .andExpect(header().string(HttpHeaders.CACHE_CONTROL, containsString("no-cache")))
+            .andExpect(header().string("X-Accel-Buffering", "no"))
+            .andReturn();
+
+        String body = dispatched.getResponse().getContentAsString();
+        assertThat(body).contains("event:citations");
+        assertThat(body).contains("\"fileName\":\"hr-policy.pdf\"");
+        assertThat(body).contains("event:token");
+        assertThat(body).contains("\"delta\":\"Theo chính sách \"");
+        assertThat(body).contains("event:done");
+        assertThat(body).contains("\"totalTokens\":144");
+    }
+
+    @Test
+    void streamReturnsPreFlightHttpProblemDetailFor400And403And404() throws Exception {
+        CallerContext caller = new CallerContext(USER_ID, HR_DEPT_ID, Role.STANDARD_EMPLOYEE, "127.0.0.1");
+        when(callerContextResolver.resolve(any())).thenReturn(caller);
+
+        // 400 validation error
+        mockMvc.perform(post("/api/v1/chat/stream")
+                .contentType(MediaType.APPLICATION_JSON)
+                .content("{\"question\":\"   \"}"))
+            .andExpect(status().isBadRequest())
+            .andExpect(jsonPath("$.errorCode").value("VALIDATION_ERROR"));
+
+        // 403 non-admin departmentId filter
+        when(ragChatStreamService.openStream("Câu hỏi", null, IT_DEPT_ID, caller))
+            .thenThrow(new DocumentAccessDeniedException("Only SYSTEM_ADMIN may filter by departmentId"));
+        mockMvc.perform(post("/api/v1/chat/stream")
+                .contentType(MediaType.APPLICATION_JSON)
+                .content(objectMapper.writeValueAsString(Map.of(
+                    "question", "Câu hỏi",
+                    "departmentId", IT_DEPT_ID.toString()
+                ))))
+            .andExpect(status().isForbidden())
+            .andExpect(jsonPath("$.errorCode").value("DOCUMENT_ACCESS_DENIED"));
+
+        // 404 unowned session
+        UUID unknownSession = UUID.randomUUID();
+        when(ragChatStreamService.openStream("Câu hỏi", unknownSession, null, caller))
+            .thenThrow(new ResourceNotFoundException("Chat session not found: " + unknownSession));
+        mockMvc.perform(post("/api/v1/chat/stream")
+                .contentType(MediaType.APPLICATION_JSON)
+                .content(objectMapper.writeValueAsString(Map.of(
+                    "question", "Câu hỏi",
+                    "sessionId", unknownSession.toString()
+                ))))
+            .andExpect(status().isNotFound())
+            .andExpect(jsonPath("$.errorCode").value("RESOURCE_NOT_FOUND"));
+    }
+
+    @Test
+    void streamReturns401WhenCallerIsUnauthenticatedAndHandlesAsyncRequestTimeoutCleanly() throws Exception {
+        try (LocalValidatorFactoryBean localValidator = new LocalValidatorFactoryBean()) {
+            localValidator.afterPropertiesSet();
+            MockMvc failClosedMvc = MockMvcBuilders
+                .standaloneSetup(new ChatController(ragChatService, ragChatStreamService, new ProdCallerContextResolver()))
+                .setControllerAdvice(new GlobalExceptionHandler())
+                .setMessageConverters(new MappingJackson2HttpMessageConverter(objectMapper))
+                .setValidator(localValidator)
+                .build();
+
+            failClosedMvc.perform(post("/api/v1/chat/stream")
+                    .contentType(MediaType.APPLICATION_JSON)
+                    .accept(MediaType.TEXT_EVENT_STREAM)
+                    .content("{\"question\":\"Chính sách công ty?\"}"))
+                .andExpect(status().isUnauthorized())
+                .andExpect(header().string(HttpHeaders.WWW_AUTHENTICATE, "Bearer realm=\"DocuMind AI\""))
+                .andExpect(jsonPath("$.errorCode").value("AUTHENTICATION_REQUIRED"));
+        }
+
+        verifyNoInteractions(ragChatStreamService);
+
+        CallerContext caller = new CallerContext(USER_ID, HR_DEPT_ID, Role.STANDARD_EMPLOYEE, "127.0.0.1");
+        when(callerContextResolver.resolve(any())).thenReturn(caller);
+        when(ragChatStreamService.openStream("Câu hỏi quá hạn", null, null, caller))
+            .thenThrow(new AsyncRequestTimeoutException());
+
+        // AsyncRequestTimeoutException must not attempt ProblemDetail serialization on text/event-stream
+        mockMvc.perform(post("/api/v1/chat/stream")
+                .contentType(MediaType.APPLICATION_JSON)
+                .accept(MediaType.TEXT_EVENT_STREAM)
+                .content("{\"question\":\"Câu hỏi quá hạn\"}"))
+            .andExpect(status().isOk())
+            .andExpect(content().string(""));
     }
 }
