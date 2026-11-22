@@ -7,6 +7,7 @@
 .superpowers/
 .ai-workflow/tasks/*
 !.ai-workflow/tasks/.gitkeep
+.ai-workflow/BOARD.md
 .ai-workflow/_archive/
 
 # Backend (Maven / Java)

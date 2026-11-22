@@ -1,104 +1,113 @@
-# DocuMind AI — AI Development Workflow (v3.0: Antigravity Native & Cross-Model Edition)
+# DocuMind AI — AI Development Workflow (v4.0: `pstack` + Grok Bot + Antigravity Edition)
 
-Quy trình phát triển phần mềm chuẩn 6 bước được may đo riêng cho **DocuMind AI** (Java 21, Spring Boot 3.4, Spring AI 1.0.3 GA, PostgreSQL 16 `pgvector`, Redis 7, MinIO, Next.js) trên **Google Antigravity**, kết hợp:
-- **Slash Skill khởi động nhanh (`/ai-workflow`)** tại `.agents/skills/ai-workflow/SKILL.md`.
-- **Kỷ luật 1 Lượt = 1 Bước (Hard Stop)** kèm **Hộp Gợi Ý Câu Lệnh + Model Chuyển Tiếp Tự Động**.
-- **Chiến lược Đảo Họ Model (Cross-Model Review)** giữa **Gemini 4** và **Claude 5.5** nhằm triệt tiêu điểm mù khi thẩm định bảo mật Vector RBAC / Cache Isolation / Virtual Threads và chia tải đều 2 bể hạn mức (Quota Pools) trên Antigravity.
+Hệ thống điều phối phát triển phần mềm 6 bước dành riêng cho **DocuMind AI** (Java 21, Spring Boot 3.4, Spring AI 1.0.3 GA, PostgreSQL 16 `pgvector`, Redis 7, MinIO, Next.js) trên **Google Antigravity**, hợp nhất 3 trụ cột:
 
----
-
-## 1. Cách Khởi Động Nhanh Nhất Trên Antigravity
-
-Mở khung chat Antigravity, chọn Model cho Bước 1 (xem bảng mục 3) và gõ **1 câu ngắn gọn**:
-
-```text
-/ai-workflow DA-9
-```
-*(hoặc gõ tự nhiên: `Làm task DA-9 theo .ai-workflow`)*
-
-Từ đó về sau, **ở cuối mỗi bước Agent sẽ tự động in ra một Hộp Chuyển Tiếp** gồm:
-1. **Model khuyên chọn** trên thanh Model Selection cho bước kế tiếp.
-2. **Câu lệnh chính xác** để bạn chỉ việc copy-paste vào ô chat.
+1. **Kiến trúc 4 Vai trò Chuyên biệt của Lauren Tan (`pstack`)**: `Chief of Staff` (điều phối) → `Researcher` (khảo sát `/how` & `/why` bằng subagent) → `Engineer` (TDD + chống AI slop) → `Reviewer / Checker` (3 subagents độc lập + `Comment-Sicko`) → `Memory Reuse` (`MEMORY.md`).
+2. **Cơ chế Tiết kiệm Token của Grok Bot (`Wake-ups × Re-reads`)**: Gói bàn giao siêu gọn `state.md` (≤ 20 dòng), bảng `BOARD.md` 5 trạng thái, CLI kiểm chứng 1 lệnh `verify.cjs` (thay cho nhiều lệnh rời rạc), cầu chì **2-Strike Blocked** và cắt lịch sử chat giữa các vai trò.
+3. **Cross-Model Review & Jira Automation trên Antigravity**: Đảo họ Model **Gemini 4 ↔ Claude 5.5** giữa người viết code và người chấm bài để triệt tiêu điểm mù bảo mật Vector RBAC / Cache Isolation / Virtual Threads, đồng bộ tự động vòng đời `DA-*` (`To Do` ➔ `In Progress` ➔ `Verify / Test` ➔ `Done`) qua MCP `jira-cwb`.
 
 ---
 
-## 2. Sơ Đồ Vòng Đời 6 Bước & Các Cổng Kiểm Soát (Human Gates)
+## 1. Các Lệnh Khởi Động Nhanh Trên Antigravity
+
+| Mục đích | Câu lệnh gõ vào ô chat Antigravity |
+|---|---|
+| **Khởi động ticket mới (Bước 1)** | `/ai-workflow DA-19` *(hoặc `Làm task DA-19`)* |
+| **Xem bảng tiến độ toàn dự án (`THE BOARD`)** | `/ai-workflow board` *(hoặc chạy terminal: `node .ai-workflow/scripts/verify.cjs board`)* |
+| **Kiểm tra trạng thái 1 ticket đang làm dở** | `/ai-workflow DA-18` |
+
+Ở cuối mỗi bước, Agent tự động cập nhật `state.md` + `BOARD.md` và in ra **Hộp Chuyển Tiếp** gồm: **Model khuyên chọn**, **mẹo mở New Chat / `/compact`** và **câu lệnh copy-paste** cho bước kế tiếp.
+
+---
+
+## 2. Vòng Đời 6 Bước, 4 Vai Trò & Các Cổng Kiểm Soát (`Undo-Priced Gates`)
 
 ```text
 [BẠN gõ: "/ai-workflow DA-XX"]
        │
        ▼
-[Bước 1: Plan (01-plan.md)]
-  • Kéo Jira `DA-XX` qua `jira-cwb` ➔ tự động chuyển Jira sang **`In Progress`** + lưu jira.md
+[Bước 1: Goal, Research & Plan — Chief of Staff + Researcher (01-plan.md)]
+  • Đọc MEMORY.md + kéo live Jira qua `jira-cwb` ➔ chuyển `In Progress` + lưu jira.md
   • Kiểm tra working tree sạch ➔ tạo nhánh từ `main` (feat/ | bugfix/ | chore/ | docs/)
-  • Khảo sát code + Flyway SQL + chọn Skills chuyên ngành ➔ xuất plan.md
+  • Ủy quyền subagent `Researcher` chạy `/how` + `/why` (git log) + chọn Canonical Examples
+  • Xuất plan.md (6-point Startup Checklist) + state.md + đồng bộ BOARD.md
        │
-       ▼ ──► [GATE 1]: Bạn duyệt plan.md, đổi sang Model Implement & dán prompt gợi ý
-[Bước 2: Implement (02-implement.md)]
-  • TDD + Java 21 / Spring AI 1.0.3 / Next.js theo Skills Blueprint
-  • Chạy thật: `.\mvnw.cmd verify` (Unit + Testcontainers pgvector/redis/minio) + Playwright `--headed`
-  • Xuất implementation-report.md (KHÔNG commit)
+       ▼ ──► [GATE 1]: Duyệt plan.md ➔ Khuyên mở New Chat sạch (hoặc `/compact`) & đổi sang Model Engineer
+[Bước 2: Build — Engineer (02-implement.md)]
+  • Đọc state.md + plan.md + Canonical Repo Examples (không cần đọc lại lịch sử mò file Bước 1)
+  • TDD + Java 21 / Spring AI 1.0.3 / Next.js + Anti-Slop (`Comment-Sicko` ngay lúc viết)
+  • Chạy 1 lệnh: `node .ai-workflow/scripts/verify.cjs check --verify` (Unit + Testcontainers + JaCoCo >= 75%)
+  • Xuất implementation-report.md + cập nhật state.md (`Ready for Review`)
        │
-       ▼ ──► [GATE 2]: Đổi sang họ Model Tier S đối lập (khuyên mở New Chat sạch) & dán prompt gợi ý
-[Bước 3: Independent Review (03-review.md + domain-review.md)]
-  • Quét trọn vẹn `git diff $(git merge-base main HEAD)` + toàn bộ file mới untracked (`??`)
-  • Chạy 3 Subagents độc lập: Standards & Domain + Spec & Test + Ponytail
-  • Tự động chuyển Jira sang **`Verify / Test`** + xuất review-01.md (KHÔNG sửa code)
+       ▼ ──► [GATE 2]: Mở New Chat sạch + Đảo sang họ Model Tier S đối lập (Gemini ↔ Claude)
+[Bước 3: Independent Review — Checker + 3 Subagents (03-review.md)]
+  • Chạy `verify.cjs diff` (`merge-base main HEAD` + uncommitted + file mới `??` + quét hygiene/secrets)
+  • 3 Subagents độc lập: `Standards & Domain` + `Spec & Test` + `Ponytail & Comment-Sicko`
+  • Chuyển Jira sang `Verify / Test` + xuất review-01.md chuẩn gọn `FAILED / SAW / FIX` (KHÔNG sửa code)
        │
-       ▼ ──► [GATE 3]: Xem kết quả review-01.md
-   ┌───┴──────────────────────────────────────┐
-   │ CHANGES REQUESTED (Có findings)          │ APPROVED (0 lỗi blocking)
-   ▼                                          │
-[Bước 4: Fix (04-fix.md)]                     │
-  • Vá tận gốc + thêm regression test thật    │
-  • Chạy lại `.\mvnw.cmd verify` ➔ fix-report │
-   │                                          │
-   └──────────────► [Bước 5: Final Review (05-final-review.md)] ◄───┘
-                      • Đối chiếu 100% findings đã RESOLVED & 100% AC / AGENTS.md PASS
-                      • Scoped ponytail-review + tự chạy lại Quality Gates
-                      • Xuất final-review.md
+       ▼ ──► [GATE 3]: Phân nhánh theo kết quả review-01.md
+   ┌───┴──────────────────────────────────────────┐
+   │ CHANGES REQUESTED                            │ APPROVED (0 Must/Should Fix)
+   ▼                                              │
+[Bước 4: Fix — Engineer (04-fix.md)]              │
+  • Đọc gọn state.md + các khối FAILED/SAW/FIX    │
+  • Tái hiện lỗi ➔ vá gốc ➔ verify.cjs check      │
+  • Cầu chì 2-Strike: kẹt 2 lần ➔ `Blocked`       │
+   │                                              │
+   └──────────────► [Bước 5: Final Gate & Prevention Audit — Final Checker (05-final-review.md)] ◄──┘
+                      • Chạy thật `node .ai-workflow/scripts/verify.cjs check --verify`
+                      • Tái xác minh 100% AC + Scoped Ponytail/Comment-Sicko + 4-Step Prevention Audit
+                      • Xuất final-review.md (`READY FOR PRE-COMMIT` hoặc cầu chì `Blocked` nếu Strikes >= 2)
                             │
-                            ▼ ──► [GATE 4]: Đạt `READY FOR PRE-COMMIT` ➔ chuyển sang Model nhẹ (Hydrogen/Flash)
-                    [Bước 6: Pre-Commit & Release (06-precommit.md)]
-                      • Quét sạch git status / API keys / dev-caller-fallback / ports / debug logs
-                      • Soạn PR bằng skill `pr` + đăng comment Jira (`jira_add_comment`)
-                      • Tự động chuyển Jira sang **`Done`** + xuất precommit.md + in lệnh Git cho BẠN
+                            ▼ ──► [GATE 4]: Đổi sang Model siêu nhẹ (Hydrogen / Flash)
+                    [Bước 6: Deliver & Reuse — Release & Memory Keeper (06-precommit.md)]
+                      • Chạy `verify.cjs diff` + soạn PR bằng skill `pr` + đăng comment & chuyển Jira `Done`
+                      • Chắt lọc Decision/Source/Lesson mới (nếu có) vào `.ai-workflow/MEMORY.md`
+                      • Đánh dấu `Done` trên `BOARD.md` + Dừng tại `The Undo Gate` (in lệnh Git cho BẠN)
 ```
 
 ---
 
-## 3. Thứ Tự Sức Mạnh & Chiến Lược Chọn Model Trên Antigravity
+## 3. Công Cụ Kiểm Chứng 1 Lệnh (`verify.cjs`)
 
-### 3.1. Xếp hạng thực tế các Model trên Antigravity (Từ Mạnh nhất ➔ Nhẹ/Nhanh nhất)
-1. **Tier S — Flagship Frontier (Đỉnh nhất về suy luận sâu, kiến trúc & bắt bug bảo mật/đồng thời)**:
-   - **Gemini 4 Carbon (`High` > `Medium` > `Low`)**: Flagship mạnh nhất của Google DeepMind (đặc biệt sắc bén về kiến trúc hệ thống, cybersecurity/RBAC, I/O stream và concurrency Virtual Threads).
-   - **Claude Opus 5.5 (`High` > `Medium` > `Low`)**: Siêu mô hình đầu bảng của Anthropic (đối trọng ngang ngửa với Carbon, cực mạnh khi đọc hiểu spec phức tạp và viết code lớn ít sót yêu cầu).
-2. **Tier S- / A+ — Chế độ Nhạc trưởng Đa Model (Tối ưu tốc độ & tiết kiệm ~24% Quota)**:
-   - **Orchestrator (Carbon)**: Tự động dùng **Carbon** lập kế hoạch/gỡ ca khó + giao việc sửa file/chạy lệnh Maven lặp lại cho **Hydrogen**.
-   - **Orchestrator (Argon)**: Dùng **Argon** làm nhạc trưởng + **Hydrogen** thực thi.
-3. **Tier A — Balanced Frontier Engineering (Chủ lực viết code, TDD, UI hằng ngày)**:
-   - **Claude Sonnet 5.5 (`High` > `Medium` > `Low`)** & **Gemini 4 Argon (`High` > `Medium` > `Low`)**.
-4. **Tier B — Fast Execution Engine (Siêu nhanh, nhẹ, tiết kiệm quota)**:
-   - **Gemini 4 Hydrogen (`XHigh` > `High` > `Medium` > `Low`)**: Model thực thi tốc độ cao nhẹ nhất họ Gemini 4.
-5. **Tier C — Ultra-Light / Phụ trợ**:
-   - **Gemini 3.8 Flash (`High` > `Medium` > `Low`)** *(mặc định cho `browser` subagent)* & **GPT-OSS 120B (`Medium`)**.
+```powershell
+# 1. Xem phạm vi diff (merge-base main HEAD + uncommitted + file mới ??) & quét vệ sinh/secrets (<0.2s):
+node .ai-workflow/scripts/verify.cjs diff
 
-### 3.2. Bảng chọn Model theo từng bước (Chia đều 2 bể Quota Gemini & Claude)
+# 2. Chạy nhanh targeted backend tests trong lúc TDD:
+node .ai-workflow/scripts/verify.cjs check --test=Week2CrossGateRbacIntegrationTest
 
-| Bước | File Prompt | Khuyên dùng số 1 (Cross-Model Chuẩn) | Phương án 2 (Thuần Gemini / Tiết kiệm) | Có nên mở New Chat? |
-|---|---|---|---|---|
-| **Bước 1: Plan** | `01-plan.md` | **Gemini 4 Carbon (High)** hoặc **Claude Opus 5.5 (High)** | **Gemini 4 Argon (High)** *(task vừa/nhỏ)* | Bắt đầu chat mới cho mỗi ticket `DA-*` |
-| **Bước 2: Implement** | `02-implement.md` | **Claude Sonnet 5.5 (High / Medium)** hoặc **Orchestrator (Carbon)** | **Orchestrator (Argon)** / **Gemini 4 Argon (High)** | Giữ nguyên chat Bước 1 (đổi Model nếu cần) |
-| **Bước 3: Review** | `03-review.md` | **Đảo ngược họ Tier S với Bước 2:**<br>• Bước 2 Claude ➔ **Gemini 4 Carbon (High)**<br>• Bước 2 Gemini ➔ **Claude Opus 5.5 (High)** | **Gemini 4 Carbon (Medium / High)** | **Nên mở New Chat sạch** để triệt tiêu thiên kiến người viết code |
-| **Bước 4: Fix** | `04-fix.md` | **Claude Sonnet 5.5 (Medium)** | **Gemini 4 Argon (Medium)** / **Orchestrator (Argon)** | Quay lại chat Bước 2 hoặc dùng tiếp chat hiện tại |
-| **Bước 5: Final Review** | `05-final-review.md` | **Gemini 4 Argon (High / Medium)** hoặc **Claude Sonnet 5.5 (Medium)** | **Gemini 4 Argon (Medium)** | Mở New Chat sạch hoặc đổi sang Model Reviewer |
-| **Bước 6: Pre-Commit** | `06-precommit.md` | **Gemini 4 Hydrogen (Medium / High)** | **Gemini 3.8 Flash (High)** | Dùng ngay ô chat hiện tại cho nhanh |
+# 3. Chạy trọn bộ Quality Gates (Hygiene + .\mvnw.cmd verify [Unit + Testcontainers + JaCoCo >= 75%] + Frontend):
+node .ai-workflow/scripts/verify.cjs check --verify
 
-> 💡 **Lưu ý về Subagents ở Bước 3**: Công cụ `invoke_subagent` trên Antigravity mặc định chạy với `Model: "inherit"` (thừa kế đúng Model bạn đang chọn trên thanh công cụ ở lượt đó). Vì vậy chọn **Tier S (`Carbon High` hoặc `Opus 5.5 High`)** ở Bước 3 giúp cả 3 Subagents (`Standards & Domain`, `Spec & Test`, `Ponytail`) đều đạt độ sắc bén cao nhất.
+# 4. Chạy kèm Playwright E2E (luôn tự động ép --headed / headless: false):
+node .ai-workflow/scripts/verify.cjs check --verify --e2e e2e/chat.spec.ts
+
+# 5. Đồng bộ bảng trạng thái toàn bộ các ticket DA-* (.ai-workflow/BOARD.md):
+node .ai-workflow/scripts/verify.cjs board
+
+# 6. Tự kiểm thử chính công cụ verify.cjs:
+node --test .ai-workflow/scripts/verify.test.cjs
+```
 
 ---
 
-## 4. Cấu Trúc Thư Mục `.ai-workflow` & Skills Liên Kết
+## 4. Chiến Lược Chọn Model & Cắt Lịch Sử Chat (`Anti-Re-Read Tax`)
+
+Công thức chi phí token thực tế là **`Số vòng gọi công cụ × Độ dài lịch sử chat đọc lại`**. Nhờ đã có `state.md` (≤ 20 dòng) + `MEMORY.md`, bạn **nên mở New Chat sạch (hoặc gõ `/compact`)** mỗi khi chuyển vai:
+
+| Bước | Vai trò (`pstack`) | Model Khuyên Dùng Số 1 (Cross-Model) | Phương Án Tiết Kiệm | Ngữ Cảnh Chat |
+|---|---|---|---|---|
+| **Bước 1: Plan** | `Chief` + `Researcher` | **Gemini 4 Carbon (High)** hoặc **Claude Opus 5.5 (High)** | **Gemini 4 Argon (High)** | Mở chat mới cho mỗi ticket `DA-*` |
+| **Bước 2: Build** | `Engineer` | **Claude Sonnet 5.5 (High / Medium)** hoặc **Orchestrator (Carbon)** | **Orchestrator (Argon)** / **Gemini 4 Argon (High)** | **Mở New Chat sạch** (hoặc `/compact`) |
+| **Bước 3: Review** | `Checker` (3 Subagents) | **Đảo họ Tier S với Bước 2:**<br>• Bước 2 Claude ➔ **Gemini 4 Carbon (High)**<br>• Bước 2 Gemini ➔ **Claude Opus 5.5 (High)** | **Gemini 4 Carbon (Medium / High)** | **Bắt buộc mở New Chat sạch** |
+| **Bước 4: Fix** | `Engineer` | **Claude Sonnet 5.5 (Medium)** | **Gemini 4 Argon (Medium)** / **Orchestrator (Argon)** | **Mở New Chat sạch** (chỉ nạp `state.md` + `review-01.md`) |
+| **Bước 5: Final** | `Final Checker` | **Gemini 4 Argon (High / Medium)** hoặc **Claude Sonnet 5.5 (Medium)** | **Gemini 4 Argon (Medium)** | Mở New Chat sạch hoặc `/compact` |
+| **Bước 6: Deliver** | `Release & Memory` | **Gemini 4 Hydrogen (Medium / High)** | **Gemini 3.8 Flash (High)** | Dùng ngay chat hiện tại |
+
+---
+
+## 5. Cấu Trúc Thư Mục `.ai-workflow` (v4.0)
 
 ```text
 DocuMind-AI/
@@ -106,17 +115,22 @@ DocuMind-AI/
 ├── .agents/
 │   ├── rules/
 │   │   └── 00-documind.md                         # Con trỏ tự động nối AGENTS.md + /ai-workflow
-│   └── skills/                                    # 7 skills tinh gọn (không gây tràn Context Budget)
-│       ├── ai-workflow/SKILL.md                   # Slash router `/ai-workflow`
+│   └── skills/
+│       ├── ai-workflow/SKILL.md                   # Slash router `Chief of Staff` (`/ai-workflow`)
 │       ├── spring-ai-rag-pipeline/SKILL.md        # Chuẩn Ingestion, PgVector, RBAC Filter & SSE
 │       ├── enterprise-rbac-and-cache-testing/     # Chuẩn Testcontainers RBAC, Redis Cache & Bucket4j
-│       ├── rag-kpi-evaluator/SKILL.md             # Chuẩn đo KPI Golden Dataset (Hit@5, Hallucination, Cache)
+│       ├── rag-kpi-evaluator/SKILL.md             # Chuẩn đo KPI Golden Dataset
 │       ├── code-review/SKILL.md                   # Review 2 trục độc lập (Standards + Spec)
 │       ├── ponytail-review/SKILL.md               # Review chịu tải thực tế, tài nguyên & anti-bloat
 │       └── pr/SKILL.md                            # Chuẩn soạn Pull Request kèm bằng chứng
 └── .ai-workflow/
-    ├── README.md                                  # Cẩm nang vận hành này (tracked in Git)
-    ├── prompts/                                   # 7 file quy trình chuẩn (tracked in Git)
+    ├── README.md                                  # Cẩm nang vận hành v4.0 (tracked in Git)
+    ├── MEMORY.md                                  # Bộ nhớ dài hạn chống mục nát (tracked in Git)
+    ├── BOARD.md                                   # Bảng 5 trạng thái tự động đồng bộ (gitignored)
+    ├── scripts/
+    │   ├── verify.cjs                             # CLI kiểm chứng 1 lệnh (diff | check | board)
+    │   └── verify.test.cjs                        # Unit tests bảo vệ verify.cjs (node:test)
+    ├── prompts/                                   # 7 file quy trình chuẩn v4.0 (tracked in Git)
     │   ├── 00-shared-rules.md
     │   ├── 01-plan.md
     │   ├── 02-implement.md
@@ -128,25 +142,13 @@ DocuMind-AI/
     │   └── domain-review.md                       # Checklist nghiệp vụ RAG & bảo mật của DocuMind AI
     └── tasks/
         ├── .gitkeep                               # Giữ khung thư mục trên Git
-        └── DA-XX/                                 # Hồ sơ nháp từng ticket (được .gitignore tự động ẩn)
+        └── DA-XX/                                 # Hồ sơ nháp từng ticket (gitignored)
+            ├── state.md                           # Gói bàn giao siêu gọn ≤ 20 dòng (mới ở v4.0)
             ├── jira.md
             ├── plan.md
             ├── implementation-report.md
             ├── review-01.md
-            ├── fix-report.md                      # (Chỉ sinh ra khi review-01.md có findings)
+            ├── fix-report.md
             ├── final-review.md
             └── precommit.md
 ```
-
----
-
-## 5. Bảng Tra Nhanh Câu Lệnh Các Bước (Khi Gõ Tay Hoặc Đang Làm Dở Giữa Chừng)
-
-| Tình huống | Câu lệnh gửi vào Antigravity |
-|---|---|
-| **Bắt đầu ticket mới (Bước 1)** | `/ai-workflow DA-XX` |
-| **Chạy Bước 2 (Implement)** | `Duyệt plan. Thực hiện Bước 2 (Implement) cho task DA-XX theo .ai-workflow/prompts/02-implement.md và các skills trong blueprint của plan.md.` |
-| **Chạy Bước 3 (Review độc lập)** | `Thực hiện Bước 3 (Independent Review) cho task DA-XX theo .ai-workflow/prompts/03-review.md. Khởi chạy các subagents độc lập (Standards, Spec, Ponytail) đối chiếu jira.md, AGENTS.md và domain-review.md, lưu kết quả vào review-01.md.` |
-| **Chạy Bước 4 (Fix lỗi review)** | `Thực hiện Bước 4 (Fix) cho task DA-XX theo .ai-workflow/prompts/04-fix.md. Xử lý tận gốc các findings trong .ai-workflow/tasks/DA-XX/review-01.md, bổ sung regression tests và lưu báo cáo vào fix-report.md.` |
-| **Chạy Bước 5 (Final Review)** | `Thực hiện Bước 5 (Final Review) cho task DA-XX theo .ai-workflow/prompts/05-final-review.md. Kiểm tra lại toàn bộ findings từ review-01.md và fix-report.md, chạy các Quality Gates và lưu kết quả vào final-review.md.` |
-| **Chạy Bước 6 (Pre-Commit & PR)** | `Thực hiện Bước 6 (Pre-Commit) cho task DA-XX theo .ai-workflow/prompts/06-precommit.md. Dùng skill pr soạn nội dung PR, đăng comment tổng kết và chuyển trạng thái ticket sang Done trên Jira qua jira-cwb, sau đó lưu báo cáo vào precommit.md.` |
