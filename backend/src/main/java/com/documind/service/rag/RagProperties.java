@@ -5,15 +5,19 @@ import org.springframework.boot.context.properties.bind.ConstructorBinding;
 import org.springframework.boot.context.properties.bind.DefaultValue;
 import org.springframework.validation.annotation.Validated;
 
+import java.time.Duration;
+
 /**
- * Configuration properties controlling vector retrieval bounds, excerpt sizing, and LLM ask safeguards.
+ * Configuration properties controlling vector retrieval bounds, excerpt sizing, LLM ask safeguards,
+ * conversation memory windows, and typed SSE streaming timeouts.
  */
 @Validated
 @ConfigurationProperties(prefix = "documind.rag")
 public record RagProperties(
     RetrievalProperties retrieval,
     LlmProperties llm,
-    MemoryProperties memory
+    MemoryProperties memory,
+    SseProperties sse
 ) {
 
     public static final int DEFAULT_TOP_K = 5;
@@ -25,23 +29,30 @@ public record RagProperties(
     public static final int DEFAULT_HISTORY_WINDOW_SIZE = 6;
     public static final int DEFAULT_MAX_HISTORY_MESSAGE_CHARS = 1000;
     public static final int DEFAULT_AUTO_TITLE_MAX_CHARS = 80;
+    public static final Duration DEFAULT_SSE_TIMEOUT = Duration.ofSeconds(120);
 
     @ConstructorBinding
     public RagProperties {
         retrieval = retrieval != null ? retrieval : RetrievalProperties.defaults();
         llm = llm != null ? llm : LlmProperties.defaults();
         memory = memory != null ? memory : MemoryProperties.defaults();
+        sse = sse != null ? sse : SseProperties.defaults();
     }
 
     public RagProperties(RetrievalProperties retrieval, LlmProperties llm) {
-        this(retrieval, llm, MemoryProperties.defaults());
+        this(retrieval, llm, MemoryProperties.defaults(), SseProperties.defaults());
+    }
+
+    public RagProperties(RetrievalProperties retrieval, LlmProperties llm, MemoryProperties memory) {
+        this(retrieval, llm, memory, SseProperties.defaults());
     }
 
     public static RagProperties defaults() {
         return new RagProperties(
             RetrievalProperties.defaults(),
             LlmProperties.defaults(),
-            MemoryProperties.defaults()
+            MemoryProperties.defaults(),
+            SseProperties.defaults()
         );
     }
 
@@ -124,6 +135,27 @@ public record RagProperties(
                 DEFAULT_MAX_HISTORY_MESSAGE_CHARS,
                 DEFAULT_AUTO_TITLE_MAX_CHARS
             );
+        }
+    }
+
+    public record SseProperties(
+        @DefaultValue("120s") Duration timeout
+    ) {
+
+        private static final Duration MIN_TIMEOUT = Duration.ofMillis(50);
+        private static final Duration MAX_TIMEOUT = Duration.ofMinutes(10);
+
+        @ConstructorBinding
+        public SseProperties {
+            if (timeout == null || timeout.compareTo(MIN_TIMEOUT) < 0 || timeout.compareTo(MAX_TIMEOUT) > 0) {
+                throw new IllegalArgumentException(
+                    "sse.timeout must be between " + MIN_TIMEOUT + " and " + MAX_TIMEOUT
+                );
+            }
+        }
+
+        public static SseProperties defaults() {
+            return new SseProperties(DEFAULT_SSE_TIMEOUT);
         }
     }
 }

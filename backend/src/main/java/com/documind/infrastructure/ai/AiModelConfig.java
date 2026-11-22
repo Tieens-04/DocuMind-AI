@@ -1,15 +1,23 @@
 package com.documind.infrastructure.ai;
 
+import jakarta.annotation.PreDestroy;
 import org.springframework.ai.chat.client.ChatClient;
+import org.springframework.ai.model.openai.autoconfigure.OpenAiChatProperties;
 import org.springframework.ai.model.openai.autoconfigure.OpenAiConnectionProperties;
 import org.springframework.ai.openai.OpenAiChatModel;
 import org.springframework.ai.openai.OpenAiChatOptions;
 import org.springframework.ai.openai.api.OpenAiApi;
 import org.springframework.beans.BeansException;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.beans.factory.config.BeanPostProcessor;
+import org.springframework.boot.web.reactive.function.client.WebClientCustomizer;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.context.annotation.Primary;
+import org.springframework.http.client.reactive.JdkClientHttpConnector;
+
+import java.net.http.HttpClient;
+import java.time.Duration;
 
 @Configuration
 public class AiModelConfig {
@@ -19,6 +27,36 @@ public class AiModelConfig {
     private static final String DEFAULT_GEMINI_COMPLETIONS_PATH = "/chat/completions";
     private static final String DEFAULT_GEMINI_MODEL = "gemini-3.5-flash";
     private static final double DEFAULT_TEMPERATURE = 0.1;
+    private static final Duration DEFAULT_WEBCLIENT_CONNECT_TIMEOUT = Duration.ofSeconds(10);
+
+    private volatile HttpClient streamingHttpClient;
+
+    @Bean
+    public WebClientCustomizer streamingWebClientConnectTimeoutCustomizer(
+        @Value("${spring.http.client.connect-timeout:10s}") Duration connectTimeout
+    ) {
+        HttpClient httpClient = buildStreamingHttpClient(connectTimeout);
+        this.streamingHttpClient = httpClient;
+        JdkClientHttpConnector connector = new JdkClientHttpConnector(httpClient);
+        return builder -> builder.clientConnector(connector);
+    }
+
+    HttpClient buildStreamingHttpClient(Duration connectTimeout) {
+        Duration effectiveTimeout = (connectTimeout != null && !connectTimeout.isNegative() && !connectTimeout.isZero())
+            ? connectTimeout
+            : DEFAULT_WEBCLIENT_CONNECT_TIMEOUT;
+        return HttpClient.newBuilder()
+            .connectTimeout(effectiveTimeout)
+            .build();
+    }
+
+    @PreDestroy
+    void closeStreamingHttpClient() {
+        HttpClient client = this.streamingHttpClient;
+        if (client != null) {
+            client.close();
+        }
+    }
 
     @Bean
     public static BeanPostProcessor openAiConnectionPropertiesSanitizer() {
@@ -30,6 +68,10 @@ public class AiModelConfig {
                     if (props.getBaseUrl() != null && !props.getBaseUrl().isBlank()) {
                         props.setBaseUrl(normalizeBaseUrl(props.getBaseUrl()));
                     }
+                } else if (bean instanceof OpenAiChatProperties chatProps
+                    && chatProps.getOptions() != null
+                    && chatProps.getOptions().getStreamOptions() == null) {
+                    chatProps.getOptions().setStreamUsage(Boolean.TRUE);
                 }
                 return bean;
             }
@@ -39,11 +81,31 @@ public class AiModelConfig {
     @Bean
     @Primary
     public ChatClient groqChatClient(OpenAiChatModel openAiChatModel) {
-        return ChatClient.create(openAiChatModel);
+        return ChatClient.create(buildGroqChatModel(openAiChatModel));
     }
 
     @Bean("geminiChatClient")
     public ChatClient geminiChatClient(
+        OpenAiApi baseOpenAiApi,
+        OpenAiChatModel baseChatModel,
+        AiProperties aiProperties
+    ) {
+        return ChatClient.create(buildGeminiChatModel(baseOpenAiApi, baseChatModel, aiProperties));
+    }
+
+    OpenAiChatModel buildGroqChatModel(OpenAiChatModel openAiChatModel) {
+        if (openAiChatModel.getDefaultOptions() instanceof OpenAiChatOptions defaultOptions
+            && !Boolean.TRUE.equals(defaultOptions.getStreamUsage())) {
+            OpenAiChatOptions withStreamUsage = OpenAiChatOptions.fromOptions(defaultOptions);
+            withStreamUsage.setStreamUsage(Boolean.TRUE);
+            return openAiChatModel.mutate()
+                .defaultOptions(withStreamUsage)
+                .build();
+        }
+        return openAiChatModel;
+    }
+
+    OpenAiChatModel buildGeminiChatModel(
         OpenAiApi baseOpenAiApi,
         OpenAiChatModel baseChatModel,
         AiProperties aiProperties
@@ -69,15 +131,14 @@ public class AiModelConfig {
             .apiKey(normalizeApiKey(gemini.apiKey()))
             .build();
 
-        OpenAiChatModel geminiModel = baseChatModel.mutate()
+        return baseChatModel.mutate()
             .openAiApi(geminiApi)
             .defaultOptions(OpenAiChatOptions.builder()
                 .model(modelName)
                 .temperature(temperature)
+                .streamUsage(true)
                 .build())
             .build();
-
-        return ChatClient.create(geminiModel);
     }
 
     public static String normalizeApiKey(String rawKey) {

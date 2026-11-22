@@ -33,6 +33,8 @@ public class IngestionAsyncConfig {
 
     public static final String INGESTION_TASK_EXECUTOR = "documentIngestionExecutor";
     public static final String VIRTUAL_THREAD_PREFIX = "documind-ingest-vt-";
+    public static final String CHAT_SSE_TASK_EXECUTOR = "chatSseExecutor";
+    public static final String SSE_VIRTUAL_THREAD_PREFIX = "documind-sse-vt-";
 
     @Bean(name = {
         TaskExecutionAutoConfiguration.APPLICATION_TASK_EXECUTOR_BEAN_NAME,
@@ -59,5 +61,10 @@ public class IngestionAsyncConfig {
             );
         }
         return new VirtualThreadTaskExecutor(VIRTUAL_THREAD_PREFIX);
+    }
+
+    @Bean(name = CHAT_SSE_TASK_EXECUTOR)
+    public AsyncTaskExecutor chatSseExecutor() {
+        return new VirtualThreadTaskExecutor(SSE_VIRTUAL_THREAD_PREFIX);
     }
 }
