@@ -53,6 +53,7 @@ import org.springframework.test.context.ActiveProfiles;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
 import org.springframework.util.LinkedMultiValueMap;
 import org.springframework.util.MultiValueMap;
+import reactor.core.publisher.Flux;
 import software.amazon.awssdk.services.s3.S3Client;
 import software.amazon.awssdk.services.s3.model.DeleteObjectRequest;
 import software.amazon.awssdk.services.s3.model.ListObjectsV2Request;
@@ -641,6 +642,31 @@ public abstract class AbstractIntegrationTest {
                 .usage(new DefaultUsage(125, 48, 173))
                 .build();
             return new ChatResponse(List.of(new Generation(new AssistantMessage(answer))), metadata);
+        }
+
+        @Override
+        public Flux<ChatResponse> stream(Prompt prompt) {
+            callCount.incrementAndGet();
+            lastPrompt.set(prompt);
+            txActiveOnLastCall.set(TransactionSynchronizationManager.isActualTransactionActive());
+
+            String systemText = prompt.getInstructions().stream()
+                .filter(msg -> msg.getMessageType() == MessageType.SYSTEM)
+                .map(Message::getText)
+                .findFirst()
+                .orElse("");
+            Matcher matcher = CITATION_ATTR_PATTERN.matcher(systemText);
+            String firstCitation = matcher.find() ? matcher.group(1) : "[Nguồn: document]";
+
+            ChatResponseMetadata usageMeta = ChatResponseMetadata.builder()
+                .usage(new DefaultUsage(125, 48, 173))
+                .build();
+            return Flux.just(
+                new ChatResponse(List.of(new Generation(new AssistantMessage("Theo tài liệu ")))),
+                new ChatResponse(List.of(new Generation(new AssistantMessage("nội bộ đã trích xuất ")))),
+                new ChatResponse(List.of(new Generation(new AssistantMessage(firstCitation + ".")))),
+                new ChatResponse(List.of(), usageMeta)
+            );
         }
     }
 

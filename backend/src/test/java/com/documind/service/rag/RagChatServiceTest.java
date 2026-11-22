@@ -619,6 +619,7 @@ class RagChatServiceTest {
             eq(15),
             any(Long.class),
             eq(RagConstants.PROVIDER_GROQ),
+            eq(502),
             eq("10.0.0.5")
         );
 
