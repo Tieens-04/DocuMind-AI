@@ -17,9 +17,9 @@ import com.documind.domain.enums.MessageRole;
 import com.documind.domain.enums.Role;
 import com.documind.domain.model.CitationPayload;
 import com.documind.exception.DocumentAccessDeniedException;
-import com.documind.exception.DocumentStorageException;
 import com.documind.exception.InvalidChatRequestException;
 import com.documind.exception.ResourceNotFoundException;
+import com.documind.infrastructure.security.DocumentPreviewTokenService;
 import com.documind.infrastructure.storage.MinioStorageService;
 import com.documind.repository.AuditLogRepository;
 import com.documind.repository.ChatMessageRepository;
@@ -42,7 +42,6 @@ import org.springframework.security.access.prepost.PreAuthorize;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.support.TransactionTemplate;
 
-import java.net.URL;
 import java.text.Normalizer;
 import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
@@ -86,7 +85,7 @@ public class ChatSessionService {
     private final ObjectProvider<DepartmentRepository> departmentRepositoryProvider;
     private final ObjectProvider<DocumentRepository> documentRepositoryProvider;
     private final ObjectProvider<AuditLogRepository> auditLogRepositoryProvider;
-    private final MinioStorageService minioStorageService;
+    private final DocumentPreviewTokenService previewTokenService;
     private final RbacVectorFilterFactory rbacVectorFilterFactory;
     private final ObjectProvider<TransactionTemplate> transactionTemplateProvider;
     private final RagProperties ragProperties;
@@ -98,7 +97,7 @@ public class ChatSessionService {
         ObjectProvider<DepartmentRepository> departmentRepositoryProvider,
         ObjectProvider<DocumentRepository> documentRepositoryProvider,
         ObjectProvider<AuditLogRepository> auditLogRepositoryProvider,
-        MinioStorageService minioStorageService,
+        DocumentPreviewTokenService previewTokenService,
         RbacVectorFilterFactory rbacVectorFilterFactory,
         ObjectProvider<TransactionTemplate> transactionTemplateProvider,
         RagProperties ragProperties
@@ -109,7 +108,7 @@ public class ChatSessionService {
         this.departmentRepositoryProvider = Objects.requireNonNull(departmentRepositoryProvider, "departmentRepositoryProvider must not be null");
         this.documentRepositoryProvider = Objects.requireNonNull(documentRepositoryProvider, "documentRepositoryProvider must not be null");
         this.auditLogRepositoryProvider = Objects.requireNonNull(auditLogRepositoryProvider, "auditLogRepositoryProvider must not be null");
-        this.minioStorageService = Objects.requireNonNull(minioStorageService, "minioStorageService must not be null");
+        this.previewTokenService = Objects.requireNonNull(previewTokenService, "previewTokenService must not be null");
         this.rbacVectorFilterFactory = Objects.requireNonNull(rbacVectorFilterFactory, "rbacVectorFilterFactory must not be null");
         this.transactionTemplateProvider = Objects.requireNonNull(transactionTemplateProvider, "transactionTemplateProvider must not be null");
         this.ragProperties = Objects.requireNonNull(ragProperties, "ragProperties must not be null");
@@ -551,12 +550,16 @@ public class ChatSessionService {
         Map<UUID, DocumentEntity> parentsById,
         RbacVectorScope scope
     ) {
-        if (payload == null || payload.documentId() == null) {
+        if (payload == null
+            || payload.documentId() == null
+            || payload.docVersion() == null
+            || payload.docVersion() < 1) {
             return false;
         }
         DocumentEntity parent = parentsById.get(payload.documentId());
         return parent != null
             && parent.getStatus() == DocumentStatus.COMPLETED
+            && Objects.equals(parent.getCurrentVersion(), payload.docVersion())
             && scope.allows(parent.getDepartmentId(), parent.getAccessLevel());
     }
 
@@ -571,31 +574,20 @@ public class ChatSessionService {
         }
         List<CitationDto> result = new ArrayList<>(storedCitations.size());
         for (CitationPayload payload : storedCitations) {
-            if (payload == null) {
-                continue;
-            }
-            if (!isCitationAuthorized(payload, parentsById, scope)) {
-                // Fail closed on deleted, restricted, reclassified, or non-COMPLETED documents
-                result.add(new CitationDto(
-                    payload.documentId(),
-                    payload.fileName(),
-                    payload.pageNumber(),
-                    payload.sectionHeading(),
-                    payload.similarityScore(),
-                    "",
-                    null
-                ));
+            if (payload == null || !isCitationAuthorized(payload, parentsById, scope)) {
+                // Drop restricted, deleted, non-COMPLETED, missing-version, or version-superseded citations completely
                 continue;
             }
             DocumentEntity parent = parentsById.get(payload.documentId());
             String baseUrl = presignedUrlMemo.computeIfAbsent(
                 parent.getId(),
-                id -> generateBasePresignedUrl(parent)
+                id -> generateBasePresignedUrl(parent, scope.caller())
             ).orElse(null);
             Integer effectivePage = parent.isPdf() ? payload.pageNumber() : null;
             String citationUrl = MinioStorageService.appendPageFragment(baseUrl, effectivePage);
             result.add(new CitationDto(
                 parent.getId(),
+                parent.getCurrentVersion(),
                 parent.getOriginalName(),
                 effectivePage,
                 payload.sectionHeading(),
@@ -607,11 +599,13 @@ public class ChatSessionService {
         return List.copyOf(result);
     }
 
-    private Optional<String> generateBasePresignedUrl(DocumentEntity parent) {
+    private Optional<String> generateBasePresignedUrl(DocumentEntity parent, CallerContext caller) {
         try {
-            URL url = minioStorageService.generatePresignedGetUrl(parent.getStorageKey(), parent.getOriginalName());
-            return url != null ? Optional.of(url.toString()) : Optional.empty();
-        } catch (DocumentStorageException ex) {
+            int version = parent.getCurrentVersion() != null ? parent.getCurrentVersion() : 1;
+            DocumentPreviewTokenService.IssuedPreviewUrl issued =
+                previewTokenService.issuePreviewUrl(parent.getId(), version, caller);
+            return issued != null && issued.baseUrl() != null ? Optional.of(issued.baseUrl()) : Optional.empty();
+        } catch (RuntimeException ex) {
             log.warn("Failed to re-sign historical citation URL for document {}: {}", parent.getId(), ex.getMessage());
             return Optional.empty();
         }

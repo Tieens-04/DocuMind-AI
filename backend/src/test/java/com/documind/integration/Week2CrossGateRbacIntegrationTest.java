@@ -812,8 +812,20 @@ class Week2CrossGateRbacIntegrationTest {
 
             assertThat(client.sendJson(port, "GET", "/api/v1/documents/" + hrDeptDoc.id(), null, oldHrEmployeeJwt).statusCode())
                 .isEqualTo(200);
-            assertThat(client.sendJson(port, "GET", "/api/v1/documents/" + hrDeptDoc.id() + "/preview-url?page=1", null, oldHrEmployeeJwt).statusCode())
-                .isEqualTo(200);
+            HttpResponse<String> preTransferPreviewResp = client.sendJson(
+                port,
+                "GET",
+                "/api/v1/documents/" + hrDeptDoc.id() + "/preview-url?page=1",
+                null,
+                oldHrEmployeeJwt
+            );
+            assertThat(preTransferPreviewResp.statusCode()).isEqualTo(200);
+            DocumentPreviewUrlResponse preTransferPreview = objectMapper.readValue(
+                preTransferPreviewResp.body(),
+                DocumentPreviewUrlResponse.class
+            );
+            URI preTransferPreviewUri = URI.create(Week2SseTestClient.stripFragment(preTransferPreview.previewUrl()));
+            assertThat(client.fetchRawBytes(preTransferPreviewUri).statusCode()).isEqualTo(200);
 
             String leaveQuestion = "Nhân viên chính thức được hưởng bao nhiêu ngày nghỉ phép năm?";
             List<SseFrame> preTransferFrames = client.collectAllSseFrames(
@@ -824,6 +836,16 @@ class Week2CrossGateRbacIntegrationTest {
             JsonNode preTransferDone = objectMapper.readTree(preTransferFrames.getLast().data());
             assertThat(preTransferDone.path("abstained").asBoolean()).isFalse();
             UUID carriedSessionId = UUID.fromString(preTransferDone.path("sessionId").asText());
+
+            // Separate pre-transfer session citing BOTH restricted hrDeptDoc AND company-wide hrPublicDoc on Turn 1
+            List<SseFrame> mixedPreTransferFrames = client.collectAllSseFrames(
+                port,
+                Map.of("question", "Nhân viên chính thức nghỉ phép năm và làm việc từ xa hybrid work khung giờ phối hợp nào?"),
+                oldHrEmployeeJwt
+            );
+            JsonNode mixedPreTransferDone = objectMapper.readTree(mixedPreTransferFrames.getLast().data());
+            assertThat(mixedPreTransferDone.path("abstained").asBoolean()).isFalse();
+            UUID mixedSessionId = UUID.fromString(mixedPreTransferDone.path("sessionId").asText());
 
             HttpResponse<String> preHistoryResp = client.sendJson(
                 port,
@@ -837,6 +859,14 @@ class Week2CrossGateRbacIntegrationTest {
             assertThat(preHistory).hasSize(2);
             assertThat(preHistory.get(1).citations().getFirst().presignedUrl()).isNotBlank();
             assertThat(preHistory.get(1).citations().getFirst().excerpt()).contains("HR_TRANSFER_SECRET_14DAYS");
+
+            List<ChatMessageResponse> preMixedHistory = objectMapper.readValue(
+                client.sendJson(port, "GET", "/api/v1/chat/sessions/" + mixedSessionId + "/messages", null, oldHrEmployeeJwt).body(),
+                new TypeReference<>() {}
+            );
+            assertThat(preMixedHistory.get(1).citations())
+                .extracting(c -> c.documentId())
+                .contains(hrDeptDoc.id(), hrPublicDoc.id());
 
             HttpResponse<String> transferResp = client.sendJson(
                 port,
@@ -860,6 +890,9 @@ class Week2CrossGateRbacIntegrationTest {
                     .contains("error=\"invalid_token\"");
                 assertThat(objectMapper.readTree(staleResp.body()).path("errorCode").asText()).isEqualTo("TOKEN_REVOKED");
             }
+
+            // Already-issued HR preview URL immediately loses read access (403) upon user department transfer
+            assertThat(client.fetchRawBytes(preTransferPreviewUri).statusCode()).isEqualTo(403);
 
             AuthTokenResponse freshSalesLogin = client.login(port, HR_EMPLOYEE_EMAIL, SEED_DEV_PASSWORD);
             assertThat(freshSalesLogin.user().departmentCode()).isEqualTo("SALES");
@@ -894,9 +927,36 @@ class Week2CrossGateRbacIntegrationTest {
             ChatMessageResponse redactedAssistant = postHistory.get(1);
             assertThat(redactedAssistant.content()).isEqualTo(ChatSessionService.REDACTED_ASSISTANT_CONTENT);
             assertThat(redactedAssistant.rewrittenQuery()).isNull();
-            assertThat(redactedAssistant.citations().getFirst().excerpt()).isEmpty();
-            assertThat(redactedAssistant.citations().getFirst().presignedUrl()).isNull();
-            assertThat(postHistoryResp.body()).doesNotContain("HR_TRANSFER_SECRET_14DAYS");
+            assertThat(redactedAssistant.citations()).isEmpty();
+            assertThat(postHistoryResp.body())
+                .doesNotContain("HR_TRANSFER_SECRET_14DAYS")
+                .doesNotContain("hr-transfer-leave.pdf")
+                .doesNotContain(hrDeptDoc.id().toString());
+
+            // Mixed session omits ALL restricted hrDeptDoc metadata while retaining still-authorized hrPublicDoc citation!
+            HttpResponse<String> postMixedHistoryResp = client.sendJson(
+                port,
+                "GET",
+                "/api/v1/chat/sessions/" + mixedSessionId + "/messages",
+                null,
+                newSalesJwt
+            );
+            assertThat(postMixedHistoryResp.statusCode()).isEqualTo(200);
+            List<ChatMessageResponse> postMixedHistory = objectMapper.readValue(postMixedHistoryResp.body(), new TypeReference<>() {});
+            ChatMessageResponse mixedRedactedAssistant = postMixedHistory.get(1);
+            assertThat(mixedRedactedAssistant.content()).isEqualTo(ChatSessionService.REDACTED_ASSISTANT_CONTENT);
+            assertThat(mixedRedactedAssistant.rewrittenQuery()).isNull();
+            assertThat(mixedRedactedAssistant.citations())
+                .hasSize(1)
+                .allSatisfy(c -> {
+                    assertThat(c.documentId()).isEqualTo(hrPublicDoc.id());
+                    assertThat(c.fileName()).isEqualTo("company-hybrid-public.txt");
+                    assertThat(c.presignedUrl()).isNotBlank();
+                });
+            assertThat(postMixedHistoryResp.body())
+                .doesNotContain("HR_TRANSFER_SECRET_14DAYS")
+                .doesNotContain("hr-transfer-leave.pdf")
+                .doesNotContain(hrDeptDoc.id().toString());
 
             recordingChatModel.reset();
             List<SseFrame> exfilAttemptFrames = client.collectAllSseFrames(
@@ -1005,6 +1065,9 @@ class Week2CrossGateRbacIntegrationTest {
                 hrManagerJwt
             ).statusCode()).isEqualTo(200);
 
+            // Already-issued Sales preview URL immediately loses read access (403) when ACL is tightened to CONFIDENTIAL!
+            assertThat(client.fetchRawBytes(v1MinioUri).statusCode()).isEqualTo(403);
+
             for (String blockedJwt : List.of(salesEmployeeJwt, hrEmployeeJwt)) {
                 assertThat(client.sendJson(port, "GET", "/api/v1/documents/" + doc.id(), null, blockedJwt).statusCode())
                     .isEqualTo(403);
@@ -1016,13 +1079,22 @@ class Week2CrossGateRbacIntegrationTest {
                 assertThat(recordingChatModel.callCount()).isZero();
             }
 
+            HttpResponse<String> redactedSalesHistoryRaw = client.sendJson(
+                port,
+                "GET",
+                "/api/v1/chat/sessions/" + salesSessionId + "/messages",
+                null,
+                salesEmployeeJwt
+            );
             List<ChatMessageResponse> redactedSalesHistory = objectMapper.readValue(
-                client.sendJson(port, "GET", "/api/v1/chat/sessions/" + salesSessionId + "/messages", null, salesEmployeeJwt).body(),
+                redactedSalesHistoryRaw.body(),
                 new TypeReference<>() {}
             );
             assertThat(redactedSalesHistory.get(1).content()).isEqualTo(ChatSessionService.REDACTED_ASSISTANT_CONTENT);
-            assertThat(redactedSalesHistory.get(1).citations().getFirst().presignedUrl()).isNull();
-            assertThat(redactedSalesHistory.get(1).citations().getFirst().excerpt()).isEmpty();
+            assertThat(redactedSalesHistory.get(1).citations()).isEmpty();
+            assertThat(redactedSalesHistoryRaw.body())
+                .doesNotContain("policy-live-v1.pdf")
+                .doesNotContain(doc.id().toString());
             assertThat(client.sendJson(port, "GET", "/api/v1/documents/" + doc.id() + "/preview-url?page=2", null, hrManagerJwt).statusCode())
                 .isEqualTo(200);
 
@@ -1081,7 +1153,29 @@ class Week2CrossGateRbacIntegrationTest {
                 doc.id()
             )).isZero();
 
-            List<SseFrame> salesV2Stream = client.collectAllSseFrames(port, Map.of("question", question), salesEmployeeJwt);
+            // Even after v2 becomes PUBLIC, salesSessionId Turn 1 (which cited v1) MUST remain redacted & excluded from Turn 2 rewrite!
+            HttpResponse<String> historyAfterV2PublicRaw = client.sendJson(
+                port,
+                "GET",
+                "/api/v1/chat/sessions/" + salesSessionId + "/messages",
+                null,
+                salesEmployeeJwt
+            );
+            List<ChatMessageResponse> historyAfterV2Public = objectMapper.readValue(
+                historyAfterV2PublicRaw.body(),
+                new TypeReference<>() {}
+            );
+            assertThat(historyAfterV2Public.get(1).content()).isEqualTo(ChatSessionService.REDACTED_ASSISTANT_CONTENT);
+            assertThat(historyAfterV2Public.get(1).citations()).isEmpty();
+            assertThat(historyAfterV2PublicRaw.body())
+                .doesNotContain("LIVE_V1_CUTOVER_MARKER")
+                .doesNotContain("policy-live-v1.pdf");
+
+            List<SseFrame> salesV2Stream = client.collectAllSseFrames(
+                port,
+                Map.of("question", question, "sessionId", salesSessionId.toString()),
+                salesEmployeeJwt
+            );
             JsonNode v2Citations = objectMapper.readTree(salesV2Stream.getFirst().data()).path("citations");
             assertThat(v2Citations.size()).isGreaterThan(0);
             assertThat(salesV2Stream.getFirst().data())
@@ -1123,7 +1217,9 @@ class Week2CrossGateRbacIntegrationTest {
                 new TypeReference<>() {}
             );
             assertThat(postDeleteHistory.get(1).content()).isEqualTo(ChatSessionService.REDACTED_ASSISTANT_CONTENT);
-            assertThat(postDeleteHistory.get(1).citations().getFirst().presignedUrl()).isNull();
+            assertThat(postDeleteHistory.get(1).citations()).isEmpty();
+            assertThat(postDeleteHistory.get(3).content()).isEqualTo(ChatSessionService.REDACTED_ASSISTANT_CONTENT);
+            assertThat(postDeleteHistory.get(3).citations()).isEmpty();
         }
 
         @Test

@@ -493,7 +493,7 @@ class MultiTurnSessionChatIntegrationTest {
         assertThat(delPublicResp.statusCode()).isEqualTo(204);
 
         // Reading session history fails closed for BOTH reclassified CONFIDENTIAL AND deleted docs:
-        // presignedUrl = null, excerpt = "", content = REDACTED_ASSISTANT_CONTENT, rewrittenQuery = null!
+        // content = REDACTED_ASSISTANT_CONTENT, rewrittenQuery = null, and restricted/deleted citation metadata completely omitted!
         HttpResponse<String> historyRaw = sendAuthed("GET", "/api/v1/chat/sessions/" + sessionId + "/messages", hrEmployeeJwt, null);
         assertThat(historyRaw.statusCode()).isEqualTo(200);
         List<ChatMessageResponse> history = objectMapper.readValue(historyRaw.body(), new TypeReference<>() {});
@@ -501,16 +501,15 @@ class MultiTurnSessionChatIntegrationTest {
 
         assertThat(history.get(1).content()).isEqualTo(ChatSessionService.REDACTED_ASSISTANT_CONTENT);
         assertThat(history.get(1).rewrittenQuery()).isNull();
-        CitationDto reclassifiedCitation = history.get(1).citations().getFirst();
-        assertThat(reclassifiedCitation.documentId()).isEqualTo(hrDeptDocId);
-        assertThat(reclassifiedCitation.presignedUrl()).isNull();
-        assertThat(reclassifiedCitation.excerpt()).isEmpty();
+        assertThat(history.get(1).citations()).isEmpty();
 
         assertThat(history.get(3).content()).isEqualTo(ChatSessionService.REDACTED_ASSISTANT_CONTENT);
-        CitationDto deletedCitation = history.get(3).citations().getFirst();
-        assertThat(deletedCitation.documentId()).isEqualTo(publicDocId);
-        assertThat(deletedCitation.presignedUrl()).isNull();
-        assertThat(deletedCitation.excerpt()).isEmpty();
+        assertThat(history.get(3).citations()).isEmpty();
+        assertThat(historyRaw.body())
+            .doesNotContain("hr-dept-pvi.pdf")
+            .doesNotContain(hrDeptDocId.toString())
+            .doesNotContain("public-remote-work.md")
+            .doesNotContain(publicDocId.toString());
 
         // Follow-up ask on the same session MUST exclude revoked/deleted turns from contextualizer & answer prompt
         chatModel.reset();
@@ -527,8 +526,7 @@ class MultiTurnSessionChatIntegrationTest {
         assertThat(historyAfterDeleteRaw.statusCode()).isEqualTo(200);
         List<ChatMessageResponse> historyAfterDelete = objectMapper.readValue(historyAfterDeleteRaw.body(), new TypeReference<>() {});
         assertThat(historyAfterDelete.get(1).content()).isEqualTo(ChatSessionService.REDACTED_ASSISTANT_CONTENT);
-        assertThat(historyAfterDelete.get(1).citations().getFirst().presignedUrl()).isNull();
-        assertThat(historyAfterDelete.get(1).citations().getFirst().excerpt()).isEmpty();
+        assertThat(historyAfterDelete.get(1).citations()).isEmpty();
     }
 
     @Test
@@ -681,6 +679,168 @@ class MultiTurnSessionChatIntegrationTest {
             .containsExactly(MessageRole.USER, MessageRole.ASSISTANT, MessageRole.USER, MessageRole.ASSISTANT);
         for (int i = 1; i < raceHistory.size(); i++) {
             assertThat(raceHistory.get(i).createdAt()).isAfter(raceHistory.get(i - 1).createdAt());
+        }
+    }
+
+    @Test
+    void reindexFromConfidentialV1ToPublicV2AndLegacyVersionlessCitationsFailClosedAcrossHistoryAndFollowUp() throws Exception {
+        UUID publicRemoteId = seedIndexedDocument(
+            IT_DEPT_ID,
+            AccessLevel.PUBLIC,
+            "company-hybrid-public.md",
+            "md",
+            "text/markdown",
+            null,
+            "Quy định chung",
+            "Chính sách làm việc từ xa hybrid work toàn công ty cho phép tối đa 2 ngày mỗi tuần."
+        );
+        UUID docId = seedIndexedDocument(
+            HR_DEPT_ID,
+            AccessLevel.CONFIDENTIAL,
+            "hr-bonus-v1-secret.pdf",
+            "pdf",
+            "application/pdf",
+            2,
+            "Phụ lục Lương Mật V1",
+            "Chính sách nghỉ phép năm thâm niên mật v1: giám đốc hưởng 30 ngày phép đặc biệt. V1_CONF_SECRET_30DAYS"
+        );
+
+        String hrManagerJwt = loginAndGetAccessToken(HR_MANAGER_EMAIL);
+        String adminJwt = loginAndGetAccessToken(ADMIN_EMAIL);
+
+        // Turn 1: HR Manager asks about PUBLIC hybrid work doc (will remain authorized throughout)
+        ChatAskResponse turn1Public = objectMapper.readValue(
+            askChat(hrManagerJwt, "Chính sách làm việc từ xa hybrid work tối đa mấy ngày?", null).body(),
+            ChatAskResponse.class
+        );
+        UUID sessionId = turn1Public.sessionId();
+        assertThat(turn1Public.abstained()).isFalse();
+
+        // Turn 2: HR Manager asks combined question citing BOTH CONFIDENTIAL v1 doc AND PUBLIC hybrid work doc
+        ChatAskResponse turn2Mixed = objectMapper.readValue(
+            askChat(hrManagerJwt, "Chính sách nghỉ phép năm thâm niên kết hợp làm việc từ xa hybrid work thế nào?", sessionId).body(),
+            ChatAskResponse.class
+        );
+        assertThat(turn2Mixed.abstained()).isFalse();
+        assertThat(turn2Mixed.citations()).extracting(CitationDto::documentId).contains(docId, publicRemoteId);
+        assertThat(turn2Mixed.citations()).allSatisfy(c -> assertThat(c.docVersion()).isEqualTo(1));
+
+        // Simulate reindex of docId -> v2 where CONFIDENTIAL content is stripped and document is promoted to PUBLIC!
+        String v2Text = "Chính sách nghỉ phép năm phiên bản 2 công khai: tất cả nhân viên hưởng 15 ngày phép năm. V2_PUBLIC_15DAYS";
+        String v2StorageKey = minioStorageService.buildStorageKey(HR_DEPT_ID, docId, 2, "hr-bonus-v2-public.pdf");
+        byte[] v2Bytes = v2Text.getBytes(StandardCharsets.UTF_8);
+        minioStorageService.uploadStream(v2StorageKey, new ByteArrayInputStream(v2Bytes), v2Bytes.length, "application/pdf");
+        jdbcTemplate.update("DELETE FROM document_chunks WHERE document_id = ? AND doc_version < 2", docId);
+        jdbcTemplate.update(
+            """
+            UPDATE documents
+            SET original_name = 'hr-bonus-v2-public.pdf',
+                storage_key = ?,
+                access_level = 'PUBLIC',
+                current_version = 2,
+                status = 'COMPLETED'
+            WHERE id = ?
+            """,
+            v2StorageKey,
+            docId
+        );
+        Map<String, Object> v2Meta = new LinkedHashMap<>();
+        v2Meta.put(ChunkMetadataKeys.DOCUMENT_ID, docId.toString());
+        v2Meta.put(ChunkMetadataKeys.DEPARTMENT_ID, HR_DEPT_ID.toString());
+        v2Meta.put(ChunkMetadataKeys.ACCESS_LEVEL, AccessLevel.PUBLIC.name());
+        v2Meta.put(ChunkMetadataKeys.FILE_NAME, "hr-bonus-v2-public.pdf");
+        v2Meta.put(ChunkMetadataKeys.DOC_VERSION, 2);
+        v2Meta.put(ChunkMetadataKeys.CHUNK_INDEX, 0);
+        v2Meta.put(ChunkMetadataKeys.PAGE_NUMBER, 1);
+        vectorStore.add(List.of(Document.builder()
+            .id(ChunkIdGenerator.generate(docId, 2, 0).toString())
+            .text(v2Text)
+            .metadata(v2Meta)
+            .build()));
+
+        // Demote HR Manager to STANDARD_EMPLOYEE and re-login
+        HttpResponse<String> demoteResp = sendAuthed(
+            "PATCH",
+            "/api/v1/admin/users/" + AbstractIntegrationTest.HR_MANAGER_USER_ID,
+            adminJwt,
+            Map.of("role", "STANDARD_EMPLOYEE")
+        );
+        assertThat(demoteResp.statusCode()).isEqualTo(200);
+        try {
+            String demotedJwt = loginAndGetAccessToken(HR_MANAGER_EMAIL);
+
+            // 1. Session history MUST redact Turn 2 prose, strip ALL v1 citation metadata, and retain ONLY still-valid publicRemoteId!
+            HttpResponse<String> historyAfterReindexResp = sendAuthed(
+                "GET",
+                "/api/v1/chat/sessions/" + sessionId + "/messages",
+                demotedJwt,
+                null
+            );
+            assertThat(historyAfterReindexResp.statusCode()).isEqualTo(200);
+            List<ChatMessageResponse> historyAfterReindex = objectMapper.readValue(
+                historyAfterReindexResp.body(),
+                new TypeReference<>() {}
+            );
+            assertThat(historyAfterReindex).hasSize(4);
+            ChatMessageResponse t2Assistant = historyAfterReindex.get(3);
+            assertThat(t2Assistant.content()).isEqualTo(ChatSessionService.REDACTED_ASSISTANT_CONTENT);
+            assertThat(t2Assistant.rewrittenQuery()).isNull();
+            assertThat(t2Assistant.citations())
+                .extracting(CitationDto::documentId)
+                .containsExactly(publicRemoteId);
+            assertThat(historyAfterReindexResp.body())
+                .doesNotContain("hr-bonus-v1-secret.pdf")
+                .doesNotContain("hr-bonus-v2-public.pdf")
+                .doesNotContain("Phụ lục Lương Mật V1")
+                .doesNotContain("V1_CONF_SECRET_30DAYS")
+                .doesNotContain(docId.toString());
+
+            // 2. Turn 3 follow-up on the SAME session runs QueryContextualizerService with Turn 1 ONLY (excluding Turn 2 v1!) and cites v2 (docVersion=2)
+            chatModel.reset();
+            ChatAskResponse turn3 = objectMapper.readValue(
+                askChat(demotedJwt, "Còn chính sách nghỉ phép năm phiên bản 2 thì sao?", sessionId).body(),
+                ChatAskResponse.class
+            );
+            assertThat(turn3.abstained()).isFalse();
+            assertThat(chatModel.rewriteCallCount()).isEqualTo(1);
+            assertThat(chatModel.lastRewriteSystemPrompt())
+                .contains("company-hybrid-public.md")
+                .doesNotContain("hr-bonus-v1-secret.pdf")
+                .doesNotContain("V1_CONF_SECRET_30DAYS");
+            assertThat(turn3.citations())
+                .anySatisfy(c -> {
+                    assertThat(c.documentId()).isEqualTo(docId);
+                    assertThat(c.docVersion()).isEqualTo(2);
+                    assertThat(c.fileName()).isEqualTo("hr-bonus-v2-public.pdf");
+                    assertThat(c.excerpt()).contains("V2_PUBLIC_15DAYS");
+                });
+
+            // 3. Legacy JSONB citation lacking docVersion also fails closed on history display
+            jdbcTemplate.update(
+                """
+                UPDATE chat_messages
+                SET citations = (
+                    SELECT jsonb_agg(elem - 'docVersion')
+                    FROM jsonb_array_elements(citations) AS elem
+                )
+                WHERE id = ?
+                """,
+                turn3.messageId()
+            );
+            HttpResponse<String> legacyHistoryResp = sendAuthed(
+                "GET",
+                "/api/v1/chat/sessions/" + sessionId + "/messages",
+                demotedJwt,
+                null
+            );
+            List<ChatMessageResponse> legacyHistory = objectMapper.readValue(
+                legacyHistoryResp.body(),
+                new TypeReference<>() {}
+            );
+            assertThat(legacyHistory.get(5).content()).isEqualTo(ChatSessionService.REDACTED_ASSISTANT_CONTENT);
+            assertThat(legacyHistory.get(5).citations()).isEmpty();
+        } finally {
+            jdbcTemplate.update("UPDATE users SET role = 'DEPARTMENT_MANAGER' WHERE id = ?", AbstractIntegrationTest.HR_MANAGER_USER_ID);
         }
     }
 

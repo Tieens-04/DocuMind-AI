@@ -4,8 +4,8 @@ import com.documind.controller.dto.CitationDto;
 import com.documind.domain.entity.DocumentEntity;
 import com.documind.domain.enums.AccessLevel;
 import com.documind.domain.enums.DocumentStatus;
-import com.documind.exception.DocumentStorageException;
 import com.documind.exception.InvalidChatRequestException;
+import com.documind.infrastructure.security.DocumentPreviewTokenService;
 import com.documind.infrastructure.storage.MinioStorageService;
 import com.documind.repository.DocumentRepository;
 import com.documind.service.document.CallerContext;
@@ -21,7 +21,6 @@ import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.security.access.prepost.PreAuthorize;
 import org.springframework.stereotype.Service;
 
-import java.net.URL;
 import java.text.Normalizer;
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -52,20 +51,20 @@ public class VectorRetrievalService {
 
     private final ObjectProvider<VectorStore> vectorStoreProvider;
     private final ObjectProvider<DocumentRepository> documentRepositoryProvider;
-    private final MinioStorageService minioStorageService;
+    private final DocumentPreviewTokenService previewTokenService;
     private final RbacVectorFilterFactory rbacVectorFilterFactory;
     private final RagProperties properties;
 
     public VectorRetrievalService(
         ObjectProvider<VectorStore> vectorStoreProvider,
         ObjectProvider<DocumentRepository> documentRepositoryProvider,
-        MinioStorageService minioStorageService,
+        DocumentPreviewTokenService previewTokenService,
         RbacVectorFilterFactory rbacVectorFilterFactory,
         RagProperties properties
     ) {
         this.vectorStoreProvider = Objects.requireNonNull(vectorStoreProvider, "vectorStoreProvider must not be null");
         this.documentRepositoryProvider = Objects.requireNonNull(documentRepositoryProvider, "documentRepositoryProvider must not be null");
-        this.minioStorageService = Objects.requireNonNull(minioStorageService, "minioStorageService must not be null");
+        this.previewTokenService = Objects.requireNonNull(previewTokenService, "previewTokenService must not be null");
         this.rbacVectorFilterFactory = Objects.requireNonNull(rbacVectorFilterFactory, "rbacVectorFilterFactory must not be null");
         this.properties = Objects.requireNonNull(properties, "properties must not be null");
     }
@@ -160,13 +159,14 @@ public class VectorRetrievalService {
 
             String baseUrl = presignedUrlMemo.computeIfAbsent(
                 parent.getId(),
-                id -> generateBasePresignedUrl(parent)
+                id -> generateBasePresignedUrl(parent, rbacScope.caller())
             ).orElse(null);
 
             String citationUrl = MinioStorageService.appendPageFragment(baseUrl, candidate.pageNumber());
             String excerpt = buildExcerpt(candidate.content(), maxExcerptChars);
             CitationDto citation = new CitationDto(
                 parent.getId(),
+                candidate.docVersion(),
                 parent.getOriginalName(),
                 candidate.pageNumber(),
                 candidate.sectionHeading(),
@@ -210,12 +210,14 @@ public class VectorRetrievalService {
         return cleaned;
     }
 
-    private Optional<String> generateBasePresignedUrl(DocumentEntity parent) {
+    private Optional<String> generateBasePresignedUrl(DocumentEntity parent, CallerContext caller) {
         try {
-            URL url = minioStorageService.generatePresignedGetUrl(parent.getStorageKey(), parent.getOriginalName());
-            return url != null ? Optional.of(url.toString()) : Optional.empty();
-        } catch (DocumentStorageException ex) {
-            log.warn("Failed to generate presigned citation URL for document {}: {}", parent.getId(), ex.getMessage());
+            int version = parent.getCurrentVersion() != null ? parent.getCurrentVersion() : 1;
+            DocumentPreviewTokenService.IssuedPreviewUrl issued =
+                previewTokenService.issuePreviewUrl(parent.getId(), version, caller);
+            return issued != null && issued.baseUrl() != null ? Optional.of(issued.baseUrl()) : Optional.empty();
+        } catch (RuntimeException ex) {
+            log.warn("Failed to generate citation preview URL for document {}: {}", parent.getId(), ex.getMessage());
             return Optional.empty();
         }
     }
