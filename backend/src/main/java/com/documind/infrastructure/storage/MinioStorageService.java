@@ -81,13 +81,19 @@ public class MinioStorageService {
     }
 
     public ResponseInputStream<GetObjectResponse> openStream(String storageKey) {
+        return openStream(storageKey, null);
+    }
+
+    public ResponseInputStream<GetObjectResponse> openStream(String storageKey, String byteRange) {
         Objects.requireNonNull(storageKey, "storageKey must not be null");
-        GetObjectRequest request = GetObjectRequest.builder()
+        GetObjectRequest.Builder builder = GetObjectRequest.builder()
             .bucket(props.bucket())
-            .key(storageKey)
-            .build();
+            .key(storageKey);
+        if (byteRange != null && !byteRange.isBlank()) {
+            builder.range(byteRange.trim());
+        }
         try {
-            return s3Client.getObject(request);
+            return s3Client.getObject(builder.build());
         } catch (SdkException ex) {
             throw new DocumentStorageException("Failed to open stream for storage key: " + storageKey, ex);
         }
@@ -157,7 +163,7 @@ public class MinioStorageService {
         }
     }
 
-    private static String buildInlineContentDisposition(String inlineFileName) {
+    public static String buildInlineContentDisposition(String inlineFileName) {
         String cleanedUtf8 = (inlineFileName == null)
             ? ""
             : inlineFileName.replaceAll("[\\r\\n\\u0000-\\u001F\\u007F]+", " ").trim();

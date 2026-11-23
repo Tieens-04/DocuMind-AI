@@ -23,6 +23,7 @@ import com.documind.repository.UserRepository;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
+import org.mockito.InOrder;
 import org.springframework.mock.env.MockEnvironment;
 import org.springframework.security.crypto.bcrypt.BCryptPasswordEncoder;
 import org.springframework.security.crypto.password.PasswordEncoder;
@@ -46,6 +47,7 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.inOrder;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.spy;
@@ -104,6 +106,8 @@ class AuthServiceTest {
     void loginIssuesJwtAndHashedRefreshTokenAndRecordsAuditLog() {
         UserEntity user = buildUser(USER_ID, HR_DEPT_ID, "manager.hr@documind.ai", "DocuMind@2026!", Role.DEPARTMENT_MANAGER, true);
         when(userRepository.findByEmailIgnoreCase("manager.hr@documind.ai")).thenReturn(Optional.of(user));
+        when(userRepository.lockUserByIdForUpdate(USER_ID)).thenReturn(Optional.of(USER_ID));
+        when(userRepository.findWithDepartmentById(USER_ID)).thenReturn(Optional.of(user));
         when(refreshTokenRepository.save(any(RefreshTokenEntity.class))).thenAnswer(inv -> inv.getArgument(0));
         when(auditLogRepository.save(any(AuditLogEntity.class))).thenAnswer(inv -> inv.getArgument(0));
 
@@ -141,6 +145,71 @@ class AuthServiceTest {
         assertThat(audit.getUser()).isSameAs(user);
         assertThat(audit.getDepartment()).isSameAs(user.getDepartment());
         assertThat(audit.getQueryText()).isNull();
+
+        InOrder lockOrder = inOrder(userRepository, refreshTokenRepository);
+        lockOrder.verify(userRepository).findByEmailIgnoreCase("manager.hr@documind.ai");
+        lockOrder.verify(userRepository).lockUserByIdForUpdate(USER_ID);
+        lockOrder.verify(userRepository).findWithDepartmentById(USER_ID);
+        lockOrder.verify(refreshTokenRepository).save(any(RefreshTokenEntity.class));
+    }
+
+    @Test
+    void loginRejectsWhenPasswordHashEmailOrActiveStatusMutatesConcurrentlyBeforeSessionPersistence() {
+        UserEntity preResetSnapshot = buildUser(USER_ID, HR_DEPT_ID, "manager.hr@documind.ai", "OldPass@2026!", Role.DEPARTMENT_MANAGER, true);
+        UserEntity postResetSnapshot = buildUser(USER_ID, HR_DEPT_ID, "manager.hr@documind.ai", "NewPass@2026!", Role.DEPARTMENT_MANAGER, true);
+        when(userRepository.findByEmailIgnoreCase("manager.hr@documind.ai")).thenReturn(Optional.of(preResetSnapshot));
+        when(userRepository.lockUserByIdForUpdate(USER_ID)).thenReturn(Optional.of(USER_ID));
+        when(userRepository.findWithDepartmentById(USER_ID)).thenReturn(Optional.of(postResetSnapshot));
+        when(auditLogRepository.save(any(AuditLogEntity.class))).thenAnswer(inv -> inv.getArgument(0));
+
+        // 1. Concurrent password reset changed password_hash after BCrypt matched OldPass@2026! -> reject 401 & 0 refresh tokens
+        assertThatThrownBy(() -> authService.login(
+            new LoginRequest("manager.hr@documind.ai", "OldPass@2026!"),
+            "Agent/1",
+            "203.0.113.11"
+        )).isInstanceOf(InvalidCredentialsException.class);
+        verifyNoInteractions(refreshTokenRepository);
+
+        // 2. Concurrent account deactivation changed isActive=false after BCrypt matched -> reject 403 & 0 refresh tokens
+        UserEntity deactivatedSnapshot = buildUser(USER_ID, HR_DEPT_ID, "manager.hr@documind.ai", "OldPass@2026!", Role.DEPARTMENT_MANAGER, false);
+        deactivatedSnapshot.setPasswordHash(preResetSnapshot.getPasswordHash());
+        when(userRepository.findWithDepartmentById(USER_ID)).thenReturn(Optional.of(deactivatedSnapshot));
+
+        assertThatThrownBy(() -> authService.login(
+            new LoginRequest("manager.hr@documind.ai", "OldPass@2026!"),
+            "Agent/1",
+            "203.0.113.11"
+        )).isInstanceOf(AccountDisabledException.class);
+        verifyNoInteractions(refreshTokenRepository);
+
+        ArgumentCaptor<AuditLogEntity> auditCaptor = ArgumentCaptor.forClass(AuditLogEntity.class);
+        verify(auditLogRepository, org.mockito.Mockito.times(2)).save(auditCaptor.capture());
+        assertThat(auditCaptor.getAllValues())
+            .extracting(AuditLogEntity::getStatusCode)
+            .containsExactly(401, 403);
+
+        // 3. Concurrent department transfer (same passwordHash, active) mints JWT with fresh locked department
+        UUID itDeptId = UUID.fromString("11111111-1111-1111-1111-111111111111");
+        DepartmentEntity itDept = new DepartmentEntity();
+        itDept.setId(itDeptId);
+        itDept.setCode("IT");
+        itDept.setName("Information Technology");
+        UserEntity transferredSnapshot = buildUser(USER_ID, itDeptId, "manager.hr@documind.ai", "OldPass@2026!", Role.STANDARD_EMPLOYEE, true);
+        transferredSnapshot.setDepartment(itDept);
+        transferredSnapshot.setPasswordHash(preResetSnapshot.getPasswordHash());
+        when(userRepository.findWithDepartmentById(USER_ID)).thenReturn(Optional.of(transferredSnapshot));
+        when(refreshTokenRepository.save(any(RefreshTokenEntity.class))).thenAnswer(inv -> inv.getArgument(0));
+
+        AuthTokenResponse freshLogin = authService.login(
+            new LoginRequest("manager.hr@documind.ai", "OldPass@2026!"),
+            "Agent/1",
+            "203.0.113.11"
+        );
+        assertThat(freshLogin.user().departmentId()).isEqualTo(itDeptId);
+        assertThat(freshLogin.user().role()).isEqualTo(Role.STANDARD_EMPLOYEE);
+        var claims = jwtService.parseAndValidateAccessToken(freshLogin.accessToken());
+        assertThat(claims.departmentId()).isEqualTo(itDeptId);
+        assertThat(claims.role()).isEqualTo(Role.STANDARD_EMPLOYEE);
     }
 
     @Test
@@ -200,6 +269,8 @@ class AuthServiceTest {
         existing.setTokenHash(oldHash);
         existing.setExpiresAt(OffsetDateTime.ofInstant(FIXED_NOW.plus(Duration.ofDays(2)), ZoneOffset.UTC));
 
+        when(refreshTokenRepository.findByTokenHash(oldHash)).thenReturn(Optional.of(existing));
+        when(userRepository.lockUserByIdForUpdate(USER_ID)).thenReturn(Optional.of(USER_ID));
         when(refreshTokenRepository.findByTokenHashForUpdate(oldHash)).thenReturn(Optional.of(existing));
         when(userRepository.findWithDepartmentById(USER_ID)).thenReturn(Optional.of(user));
         when(refreshTokenRepository.save(any(RefreshTokenEntity.class))).thenAnswer(inv -> inv.getArgument(0));
@@ -211,13 +282,17 @@ class AuthServiceTest {
         assertThat(existing.getRevokedAt()).isEqualTo(OffsetDateTime.ofInstant(FIXED_NOW, ZoneOffset.UTC));
         assertThat(existing.getReplacedByHash()).isEqualTo(newHash);
 
+        InOrder lockOrder = inOrder(userRepository, refreshTokenRepository);
+        lockOrder.verify(userRepository).lockUserByIdForUpdate(USER_ID);
+        lockOrder.verify(refreshTokenRepository).findByTokenHashForUpdate(oldHash);
+
         ArgumentCaptor<RefreshTokenEntity> savedCaptor = ArgumentCaptor.forClass(RefreshTokenEntity.class);
         verify(refreshTokenRepository).save(savedCaptor.capture());
         assertThat(savedCaptor.getValue().getTokenHash()).isEqualTo(newHash);
     }
 
     @Test
-    void refreshDetectsTokenReuseAndCommitsEmergencyRevocationInSingleTransaction() {
+    void refreshDetectsTokenReuseCommitsDbRevocationAndRevokesAllIssuedAccessTokens() {
         UserEntity user = buildUser(USER_ID, HR_DEPT_ID, "manager.hr@documind.ai", "DocuMind@2026!", Role.DEPARTMENT_MANAGER, true);
         String replayedRaw = RefreshTokenHasher.generateOpaqueToken();
         String replayedHash = RefreshTokenHasher.sha256Hex(replayedRaw);
@@ -230,6 +305,8 @@ class AuthServiceTest {
         rotatedAlready.setRevokedAt(OffsetDateTime.ofInstant(FIXED_NOW.minusSeconds(30), ZoneOffset.UTC));
         rotatedAlready.setReplacedByHash("f".repeat(64));
 
+        when(refreshTokenRepository.findByTokenHash(replayedHash)).thenReturn(Optional.of(rotatedAlready));
+        when(userRepository.lockUserByIdForUpdate(USER_ID)).thenReturn(Optional.of(USER_ID));
         when(refreshTokenRepository.findByTokenHashForUpdate(replayedHash)).thenReturn(Optional.of(rotatedAlready));
         when(refreshTokenRepository.revokeAllActiveByUserId(eq(USER_ID), any(OffsetDateTime.class))).thenReturn(1);
 
@@ -239,6 +316,7 @@ class AuthServiceTest {
                 .isEqualTo(InvalidTokenException.CODE_REFRESH_TOKEN_REUSED));
 
         verify(refreshTokenRepository).revokeAllActiveByUserId(eq(USER_ID), any(OffsetDateTime.class));
+        verify(tokenBlacklistService).revokeAllUserTokens(USER_ID, Duration.ofMinutes(15));
         assertThat(transactionManager.propagationBehaviors)
             .containsExactly(TransactionDefinition.PROPAGATION_REQUIRED);
         assertThat(transactionManager.commitCount).isEqualTo(1);
@@ -249,6 +327,8 @@ class AuthServiceTest {
         UserEntity user = buildUser(USER_ID, HR_DEPT_ID, "u@documind.ai", "DocuMind@2026!", Role.STANDARD_EMPLOYEE, true);
 
         String missingRaw = "missing-token";
+        when(refreshTokenRepository.findByTokenHash(RefreshTokenHasher.sha256Hex(missingRaw)))
+            .thenReturn(Optional.empty());
         when(refreshTokenRepository.findByTokenHashForUpdate(RefreshTokenHasher.sha256Hex(missingRaw)))
             .thenReturn(Optional.empty());
         assertInvalidTokenCode(() -> authService.refresh(new RefreshTokenRequest(missingRaw), null, null),
@@ -260,6 +340,7 @@ class AuthServiceTest {
         loggedOut.setTokenHash(RefreshTokenHasher.sha256Hex(loggedOutRaw));
         loggedOut.setExpiresAt(OffsetDateTime.ofInstant(FIXED_NOW.plusSeconds(300), ZoneOffset.UTC));
         loggedOut.setRevokedAt(OffsetDateTime.ofInstant(FIXED_NOW.minusSeconds(10), ZoneOffset.UTC));
+        when(refreshTokenRepository.findByTokenHash(loggedOut.getTokenHash())).thenReturn(Optional.of(loggedOut));
         when(refreshTokenRepository.findByTokenHashForUpdate(loggedOut.getTokenHash())).thenReturn(Optional.of(loggedOut));
         assertInvalidTokenCode(() -> authService.refresh(new RefreshTokenRequest(loggedOutRaw), null, null),
             InvalidTokenException.CODE_TOKEN_REVOKED);
@@ -269,6 +350,7 @@ class AuthServiceTest {
         expired.setUser(user);
         expired.setTokenHash(RefreshTokenHasher.sha256Hex(expiredRaw));
         expired.setExpiresAt(OffsetDateTime.ofInstant(FIXED_NOW, ZoneOffset.UTC));
+        when(refreshTokenRepository.findByTokenHash(expired.getTokenHash())).thenReturn(Optional.of(expired));
         when(refreshTokenRepository.findByTokenHashForUpdate(expired.getTokenHash())).thenReturn(Optional.of(expired));
         assertInvalidTokenCode(() -> authService.refresh(new RefreshTokenRequest(expiredRaw), null, null),
             InvalidTokenException.CODE_TOKEN_EXPIRED);
@@ -281,6 +363,8 @@ class AuthServiceTest {
         validTokenForDisabledUser.setUser(disabledUser);
         validTokenForDisabledUser.setTokenHash(RefreshTokenHasher.sha256Hex(disabledRaw));
         validTokenForDisabledUser.setExpiresAt(OffsetDateTime.ofInstant(FIXED_NOW.plusSeconds(600), ZoneOffset.UTC));
+        when(refreshTokenRepository.findByTokenHash(validTokenForDisabledUser.getTokenHash()))
+            .thenReturn(Optional.of(validTokenForDisabledUser));
         when(refreshTokenRepository.findByTokenHashForUpdate(validTokenForDisabledUser.getTokenHash()))
             .thenReturn(Optional.of(validTokenForDisabledUser));
         when(userRepository.findWithDepartmentById(USER_ID)).thenReturn(Optional.of(disabledUser));

@@ -36,6 +36,12 @@ public interface UserRepository extends JpaRepository<UserEntity, UUID>, JpaSpec
     boolean existsByDepartmentId(UUID departmentId);
 
     @Query(
+        value = "SELECT id FROM users WHERE id = :id FOR UPDATE",
+        nativeQuery = true
+    )
+    Optional<UUID> lockUserByIdForUpdate(@Param("id") UUID id);
+
+    @Query(
         value = "SELECT id FROM users WHERE role = 'SYSTEM_ADMIN' AND is_active = TRUE ORDER BY id ASC FOR UPDATE",
         nativeQuery = true
     )

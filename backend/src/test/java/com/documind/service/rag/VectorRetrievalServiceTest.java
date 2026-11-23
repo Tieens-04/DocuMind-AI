@@ -9,13 +9,13 @@ import com.documind.domain.enums.Role;
 import com.documind.domain.model.CitationPayload;
 import com.documind.exception.AuthenticationRequiredException;
 import com.documind.exception.DocumentAccessDeniedException;
-import com.documind.exception.DocumentStorageException;
 import com.documind.exception.InvalidChatRequestException;
 import com.documind.infrastructure.security.CustomUserDetails;
-import com.documind.infrastructure.storage.MinioStorageService;
+import com.documind.infrastructure.security.DocumentPreviewTokenService;
 import com.documind.repository.DocumentRepository;
 import com.documind.service.document.CallerContext;
 import com.documind.service.ingestion.ChunkMetadataKeys;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -34,10 +34,10 @@ import org.springframework.security.authentication.UsernamePasswordAuthenticatio
 import org.springframework.security.core.context.SecurityContextHolder;
 
 import java.lang.reflect.Method;
-import java.net.URI;
-import java.net.URL;
 import java.text.Normalizer;
 import java.time.Instant;
+import java.time.OffsetDateTime;
+import java.time.ZoneOffset;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -65,7 +65,7 @@ class VectorRetrievalServiceTest {
 
     private VectorStore vectorStore;
     private DocumentRepository documentRepository;
-    private MinioStorageService minioStorageService;
+    private DocumentPreviewTokenService previewTokenService;
     private RbacVectorFilterFactory rbacVectorFilterFactory;
     private RagProperties properties;
     private VectorRetrievalService retrievalService;
@@ -75,7 +75,7 @@ class VectorRetrievalServiceTest {
         SecurityContextHolder.clearContext();
         vectorStore = mock(VectorStore.class);
         documentRepository = mock(DocumentRepository.class);
-        minioStorageService = mock(MinioStorageService.class);
+        previewTokenService = mock(DocumentPreviewTokenService.class);
         MockEnvironment env = new MockEnvironment();
         env.setActiveProfiles("dev");
         env.setProperty("documind.security.dev-caller-fallback.enabled", "false");
@@ -84,7 +84,7 @@ class VectorRetrievalServiceTest {
         retrievalService = new VectorRetrievalService(
             providerOf(vectorStore),
             providerOf(documentRepository),
-            minioStorageService,
+            previewTokenService,
             rbacVectorFilterFactory,
             properties
         );
@@ -197,7 +197,7 @@ class VectorRetrievalServiceTest {
             HR_DEPT_ID
         )).isInstanceOf(DocumentAccessDeniedException.class);
 
-        verifyNoInteractions(vectorStore, documentRepository, minioStorageService);
+        verifyNoInteractions(vectorStore, documentRepository, previewTokenService);
     }
 
     @Test
@@ -242,12 +242,13 @@ class VectorRetrievalServiceTest {
         when(documentRepository.findAllById(anyIterable()))
             .thenReturn(List.of(validPdfEntity, processingEntity, staleEntity, publicMdEntity));
 
-        URL pdfSignedUrl = URI.create("http://localhost:9000/documind-documents/hr-handbook.pdf?X-Amz-Signature=abc").toURL();
-        URL mdSignedUrl = URI.create("http://localhost:9000/documind-documents/remote-policy.md?X-Amz-Signature=xyz").toURL();
-        when(minioStorageService.generatePresignedGetUrl("departments/hr/1/v2/hr-handbook.pdf", "hr-handbook.pdf"))
-            .thenReturn(pdfSignedUrl);
-        when(minioStorageService.generatePresignedGetUrl("departments/it/5/v1/remote-policy.md", "remote-policy.md"))
-            .thenReturn(mdSignedUrl);
+        String pdfSignedUrl = "http://localhost:8081/api/v1/documents/" + validPdfId + "/content?token=tok-pdf";
+        String mdSignedUrl = "http://localhost:8081/api/v1/documents/" + publicMdId + "/content?token=tok-md";
+        OffsetDateTime exp = OffsetDateTime.now(ZoneOffset.UTC).plusMinutes(15);
+        when(previewTokenService.issuePreviewUrl(validPdfId, 2, hrEmployee))
+            .thenReturn(new DocumentPreviewTokenService.IssuedPreviewUrl(pdfSignedUrl, "tok-pdf", exp));
+        when(previewTokenService.issuePreviewUrl(publicMdId, 1, hrEmployee))
+            .thenReturn(new DocumentPreviewTokenService.IssuedPreviewUrl(mdSignedUrl, "tok-md", exp));
 
         String nfdQuestion = Normalizer.normalize("  Quy định nghỉ phép năm?  ", Normalizer.Form.NFD);
         List<RetrievedChunk> results = retrievalService.retrieve(nfdQuestion, hrEmployee);
@@ -268,6 +269,7 @@ class VectorRetrievalServiceTest {
         assertThat(first.documentId()).isEqualTo(validPdfId);
         assertThat(first.departmentId()).isEqualTo(HR_DEPT_ID);
         assertThat(first.accessLevel()).isEqualTo(AccessLevel.DEPARTMENT);
+        assertThat(first.citation().docVersion()).isEqualTo(2);
         assertThat(first.citation().fileName()).isEqualTo("hr-handbook.pdf");
         assertThat(first.citation().pageNumber()).isEqualTo(3);
         assertThat(first.citation().similarityScore()).isEqualTo(0.91d);
@@ -280,10 +282,10 @@ class VectorRetrievalServiceTest {
         assertThat(second.citation().fileName()).isEqualTo("remote-policy.md");
         assertThat(second.citation().pageNumber()).isNull();
         assertThat(second.citation().sectionHeading()).isEqualTo("Hybrid Policy");
-        assertThat(second.citation().presignedUrl()).isEqualTo(mdSignedUrl.toString());
+        assertThat(second.citation().presignedUrl()).isEqualTo(mdSignedUrl);
 
-        verify(minioStorageService, times(1)).generatePresignedGetUrl("departments/hr/1/v2/hr-handbook.pdf", "hr-handbook.pdf");
-        verify(minioStorageService, times(1)).generatePresignedGetUrl("departments/it/5/v1/remote-policy.md", "remote-policy.md");
+        verify(previewTokenService, times(1)).issuePreviewUrl(validPdfId, 2, hrEmployee);
+        verify(previewTokenService, times(1)).issuePreviewUrl(publicMdId, 1, hrEmployee);
     }
 
     @Test
@@ -412,7 +414,7 @@ class VectorRetrievalServiceTest {
         List<RetrievedChunk> results = retrievalService.retrieve("Chính sách nội bộ?", salesEmployee);
 
         assertThat(results).isEmpty();
-        verifyNoInteractions(documentRepository, minioStorageService);
+        verifyNoInteractions(documentRepository, previewTokenService);
     }
 
     @Test
@@ -475,7 +477,7 @@ class VectorRetrievalServiceTest {
             .isInstanceOf(InvalidChatRequestException.class);
         assertThatThrownBy(() -> retrievalService.retrieve("Câu hỏi\0độc hại", hrEmployee))
             .isInstanceOf(InvalidChatRequestException.class);
-        verifyNoInteractions(vectorStore, documentRepository, minioStorageService);
+        verifyNoInteractions(vectorStore, documentRepository, previewTokenService);
     }
 
     @Test
@@ -487,7 +489,7 @@ class VectorRetrievalServiceTest {
         VectorRetrievalService customService = new VectorRetrievalService(
             providerOf(vectorStore),
             providerOf(documentRepository),
-            minioStorageService,
+            previewTokenService,
             rbacVectorFilterFactory,
             customProps
         );
@@ -506,9 +508,9 @@ class VectorRetrievalServiceTest {
             docEntity(doc2Id, IT_DEPT_ID, AccessLevel.PUBLIC, DocumentStatus.COMPLETED, 1, "guide.pdf", "departments/it/2/v1/guide.pdf")
         ));
 
-        URL doc1Url = URI.create("http://localhost:9000/documind-documents/policy.pdf?sig=1").toURL();
-        when(minioStorageService.generatePresignedGetUrl("departments/hr/1/v1/policy.pdf", "policy.pdf"))
-            .thenReturn(doc1Url);
+        String doc1Url = "http://localhost:8081/api/v1/documents/" + doc1Id + "/content?token=sig1";
+        when(previewTokenService.issuePreviewUrl(doc1Id, 1, manager))
+            .thenReturn(new DocumentPreviewTokenService.IssuedPreviewUrl(doc1Url, "sig1", OffsetDateTime.now(ZoneOffset.UTC).plusMinutes(15)));
 
         List<RetrievedChunk> hits = customService.retrieve("Quy định nghỉ phép", manager);
 
@@ -517,7 +519,7 @@ class VectorRetrievalServiceTest {
         assertThat(hits.get(0).citation().presignedUrl()).isEqualTo(doc1Url + "#page=2");
         assertThat(hits.get(1).citation().pageNumber()).isEqualTo(5);
         assertThat(hits.get(1).citation().presignedUrl()).isEqualTo(doc1Url + "#page=5");
-        verify(minioStorageService, times(1)).generatePresignedGetUrl(anyString(), anyString());
+        verify(previewTokenService, times(1)).issuePreviewUrl(any(), org.mockito.ArgumentMatchers.anyInt(), any());
     }
 
     @Test
@@ -529,7 +531,7 @@ class VectorRetrievalServiceTest {
         VectorRetrievalService service = new VectorRetrievalService(
             providerOf(vectorStore),
             providerOf(documentRepository),
-            minioStorageService,
+            previewTokenService,
             rbacVectorFilterFactory,
             shortExcerptProps
         );
@@ -544,8 +546,8 @@ class VectorRetrievalServiceTest {
         when(documentRepository.findAllById(anyIterable())).thenReturn(List.of(
             docEntity(docId, HR_DEPT_ID, AccessLevel.DEPARTMENT, DocumentStatus.COMPLETED, 1, "bonus.pdf", "departments/hr/9/v1/bonus.pdf")
         ));
-        when(minioStorageService.generatePresignedGetUrl(anyString(), anyString()))
-            .thenThrow(new DocumentStorageException("MinIO timeout", new RuntimeException("S3 timeout")));
+        when(previewTokenService.issuePreviewUrl(any(), org.mockito.ArgumentMatchers.anyInt(), any()))
+            .thenThrow(new IllegalStateException("Token service unavailable"));
 
         List<RetrievedChunk> results = service.retrieve("Thưởng hiệu suất", manager);
         assertThat(results).hasSize(1);
@@ -582,10 +584,28 @@ class VectorRetrievalServiceTest {
             "Nhân viên được nghỉ 12 ngày phép."
         ));
         assertThat(payload.sectionHeading()).isEqualTo("Chương 2 > Điều 5");
-        String json = new com.fasterxml.jackson.databind.ObjectMapper().writeValueAsString(payload);
+        ObjectMapper mapper = new com.fasterxml.jackson.databind.ObjectMapper();
+        String json = mapper.writeValueAsString(payload);
         assertThat(json)
             .contains("\"sectionHeading\":\"Chương 2 > Điều 5\"")
             .doesNotContain("presignedUrl");
+
+        // Versioned round-trip & legacy JSON without docVersion deserialization
+        CitationDto versionedDto = new CitationDto(
+            docId, 3, "handbook.docx", null, "Chương 2 > Điều 5", 0.9123d, "Trích đoạn v3.", "http://localhost:8081/content"
+        );
+        CitationPayload versionedPayload = versionedDto.toCitationPayload();
+        assertThat(versionedPayload.docVersion()).isEqualTo(3);
+        String versionedJson = mapper.writeValueAsString(versionedPayload);
+        assertThat(versionedJson).contains("\"docVersion\":3");
+        assertThat(mapper.readValue(versionedJson, CitationPayload.class)).isEqualTo(versionedPayload);
+
+        String legacyJsonWithoutVersion = """
+            {"documentId":"%s","fileName":"old.pdf","pageNumber":2,"similarityScore":0.85,"excerpt":"Old text"}
+            """.formatted(docId);
+        CitationPayload legacyParsed = mapper.readValue(legacyJsonWithoutVersion, CitationPayload.class);
+        assertThat(legacyParsed.documentId()).isEqualTo(docId);
+        assertThat(legacyParsed.docVersion()).isNull();
     }
 
     private static void setJwtPrincipal(UUID userId, UUID departmentId, Role role) {

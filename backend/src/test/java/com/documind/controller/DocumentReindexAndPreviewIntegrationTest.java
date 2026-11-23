@@ -633,6 +633,136 @@ class DocumentReindexAndPreviewIntegrationTest {
         }
     }
 
+    @Test
+    void alreadyIssuedPreviewAndCitationUrlsLoseReadAccessImmediatelyOnAclTighteningAndUserTransfer() throws Exception {
+        String adminToken = login(ADMIN_EMAIL).accessToken();
+        String hrManagerToken = login(HR_MANAGER_EMAIL).accessToken();
+        String hrEmployeeToken = login(HR_EMPLOYEE_EMAIL).accessToken();
+        String salesEmployeeToken = login(SALES_EMPLOYEE_EMAIL).accessToken();
+
+        byte[] policyPdf = SampleEnterpriseCorpusFactory.createMultiPagePdf(List.of(
+            List.of("Trang bìa văn bản hành chính nội bộ."),
+            List.of("Quy chế nghỉ phép năm toàn công ty: nhân viên chính thức được hưởng 12 ngày phép năm cơ bản. ACL_INSTANT_REVOKE_MARKER")
+        ));
+        DocumentResponse doc = uploadAndAwaitCompleted(
+            "hr-leave-acl.pdf",
+            "application/pdf",
+            policyPdf,
+            AccessLevel.PUBLIC,
+            null,
+            hrManagerToken
+        );
+
+        // 1. Issue preview URLs to Sales Employee, HR Employee, and HR Manager while document is PUBLIC
+        DocumentPreviewUrlResponse salesPreview = objectMapper.readValue(
+            sendGet("/api/v1/documents/" + doc.id() + "/preview-url?page=2", salesEmployeeToken).body(),
+            DocumentPreviewUrlResponse.class
+        );
+        DocumentPreviewUrlResponse hrEmpPreview = objectMapper.readValue(
+            sendGet("/api/v1/documents/" + doc.id() + "/preview-url?page=2", hrEmployeeToken).body(),
+            DocumentPreviewUrlResponse.class
+        );
+        DocumentPreviewUrlResponse hrMgrPreview = objectMapper.readValue(
+            sendGet("/api/v1/documents/" + doc.id() + "/preview-url?page=2", hrManagerToken).body(),
+            DocumentPreviewUrlResponse.class
+        );
+        URI salesPreviewFetchUri = URI.create(salesPreview.previewUrl().substring(0, salesPreview.previewUrl().indexOf("#page=")));
+        URI hrEmpPreviewFetchUri = URI.create(hrEmpPreview.previewUrl().substring(0, hrEmpPreview.previewUrl().indexOf("#page=")));
+        URI hrMgrPreviewFetchUri = URI.create(hrMgrPreview.previewUrl().substring(0, hrMgrPreview.previewUrl().indexOf("#page=")));
+
+        // Also issue a RAG citation URL to Sales Employee via /api/v1/chat/ask while PUBLIC
+        ChatAskResponse salesAsk = askQuestion("Chính sách nghỉ phép năm được bao nhiêu ngày?", salesEmployeeToken);
+        assertThat(salesAsk.citations()).isNotEmpty();
+        String rawCitationUrl = salesAsk.citations().getFirst().presignedUrl();
+        URI salesCitationFetchUri = URI.create(rawCitationUrl.substring(0, rawCitationUrl.indexOf("#page=")));
+
+        // All issued URLs work while PUBLIC (200 OK + exact bytes + inline Content-Disposition + no-store Cache-Control)
+        HttpResponse<byte[]> initialSalesFetch = httpClient.send(
+            HttpRequest.newBuilder(salesPreviewFetchUri).GET().timeout(Duration.ofSeconds(10)).build(),
+            HttpResponse.BodyHandlers.ofByteArray()
+        );
+        assertThat(initialSalesFetch.statusCode()).isEqualTo(200);
+        assertThat(initialSalesFetch.body()).isEqualTo(policyPdf);
+        assertThat(initialSalesFetch.headers().firstValue("Cache-Control").orElse("")).contains("no-store");
+        assertThat(httpClient.send(
+            HttpRequest.newBuilder(salesCitationFetchUri).GET().timeout(Duration.ofSeconds(10)).build(),
+            HttpResponse.BodyHandlers.ofByteArray()
+        ).statusCode()).isEqualTo(200);
+
+        // Supports HTTP Range requests for PDF viewers (206 Partial Content)
+        HttpResponse<byte[]> rangeFetch = httpClient.send(
+            HttpRequest.newBuilder(hrMgrPreviewFetchUri)
+                .header("Range", "bytes=0-4")
+                .GET()
+                .timeout(Duration.ofSeconds(10))
+                .build(),
+            HttpResponse.BodyHandlers.ofByteArray()
+        );
+        assertThat(rangeFetch.statusCode()).isEqualTo(206);
+        assertThat(new String(rangeFetch.body(), StandardCharsets.US_ASCII)).isEqualTo("%PDF-");
+
+        // 2. Tighten ACL from PUBLIC -> DEPARTMENT (HR): Sales Employee's ALREADY-ISSUED preview & citation URLs immediately lose read access (403)!
+        HttpResponse<String> patchToDept = httpClient.send(
+            HttpRequest.newBuilder(uri("/api/v1/documents/" + doc.id()))
+                .header(HttpHeaders.AUTHORIZATION, "Bearer " + hrManagerToken)
+                .header(HttpHeaders.CONTENT_TYPE, MediaType.APPLICATION_JSON_VALUE)
+                .method("PATCH", HttpRequest.BodyPublishers.ofString("{\"accessLevel\":\"DEPARTMENT\"}", StandardCharsets.UTF_8))
+                .build(),
+            HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8)
+        );
+        assertThat(patchToDept.statusCode()).isEqualTo(200);
+
+        assertThat(httpClient.send(
+            HttpRequest.newBuilder(salesPreviewFetchUri).GET().timeout(Duration.ofSeconds(10)).build(),
+            HttpResponse.BodyHandlers.ofByteArray()
+        ).statusCode()).isEqualTo(403);
+        assertThat(httpClient.send(
+            HttpRequest.newBuilder(salesCitationFetchUri).GET().timeout(Duration.ofSeconds(10)).build(),
+            HttpResponse.BodyHandlers.ofByteArray()
+        ).statusCode()).isEqualTo(403);
+        // HR Employee & HR Manager still have DEPARTMENT access in HR -> 200 OK
+        assertThat(httpClient.send(
+            HttpRequest.newBuilder(hrEmpPreviewFetchUri).GET().timeout(Duration.ofSeconds(10)).build(),
+            HttpResponse.BodyHandlers.ofByteArray()
+        ).statusCode()).isEqualTo(200);
+
+        // 3. Tighten ACL from DEPARTMENT -> CONFIDENTIAL: HR Employee's ALREADY-ISSUED URL immediately loses read access (403), while HR Manager retains 200!
+        HttpResponse<String> patchToConf = httpClient.send(
+            HttpRequest.newBuilder(uri("/api/v1/documents/" + doc.id()))
+                .header(HttpHeaders.AUTHORIZATION, "Bearer " + hrManagerToken)
+                .header(HttpHeaders.CONTENT_TYPE, MediaType.APPLICATION_JSON_VALUE)
+                .method("PATCH", HttpRequest.BodyPublishers.ofString("{\"accessLevel\":\"CONFIDENTIAL\"}", StandardCharsets.UTF_8))
+                .build(),
+            HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8)
+        );
+        assertThat(patchToConf.statusCode()).isEqualTo(200);
+
+        assertThat(httpClient.send(
+            HttpRequest.newBuilder(hrEmpPreviewFetchUri).GET().timeout(Duration.ofSeconds(10)).build(),
+            HttpResponse.BodyHandlers.ofByteArray()
+        ).statusCode()).isEqualTo(403);
+        assertThat(httpClient.send(
+            HttpRequest.newBuilder(hrMgrPreviewFetchUri).GET().timeout(Duration.ofSeconds(10)).build(),
+            HttpResponse.BodyHandlers.ofByteArray()
+        ).statusCode()).isEqualTo(200);
+
+        // 4. Transfer document ownership from HR -> IT: HR Manager's ALREADY-ISSUED URL immediately loses read access (403)!
+        HttpResponse<String> patchTransferDept = httpClient.send(
+            HttpRequest.newBuilder(uri("/api/v1/documents/" + doc.id()))
+                .header(HttpHeaders.AUTHORIZATION, "Bearer " + adminToken)
+                .header(HttpHeaders.CONTENT_TYPE, MediaType.APPLICATION_JSON_VALUE)
+                .method("PATCH", HttpRequest.BodyPublishers.ofString("{\"departmentId\":\"" + IT_DEPT_ID + "\"}", StandardCharsets.UTF_8))
+                .build(),
+            HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8)
+        );
+        assertThat(patchTransferDept.statusCode()).isEqualTo(200);
+
+        assertThat(httpClient.send(
+            HttpRequest.newBuilder(hrMgrPreviewFetchUri).GET().timeout(Duration.ofSeconds(10)).build(),
+            HttpResponse.BodyHandlers.ofByteArray()
+        ).statusCode()).isEqualTo(403);
+    }
+
     private SeededFixture seedFixtureForKey(String targetDocKey, String ownerToken) throws Exception {
         return switch (targetDocKey) {
             case "hr-public" -> {

@@ -19,11 +19,10 @@ import com.documind.domain.enums.Role;
 import com.documind.domain.model.CitationPayload;
 import com.documind.exception.AuthenticationRequiredException;
 import com.documind.exception.DocumentAccessDeniedException;
-import com.documind.exception.DocumentStorageException;
 import com.documind.exception.InvalidChatRequestException;
 import com.documind.exception.ResourceNotFoundException;
 import com.documind.infrastructure.security.CustomUserDetails;
-import com.documind.infrastructure.storage.MinioStorageService;
+import com.documind.infrastructure.security.DocumentPreviewTokenService;
 import com.documind.repository.AuditLogRepository;
 import com.documind.repository.ChatMessageRepository;
 import com.documind.repository.ChatSessionRepository;
@@ -92,7 +91,7 @@ class ChatSessionServiceTest {
     private DepartmentRepository departmentRepository;
     private DocumentRepository documentRepository;
     private AuditLogRepository auditLogRepository;
-    private MinioStorageService minioStorageService;
+    private DocumentPreviewTokenService previewTokenService;
     private RbacVectorFilterFactory rbacVectorFilterFactory;
     private TransactionTemplate transactionTemplate;
     private MockEnvironment environment;
@@ -107,7 +106,7 @@ class ChatSessionServiceTest {
         departmentRepository = mock(DepartmentRepository.class);
         documentRepository = mock(DocumentRepository.class);
         auditLogRepository = mock(AuditLogRepository.class);
-        minioStorageService = mock(MinioStorageService.class);
+        previewTokenService = mock(DocumentPreviewTokenService.class);
         environment = new MockEnvironment();
         environment.setActiveProfiles("dev");
         environment.setProperty("documind.security.dev-caller-fallback.enabled", "false");
@@ -152,7 +151,7 @@ class ChatSessionServiceTest {
             providerOf(departmentRepository),
             providerOf(documentRepository),
             providerOf(auditLogRepository),
-            minioStorageService,
+            previewTokenService,
             rbacVectorFilterFactory,
             providerOf(transactionTemplate),
             RagProperties.defaults()
@@ -274,9 +273,9 @@ class ChatSessionServiceTest {
         authorizedAssistantMsg.setContent("Nhân viên được 14 ngày phép.");
         authorizedAssistantMsg.setRewrittenQuery("Chính sách nghỉ phép công ty?");
         authorizedAssistantMsg.setCitations(List.of(
-            new CitationPayload(allowedDocId, "hr-handbook-old.pdf", 3, null, 0.91d, "Đoạn trích hợp lệ trang 3."),
-            new CitationPayload(allowedDocId, "hr-handbook-old.pdf", 4, null, 0.85d, "Đoạn trích hợp lệ trang 4."),
-            new CitationPayload(storageErrorDocId, "public-guide.md", null, "Tổng quan", 0.77d, "Hướng dẫn chung.")
+            new CitationPayload(allowedDocId, 1, "hr-handbook-old.pdf", 3, null, 0.91d, "Đoạn trích hợp lệ trang 3."),
+            new CitationPayload(allowedDocId, 1, "hr-handbook-old.pdf", 4, null, 0.85d, "Đoạn trích hợp lệ trang 4."),
+            new CitationPayload(storageErrorDocId, 1, "public-guide.md", null, "Tổng quan", 0.77d, "Hướng dẫn chung.")
         ));
         authorizedAssistantMsg.setCreatedAt(OffsetDateTime.of(2026, 11, 21, 10, 0, 1, 0, ZoneOffset.UTC));
 
@@ -287,10 +286,11 @@ class ChatSessionServiceTest {
         revokedAssistantMsg.setContent("Trần lương bí mật là 100 triệu.");
         revokedAssistantMsg.setRewrittenQuery("Trần lương bí mật M3?");
         revokedAssistantMsg.setCitations(List.of(
-            new CitationPayload(revokedConfidentialDocId, "hr-salary.pdf", 1, null, 0.88d, "Lương bí mật 100 triệu."),
-            new CitationPayload(crossDeptDocId, "sales-bonus.pdf", 2, null, 0.84d, "Thưởng phòng Sales."),
-            new CitationPayload(processingDocId, "hr-draft.pdf", 1, null, 0.81d, "Bản nháp chưa hoàn tất."),
-            new CitationPayload(deletedDocId, "deleted-memo.pdf", 2, null, 0.79d, "Thông báo cũ đã xóa.")
+            new CitationPayload(revokedConfidentialDocId, 1, "hr-salary.pdf", 1, "Mục lương mật", 0.88d, "Lương bí mật 100 triệu."),
+            new CitationPayload(crossDeptDocId, 1, "sales-bonus.pdf", 2, "Thưởng kinh doanh", 0.84d, "Thưởng phòng Sales."),
+            new CitationPayload(processingDocId, 1, "hr-draft.pdf", 1, null, 0.81d, "Bản nháp chưa hoàn tất."),
+            new CitationPayload(deletedDocId, 1, "deleted-memo.pdf", 2, null, 0.79d, "Thông báo cũ đã xóa."),
+            new CitationPayload(allowedDocId, 1, "hr-handbook-old.pdf", 3, null, 0.91d, "Đoạn trích hợp lệ còn quyền.")
         ));
         revokedAssistantMsg.setCreatedAt(OffsetDateTime.of(2026, 11, 21, 10, 0, 2, 0, ZoneOffset.UTC));
 
@@ -298,53 +298,59 @@ class ChatSessionServiceTest {
             .thenReturn(List.of(userMsg1, authorizedAssistantMsg, revokedAssistantMsg));
         when(documentRepository.findAllById(anyIterable()))
             .thenReturn(List.of(allowedDoc, revokedDoc, crossDeptDoc, processingDoc, storageErrDoc));
-        when(minioStorageService.generatePresignedGetUrl("hr/handbook.pdf", "hr-handbook-v2.pdf"))
-            .thenReturn(URI.create("http://localhost:9000/documind/hr/handbook.pdf?sig=live").toURL());
-        when(minioStorageService.generatePresignedGetUrl("sales/public.md", "public-guide.md"))
-            .thenThrow(new DocumentStorageException("MinIO temporary glitch", new RuntimeException()));
+        String allowedPreviewBase = "http://localhost:8081/api/v1/documents/" + allowedDocId + "/content?token=live";
+        when(previewTokenService.issuePreviewUrl(eq(allowedDocId), eq(1), any(CallerContext.class)))
+            .thenReturn(new DocumentPreviewTokenService.IssuedPreviewUrl(
+                allowedPreviewBase,
+                "live",
+                OffsetDateTime.now(ZoneOffset.UTC).plusMinutes(15)
+            ));
+        when(previewTokenService.issuePreviewUrl(eq(storageErrorDocId), eq(1), any(CallerContext.class)))
+            .thenThrow(new IllegalStateException("Temporary token signing glitch"));
 
         List<ChatMessageResponse> responses = service.listMessages(sessionId, employee);
 
         assertThat(responses).hasSize(3);
         verify(documentRepository, times(1)).findAllById(anyIterable());
-        // Memoized: allowedDoc appeared twice but MinIO presigner invoked only once
-        verify(minioStorageService, times(1)).generatePresignedGetUrl("hr/handbook.pdf", "hr-handbook-v2.pdf");
-        verify(minioStorageService, never()).generatePresignedGetUrl(eq("hr/salary.pdf"), any());
-        verify(minioStorageService, never()).generatePresignedGetUrl(eq("sales/bonus.pdf"), any());
-        verify(minioStorageService, never()).generatePresignedGetUrl(eq("hr/draft.pdf"), any());
+        // Memoized: allowedDoc appeared twice but previewTokenService invoked only once
+        verify(previewTokenService, times(1)).issuePreviewUrl(eq(allowedDocId), eq(1), any(CallerContext.class));
+        verify(previewTokenService, never()).issuePreviewUrl(eq(revokedConfidentialDocId), org.mockito.ArgumentMatchers.anyInt(), any());
+        verify(previewTokenService, never()).issuePreviewUrl(eq(crossDeptDocId), org.mockito.ArgumentMatchers.anyInt(), any());
+        verify(previewTokenService, never()).issuePreviewUrl(eq(processingDocId), org.mockito.ArgumentMatchers.anyInt(), any());
 
-        // Authorized turn preserves assistant prose, rewrittenQuery, and fresh presigned URLs
+        // Authorized turn preserves assistant prose, rewrittenQuery, and fresh preview URLs
         ChatMessageResponse authorizedResponse = responses.get(1);
         assertThat(authorizedResponse.content()).isEqualTo("Nhân viên được 14 ngày phép.");
         assertThat(authorizedResponse.rewrittenQuery()).isEqualTo("Chính sách nghỉ phép công ty?");
         List<CitationDto> authorizedCitations = authorizedResponse.citations();
         assertThat(authorizedCitations).hasSize(3);
         assertThat(authorizedCitations.get(0).fileName()).isEqualTo("hr-handbook-v2.pdf");
-        assertThat(authorizedCitations.get(0).presignedUrl()).isEqualTo("http://localhost:9000/documind/hr/handbook.pdf?sig=live#page=3");
+        assertThat(authorizedCitations.get(0).presignedUrl()).isEqualTo(allowedPreviewBase + "#page=3");
         assertThat(authorizedCitations.get(0).excerpt()).isEqualTo("Đoạn trích hợp lệ trang 3.");
-        assertThat(authorizedCitations.get(1).presignedUrl()).isEqualTo("http://localhost:9000/documind/hr/handbook.pdf?sig=live#page=4");
+        assertThat(authorizedCitations.get(1).presignedUrl()).isEqualTo(allowedPreviewBase + "#page=4");
         // MinIO storage failure -> graceful degradation (presignedUrl=null, excerpt intact for authorized doc)
         assertThat(authorizedCitations.get(2).presignedUrl()).isNull();
         assertThat(authorizedCitations.get(2).excerpt()).isEqualTo("Hướng dẫn chung.");
 
         // Revoked / cross-dept / non-COMPLETED / deleted cited turn fails closed:
-        // redacts assistant content, rewrittenQuery, and ALL restricted/unverifiable excerpts + presignedUrls!
+        // redacts assistant content & rewrittenQuery, strips ALL restricted source metadata, and keeps ONLY still-authorized citation!
         ChatMessageResponse revokedResponse = responses.get(2);
         assertThat(revokedResponse.content()).isEqualTo(ChatSessionService.REDACTED_ASSISTANT_CONTENT);
         assertThat(revokedResponse.rewrittenQuery()).isNull();
-        List<CitationDto> revokedCitations = revokedResponse.citations();
-        assertThat(revokedCitations).hasSize(4);
-        for (CitationDto revokedCitation : revokedCitations) {
-            assertThat(revokedCitation.presignedUrl()).isNull();
-            assertThat(revokedCitation.excerpt()).isEmpty();
-        }
-        assertThat(revokedCitations.get(3).fileName()).isEqualTo("deleted-memo.pdf");
+        List<CitationDto> mixedHydratedCitations = revokedResponse.citations();
+        assertThat(mixedHydratedCitations).hasSize(1);
+        assertThat(mixedHydratedCitations.getFirst().documentId()).isEqualTo(allowedDocId);
+        assertThat(mixedHydratedCitations.getFirst().docVersion()).isEqualTo(1);
+        assertThat(mixedHydratedCitations.getFirst().fileName()).isEqualTo("hr-handbook-v2.pdf");
+        assertThat(mixedHydratedCitations.getFirst().excerpt()).isEqualTo("Đoạn trích hợp lệ còn quyền.");
+        assertThat(mixedHydratedCitations.getFirst().presignedUrl()).isEqualTo(allowedPreviewBase + "#page=3");
     }
 
     @Test
-    void listMessagesOmitsPdfPageFragmentWhenCitedDocumentWasReindexedToNonPdfExtension() throws Exception {
+    void listMessagesAndLoadHistoryFailClosedOnMissingOrSupersededDocVersionWhileHydratingMatchingNonPdf() {
         CallerContext employee = new CallerContext(HR_EMPLOYEE_USER_ID, HR_DEPT_ID, Role.STANDARD_EMPLOYEE, null);
         setJwtPrincipal(employee);
+        RbacVectorScope scope = rbacVectorFilterFactory.resolveScope(employee, null);
 
         UUID sessionId = UUID.randomUUID();
         ChatSessionEntity session = new ChatSessionEntity();
@@ -353,44 +359,98 @@ class ChatSessionServiceTest {
         when(chatSessionRepository.findByIdAndUserId(sessionId, HR_EMPLOYEE_USER_ID))
             .thenReturn(Optional.of(session));
 
-        UUID upgradedDocId = UUID.randomUUID();
-        DocumentEntity upgradedDoc = document(
-            upgradedDocId,
+        UUID reindexedPublicDocId = UUID.randomUUID();
+        DocumentEntity v2PublicDoc = document(
+            reindexedPublicDocId,
             HR_DEPT_ID,
-            AccessLevel.DEPARTMENT,
+            AccessLevel.PUBLIC,
             DocumentStatus.COMPLETED,
             "hr-handbook-v2.docx",
             "hr/handbook-v2.docx"
         );
-        upgradedDoc.setFileExtension("docx");
+        v2PublicDoc.setFileExtension("docx");
+        v2PublicDoc.setCurrentVersion(2);
 
-        ChatMessageEntity assistantMsg = new ChatMessageEntity();
-        assistantMsg.setId(UUID.randomUUID());
-        assistantMsg.setSession(session);
-        assistantMsg.setRole(MessageRole.ASSISTANT);
-        assistantMsg.setContent("Chính sách đã cập nhật.");
-        assistantMsg.setCitations(List.of(
-            new CitationPayload(upgradedDocId, "hr-handbook-v1.pdf", 3, null, 0.90d, "Trích dẫn trang 3.")
+        // 1. Turn citing v1 (before reindex to v2 PUBLIC) -> MUST be redacted in listMessages & excluded from loadAuthorizedHistoryForTurn!
+        ChatMessageEntity v1UserMsg = new ChatMessageEntity();
+        v1UserMsg.setId(UUID.randomUUID());
+        v1UserMsg.setSession(session);
+        v1UserMsg.setRole(MessageRole.USER);
+        v1UserMsg.setContent("Mức thưởng mật ở v1?");
+        v1UserMsg.setCreatedAt(OffsetDateTime.of(2026, 11, 22, 9, 59, 0, 0, ZoneOffset.UTC));
+
+        ChatMessageEntity v1AssistantMsg = new ChatMessageEntity();
+        v1AssistantMsg.setId(UUID.randomUUID());
+        v1AssistantMsg.setSession(session);
+        v1AssistantMsg.setRole(MessageRole.ASSISTANT);
+        v1AssistantMsg.setContent("Nội dung mật từ v1: 500 triệu.");
+        v1AssistantMsg.setCitations(List.of(
+            new CitationPayload(reindexedPublicDocId, 1, "hr-secret-v1.pdf", 3, "Phụ lục mật v1", 0.90d, "Trích dẫn mật v1 trang 3.")
         ));
-        assistantMsg.setCreatedAt(OffsetDateTime.of(2026, 11, 22, 10, 0, 0, 0, ZoneOffset.UTC));
+        v1AssistantMsg.setCreatedAt(OffsetDateTime.of(2026, 11, 22, 10, 0, 0, 0, ZoneOffset.UTC));
+
+        // 2. Legacy turn missing docVersion (null) -> MUST also fail closed!
+        ChatMessageEntity legacyNoVersionMsg = new ChatMessageEntity();
+        legacyNoVersionMsg.setId(UUID.randomUUID());
+        legacyNoVersionMsg.setSession(session);
+        legacyNoVersionMsg.setRole(MessageRole.ASSISTANT);
+        legacyNoVersionMsg.setContent("Nội dung cũ không lưu docVersion.");
+        legacyNoVersionMsg.setCitations(List.of(
+            new CitationPayload(reindexedPublicDocId, null, "hr-legacy.pdf", 2, "Mục cũ", 0.88d, "Trích dẫn cũ thiếu version.")
+        ));
+        legacyNoVersionMsg.setCreatedAt(OffsetDateTime.of(2026, 11, 22, 10, 1, 0, 0, ZoneOffset.UTC));
+
+        // 3. Current v2 non-PDF turn -> authorized, preserves docVersion=2 and omits #page= fragment
+        ChatMessageEntity v2AssistantMsg = new ChatMessageEntity();
+        v2AssistantMsg.setId(UUID.randomUUID());
+        v2AssistantMsg.setSession(session);
+        v2AssistantMsg.setRole(MessageRole.ASSISTANT);
+        v2AssistantMsg.setContent("Chính sách công khai v2.");
+        v2AssistantMsg.setCitations(List.of(
+            new CitationPayload(reindexedPublicDocId, 2, "hr-handbook-v2.docx", 3, "Chương 1", 0.92d, "Trích dẫn v2 hợp lệ.")
+        ));
+        v2AssistantMsg.setCreatedAt(OffsetDateTime.of(2026, 11, 22, 10, 2, 0, 0, ZoneOffset.UTC));
 
         when(chatMessageRepository.findBySessionIdOrderByCreatedAtAscIdAsc(sessionId))
-            .thenReturn(List.of(assistantMsg));
+            .thenReturn(List.of(v1UserMsg, v1AssistantMsg, legacyNoVersionMsg, v2AssistantMsg));
+        when(chatMessageRepository.findBySessionIdOrderByCreatedAtDescIdDesc(eq(sessionId), any(Pageable.class)))
+            .thenReturn(List.of(v2AssistantMsg, legacyNoVersionMsg, v1AssistantMsg, v1UserMsg));
         when(documentRepository.findAllById(anyIterable()))
-            .thenReturn(List.of(upgradedDoc));
-        when(minioStorageService.generatePresignedGetUrl("hr/handbook-v2.docx", "hr-handbook-v2.docx"))
-            .thenReturn(URI.create("http://localhost:9000/documind/hr/handbook-v2.docx?sig=live").toURL());
+            .thenReturn(List.of(v2PublicDoc));
+
+        String upgradedBaseUrl = "http://localhost:8081/api/v1/documents/" + reindexedPublicDocId + "/content?token=live-v2";
+        when(previewTokenService.issuePreviewUrl(eq(reindexedPublicDocId), eq(2), any(CallerContext.class)))
+            .thenReturn(new DocumentPreviewTokenService.IssuedPreviewUrl(
+                upgradedBaseUrl,
+                "live-v2",
+                OffsetDateTime.now(ZoneOffset.UTC).plusMinutes(15)
+            ));
 
         List<ChatMessageResponse> responses = service.listMessages(sessionId, employee);
+        assertThat(responses).hasSize(4);
 
-        assertThat(responses).hasSize(1);
-        assertThat(responses.getFirst().citations()).hasSize(1);
-        CitationDto hydrated = responses.getFirst().citations().getFirst();
+        // v1 turn redacted and restricted/superseded citation metadata completely stripped
+        assertThat(responses.get(1).content()).isEqualTo(ChatSessionService.REDACTED_ASSISTANT_CONTENT);
+        assertThat(responses.get(1).citations()).isEmpty();
+
+        // Legacy missing-docVersion turn redacted and citation stripped
+        assertThat(responses.get(2).content()).isEqualTo(ChatSessionService.REDACTED_ASSISTANT_CONTENT);
+        assertThat(responses.get(2).citations()).isEmpty();
+
+        // Matching v2 non-PDF turn hydrated cleanly without #page=
+        assertThat(responses.get(3).content()).isEqualTo("Chính sách công khai v2.");
+        assertThat(responses.get(3).citations()).hasSize(1);
+        CitationDto hydrated = responses.get(3).citations().getFirst();
+        assertThat(hydrated.docVersion()).isEqualTo(2);
         assertThat(hydrated.fileName()).isEqualTo("hr-handbook-v2.docx");
         assertThat(hydrated.pageNumber()).isNull();
         assertThat(hydrated.presignedUrl())
-            .isEqualTo("http://localhost:9000/documind/hr/handbook-v2.docx?sig=live")
+            .isEqualTo(upgradedBaseUrl)
             .doesNotContain("#page=");
+
+        // Follow-up history loader excludes BOTH v1 pair (v1UserMsg + v1AssistantMsg) AND legacyNoVersionMsg!
+        List<ChatMessageEntity> authorizedHistory = service.loadAuthorizedHistoryForTurn(sessionId, HR_EMPLOYEE_USER_ID, scope);
+        assertThat(authorizedHistory).containsExactly(v2AssistantMsg);
     }
 
     @Test
@@ -457,7 +517,7 @@ class ChatSessionServiceTest {
         olderAssistant.setId(UUID.randomUUID());
         olderAssistant.setRole(MessageRole.ASSISTANT);
         olderAssistant.setContent("14 ngày phép.");
-        olderAssistant.setCitations(List.of(new CitationPayload(allowedDocId, "hr-leave.pdf", 1, null, 0.9d, "14 ngày phép.")));
+        olderAssistant.setCitations(List.of(new CitationPayload(allowedDocId, 1, "hr-leave.pdf", 1, null, 0.9d, "14 ngày phép.")));
         olderAssistant.setCreatedAt(t2);
 
         ChatMessageEntity revokedUser = new ChatMessageEntity();
@@ -659,7 +719,7 @@ class ChatSessionServiceTest {
             null
         ));
         assertThat(customSession.getTitle()).isEqualTo("Tiêu đề tự đặt của tôi");
-        verifyNoInteractions(minioStorageService);
+        verifyNoInteractions(previewTokenService);
     }
 
     @Test

@@ -33,7 +33,10 @@ import jakarta.servlet.http.HttpServletResponse;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.springframework.beans.BeansException;
+import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.config.BeanPostProcessor;
 import org.springframework.boot.autoconfigure.security.SecurityProperties;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.context.TestConfiguration;
@@ -60,6 +63,7 @@ import org.springframework.security.access.prepost.PreAuthorize;
 import org.springframework.security.core.Authentication;
 import org.springframework.security.core.annotation.AuthenticationPrincipal;
 import org.springframework.security.core.context.SecurityContextHolder;
+import org.springframework.security.crypto.password.PasswordEncoder;
 import org.springframework.test.context.ActiveProfiles;
 import org.springframework.util.LinkedMultiValueMap;
 import org.springframework.util.MultiValueMap;
@@ -86,6 +90,7 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.UUID;
 import java.util.concurrent.Callable;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.CyclicBarrier;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -158,9 +163,13 @@ class AuthAndJwtSecurityIntegrationTest {
     @Autowired
     private SseAsyncTestControllerConfig.AsyncDispatchAuditProbe asyncDispatchAuditProbe;
 
+    @Autowired
+    private SseAsyncTestControllerConfig.PasswordMatchPauseProbe passwordMatchPauseProbe;
+
     @BeforeEach
     void setUp() throws InterruptedException {
         asyncDispatchAuditProbe.reset();
+        passwordMatchPauseProbe.reset();
         AbstractIntegrationTest.cleanSharedInfrastructure(
             jdbcTemplate,
             stringRedisTemplate,
@@ -469,6 +478,10 @@ class AuthAndJwtSecurityIntegrationTest {
         assertThat(Objects.requireNonNull(revokedChildResp.getBody()).getProperties())
             .containsEntry("errorCode", "TOKEN_REVOKED");
 
+        // DA-12 Reuse Revocation Contract: previously issued access JWTs (both initial and rotated) are immediately revoked 401
+        assertInvalidBearerEndToEnd("Bearer " + initial.accessToken(), "TOKEN_REVOKED");
+        assertInvalidBearerEndToEnd("Bearer " + rotated.accessToken(), "TOKEN_REVOKED");
+
         // Concurrent Virtual Thread refresh race on the same fresh refresh token
         AuthTokenResponse raceInitial = loginAs(SALES_EMPLOYEE_EMAIL, SEED_DEV_PASSWORD);
         CyclicBarrier barrier = new CyclicBarrier(2);
@@ -752,6 +765,147 @@ class AuthAndJwtSecurityIntegrationTest {
         assertThat(revokedJson.path("errorCode").asText()).isEqualTo("TOKEN_REVOKED");
     }
 
+    @Test
+    void concurrentLoginAndRefreshDuringAdminPasswordResetLeavesZeroValidOldSessions() throws Exception {
+        AuthTokenResponse adminSession = loginAs(ADMIN_EMAIL, SEED_DEV_PASSWORD);
+        HttpHeaders adminHeaders = bearerHeaders(adminSession.accessToken());
+        adminHeaders.setContentType(MediaType.APPLICATION_JSON);
+
+        String targetEmail = "race.reset." + UUID.randomUUID() + "@documind.ai";
+        String oldPassword = "OldPassword@2026!";
+        String newPassword = "NewPassword@2026!";
+        String newerPassword = "NewerPassword@2026!";
+
+        ResponseEntity<JsonNode> createdResp = restTemplate.postForEntity(
+            "/api/v1/admin/users",
+            new HttpEntity<>(
+                Map.of(
+                    "email", targetEmail,
+                    "fullName", "Race Reset User",
+                    "password", oldPassword,
+                    "role", "STANDARD_EMPLOYEE",
+                    "departmentId", AbstractIntegrationTest.HR_DEPT_ID.toString()
+                ),
+                adminHeaders
+            ),
+            JsonNode.class
+        );
+        assertThat(createdResp.getStatusCode()).isEqualTo(HttpStatus.CREATED);
+        UUID targetUserId = UUID.fromString(Objects.requireNonNull(createdResp.getBody()).path("id").asText());
+
+        // 1. Deterministic TOCTOU window reproduction: login matches oldPassword in BCrypt, pauses while admin resets password, then enters DB tx
+        CountDownLatch matchedOldPassword = new CountDownLatch(1);
+        CountDownLatch allowLoginProceed = new CountDownLatch(1);
+        passwordMatchPauseProbe.arm(oldPassword, matchedOldPassword, allowLoginProceed);
+
+        try (ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor()) {
+            Future<ResponseEntity<String>> inFlightOldLogin = executor.submit(() -> restTemplate.postForEntity(
+                "/api/v1/auth/login",
+                Map.of("email", targetEmail, "password", oldPassword),
+                String.class
+            ));
+
+            assertThat(matchedOldPassword.await(5, TimeUnit.SECONDS)).isTrue();
+
+            ResponseEntity<Void> resetResp = restTemplate.exchange(
+                "/api/v1/admin/users/" + targetUserId + "/password",
+                HttpMethod.PUT,
+                new HttpEntity<>(Map.of("newPassword", newPassword), adminHeaders),
+                Void.class
+            );
+            assertThat(resetResp.getStatusCode()).isEqualTo(HttpStatus.NO_CONTENT);
+
+            allowLoginProceed.countDown();
+
+            ResponseEntity<String> oldLoginResult = inFlightOldLogin.get(10, TimeUnit.SECONDS);
+            assertThat(oldLoginResult.getStatusCode()).isEqualTo(HttpStatus.UNAUTHORIZED);
+            assertThat(objectMapper.readTree(oldLoginResult.getBody()).path("errorCode").asText())
+                .isEqualTo("INVALID_CREDENTIALS");
+        } finally {
+            passwordMatchPauseProbe.reset();
+        }
+
+        Integer activeTokensAfterDeterministicRace = jdbcTemplate.queryForObject(
+            "SELECT COUNT(*) FROM refresh_tokens WHERE user_id = ? AND revoked_at IS NULL",
+            Integer.class,
+            targetUserId
+        );
+        assertThat(activeTokensAfterDeterministicRace).isZero();
+
+        // 2. High-concurrency Virtual Thread burst: simultaneous logins (newPassword about to become old) + refresh + resetPassword -> newerPassword
+        AuthTokenResponse preRaceSession = loginAs(targetEmail, newPassword);
+        int loginWorkers = 6;
+        int refreshWorkers = 4;
+        CyclicBarrier burstBarrier = new CyclicBarrier(loginWorkers + refreshWorkers + 1);
+        List<Future<ResponseEntity<String>>> oldAuthFutures = new java.util.ArrayList<>();
+
+        try (ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor()) {
+            for (int i = 0; i < loginWorkers; i++) {
+                oldAuthFutures.add(executor.submit(() -> {
+                    burstBarrier.await(5, TimeUnit.SECONDS);
+                    return restTemplate.postForEntity(
+                        "/api/v1/auth/login",
+                        Map.of("email", targetEmail, "password", newPassword),
+                        String.class
+                    );
+                }));
+            }
+            for (int i = 0; i < refreshWorkers; i++) {
+                oldAuthFutures.add(executor.submit(() -> {
+                    burstBarrier.await(5, TimeUnit.SECONDS);
+                    return restTemplate.postForEntity(
+                        "/api/v1/auth/refresh",
+                        Map.of("refreshToken", preRaceSession.refreshToken()),
+                        String.class
+                    );
+                }));
+            }
+            Future<ResponseEntity<Void>> resetFuture = executor.submit(() -> {
+                burstBarrier.await(5, TimeUnit.SECONDS);
+                return restTemplate.exchange(
+                    "/api/v1/admin/users/" + targetUserId + "/password",
+                    HttpMethod.PUT,
+                    new HttpEntity<>(Map.of("newPassword", newerPassword), adminHeaders),
+                    Void.class
+                );
+            });
+
+            ResponseEntity<Void> burstResetResp = resetFuture.get(15, TimeUnit.SECONDS);
+            assertThat(burstResetResp.getStatusCode()).isEqualTo(HttpStatus.NO_CONTENT);
+
+            List<AuthTokenResponse> transientlyIssuedBeforeReset = new java.util.ArrayList<>();
+            for (Future<ResponseEntity<String>> f : oldAuthFutures) {
+                ResponseEntity<String> r = f.get(15, TimeUnit.SECONDS);
+                assertThat(r.getStatusCode().value()).isIn(200, 401);
+                if (r.getStatusCode().value() == 200) {
+                    transientlyIssuedBeforeReset.add(objectMapper.readValue(r.getBody(), AuthTokenResponse.class));
+                }
+            }
+
+            // After resetPassword completes, ZERO active refresh tokens may remain and EVERY transiently issued token must fail 401!
+            Integer activeAfterBurst = jdbcTemplate.queryForObject(
+                "SELECT COUNT(*) FROM refresh_tokens WHERE user_id = ? AND revoked_at IS NULL",
+                Integer.class,
+                targetUserId
+            );
+            assertThat(activeAfterBurst).isZero();
+
+            for (AuthTokenResponse staleTokens : transientlyIssuedBeforeReset) {
+                assertInvalidBearerEndToEnd("Bearer " + staleTokens.accessToken(), "TOKEN_REVOKED");
+                ResponseEntity<ProblemDetail> staleRefresh = restTemplate.postForEntity(
+                    "/api/v1/auth/refresh",
+                    Map.of("refreshToken", staleTokens.refreshToken()),
+                    ProblemDetail.class
+                );
+                assertThat(staleRefresh.getStatusCode()).isEqualTo(HttpStatus.UNAUTHORIZED);
+            }
+        }
+
+        // Only the final newerPassword can authenticate now
+        AuthTokenResponse freshValidSession = loginAs(targetEmail, newerPassword);
+        assertThat(freshValidSession.accessToken()).isNotBlank();
+    }
+
     private void assertInvalidBearerEndToEnd(String authorizationHeader, String expectedErrorCode) {
         HttpHeaders headers = new HttpHeaders();
         headers.set(HttpHeaders.AUTHORIZATION, authorizationHeader);
@@ -807,6 +961,24 @@ class AuthAndJwtSecurityIntegrationTest {
         @Bean
         AsyncDispatchAuditProbe asyncDispatchAuditProbe() {
             return new AsyncDispatchAuditProbe();
+        }
+
+        @Bean
+        PasswordMatchPauseProbe passwordMatchPauseProbe() {
+            return new PasswordMatchPauseProbe();
+        }
+
+        @Bean
+        static BeanPostProcessor passwordEncoderPauseWrapper(ObjectProvider<PasswordMatchPauseProbe> probeProvider) {
+            return new BeanPostProcessor() {
+                @Override
+                public Object postProcessAfterInitialization(Object bean, String beanName) throws BeansException {
+                    if (bean instanceof PasswordEncoder delegate && !(bean instanceof PausablePasswordEncoder)) {
+                        return new PausablePasswordEncoder(delegate, probeProvider);
+                    }
+                    return bean;
+                }
+            };
         }
 
         @Bean
@@ -879,6 +1051,66 @@ class AuthAndJwtSecurityIntegrationTest {
             @PreAuthorize("hasRole('SYSTEM_ADMIN')")
             public String adminOnly() {
                 return "admin-ok";
+            }
+        }
+
+        static final class PasswordMatchPauseProbe {
+
+            private record Gate(String targetRawPassword, CountDownLatch entered, CountDownLatch proceed) {
+            }
+
+            private final AtomicReference<Gate> activeGate = new AtomicReference<>();
+
+            void arm(String targetRawPassword, CountDownLatch entered, CountDownLatch proceed) {
+                activeGate.set(new Gate(targetRawPassword, entered, proceed));
+            }
+
+            void reset() {
+                Gate prev = activeGate.getAndSet(null);
+                if (prev != null) {
+                    prev.proceed().countDown();
+                }
+            }
+
+            void onPostMatch(CharSequence rawPassword, boolean matched) {
+                if (!matched || rawPassword == null) {
+                    return;
+                }
+                Gate gate = activeGate.get();
+                if (gate != null && gate.targetRawPassword().contentEquals(rawPassword) && activeGate.compareAndSet(gate, null)) {
+                    gate.entered().countDown();
+                    try {
+                        gate.proceed().await(10, TimeUnit.SECONDS);
+                    } catch (InterruptedException ex) {
+                        Thread.currentThread().interrupt();
+                    }
+                }
+            }
+        }
+
+        private static final class PausablePasswordEncoder implements PasswordEncoder {
+
+            private final PasswordEncoder delegate;
+            private final ObjectProvider<PasswordMatchPauseProbe> probeProvider;
+
+            private PausablePasswordEncoder(PasswordEncoder delegate, ObjectProvider<PasswordMatchPauseProbe> probeProvider) {
+                this.delegate = delegate;
+                this.probeProvider = probeProvider;
+            }
+
+            @Override
+            public String encode(CharSequence rawPassword) {
+                return delegate.encode(rawPassword);
+            }
+
+            @Override
+            public boolean matches(CharSequence rawPassword, String encodedPassword) {
+                boolean matched = delegate.matches(rawPassword, encodedPassword);
+                PasswordMatchPauseProbe probe = probeProvider.getIfAvailable();
+                if (probe != null) {
+                    probe.onPostMatch(rawPassword, matched);
+                }
+                return matched;
             }
         }
     }
