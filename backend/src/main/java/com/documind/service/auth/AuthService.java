@@ -144,42 +144,73 @@ public class AuthService {
             throw new InvalidCredentialsException("Invalid email or password");
         }
 
-        UserEntity user = foundUser.get();
-        if (!passwordEncoder.matches(request.password(), user.getPasswordHash())) {
-            recordAuthAudit(user, AuditActionType.AUTH_LOGIN, HttpStatus.UNAUTHORIZED.value(), safeIp, elapsedMillis(startedAtNanos));
+        UserEntity initialUser = foundUser.get();
+        String verifiedPasswordHash = initialUser.getPasswordHash();
+        if (!passwordEncoder.matches(request.password(), verifiedPasswordHash)) {
+            recordAuthAudit(initialUser, AuditActionType.AUTH_LOGIN, HttpStatus.UNAUTHORIZED.value(), safeIp, elapsedMillis(startedAtNanos));
             throw new InvalidCredentialsException("Invalid email or password");
         }
 
-        if (!user.isActive()) {
-            recordAuthAudit(user, AuditActionType.AUTH_LOGIN, HttpStatus.FORBIDDEN.value(), safeIp, elapsedMillis(startedAtNanos));
+        if (!initialUser.isActive()) {
+            recordAuthAudit(initialUser, AuditActionType.AUTH_LOGIN, HttpStatus.FORBIDDEN.value(), safeIp, elapsedMillis(startedAtNanos));
             throw new AccountDisabledException("User account is disabled");
         }
 
-        JwtService.IssuedAccessToken accessToken = jwtService.generateAccessToken(user);
         String rawRefreshToken = RefreshTokenHasher.generateOpaqueToken();
         String refreshHash = RefreshTokenHasher.sha256Hex(rawRefreshToken);
-        OffsetDateTime now = nowUtc();
-        OffsetDateTime refreshExpiresAt = now.plus(jwtService.refreshTokenTtl());
 
-        executeInTransaction(false, () -> {
-            persistRefreshToken(user, refreshHash, refreshExpiresAt, safeUserAgent, safeIp, now);
-            saveAuditEntry(user, AuditActionType.AUTH_LOGIN, HttpStatus.OK.value(), safeIp, elapsedMillis(startedAtNanos));
-            return null;
+        LoginTxOutcome outcome = executeInTransaction(false, () -> {
+            userRepositorySupplier.get().lockUserByIdForUpdate(initialUser.getId());
+            UserEntity lockedUser = userRepositorySupplier.get()
+                .findWithDepartmentById(initialUser.getId())
+                .orElse(null);
+            if (lockedUser == null
+                || !normalizedEmail.equalsIgnoreCase(lockedUser.getEmail())
+                || !Objects.equals(lockedUser.getPasswordHash(), verifiedPasswordHash)) {
+                saveAuditEntry(lockedUser, AuditActionType.AUTH_LOGIN, HttpStatus.UNAUTHORIZED.value(), safeIp, elapsedMillis(startedAtNanos));
+                return new LoginTxOutcome.InvalidCredentials();
+            }
+            if (!lockedUser.isActive()) {
+                saveAuditEntry(lockedUser, AuditActionType.AUTH_LOGIN, HttpStatus.FORBIDDEN.value(), safeIp, elapsedMillis(startedAtNanos));
+                return new LoginTxOutcome.AccountDisabled();
+            }
+
+            JwtService.IssuedAccessToken accessToken = jwtService.generateAccessToken(lockedUser);
+            OffsetDateTime now = nowUtc();
+            OffsetDateTime refreshExpiresAt = now.plus(jwtService.refreshTokenTtl());
+            persistRefreshToken(lockedUser, refreshHash, refreshExpiresAt, safeUserAgent, safeIp, now);
+            saveAuditEntry(lockedUser, AuditActionType.AUTH_LOGIN, HttpStatus.OK.value(), safeIp, elapsedMillis(startedAtNanos));
+            return new LoginTxOutcome.Success(buildTokenResponse(accessToken, rawRefreshToken, lockedUser));
         });
 
-        return buildTokenResponse(accessToken, rawRefreshToken, user);
+        return switch (outcome) {
+            case LoginTxOutcome.Success(AuthTokenResponse response) -> response;
+            case LoginTxOutcome.InvalidCredentials ignored -> throw new InvalidCredentialsException("Invalid email or password");
+            case LoginTxOutcome.AccountDisabled ignored -> throw new AccountDisabledException("User account is disabled");
+        };
     }
 
     /**
-     * Rotates a valid refresh token under {@code SELECT ... FOR UPDATE} inside a single database
-     * transaction, committing emergency session-wide revocation before throwing on reuse or inactive users.
+     * Rotates a valid refresh token under {@code users -> refresh_tokens} pessimistic row locking inside a single
+     * database transaction, committing emergency session-wide refresh + access JWT revocation on token reuse.
      */
     public AuthTokenResponse refresh(RefreshTokenRequest request, String userAgent, String ipAddress) {
         String presentedHash = RefreshTokenHasher.sha256Hex(request.refreshToken().trim());
         String safeIp = ClientIpResolver.normalize(ipAddress);
         String safeUserAgent = truncate(userAgent, MAX_USER_AGENT_LENGTH);
 
+        RefreshTokenEntity candidate = refreshTokenRepositorySupplier.get()
+            .findByTokenHash(presentedHash)
+            .orElseThrow(() -> new InvalidTokenException(
+                InvalidTokenException.CODE_INVALID_TOKEN,
+                "Refresh token is invalid"
+            ));
+        UUID candidateUserId = candidate.getUserId();
+
         RefreshTxOutcome outcome = executeInTransaction(false, () -> {
+            if (candidateUserId != null) {
+                userRepositorySupplier.get().lockUserByIdForUpdate(candidateUserId);
+            }
             RefreshTokenEntity storedToken = refreshTokenRepositorySupplier.get()
                 .findByTokenHashForUpdate(presentedHash)
                 .orElse(null);
@@ -196,11 +227,8 @@ public class AuthService {
             if (storedToken.getRevokedAt() != null) {
                 if (storedToken.getReplacedByHash() != null) {
                     refreshTokenRepositorySupplier.get().revokeAllActiveByUserId(userId, now);
-                    log.warn("Refresh token reuse detected for userId={}; all active refresh tokens revoked", userId);
-                    return new RefreshTxOutcome.Rejected(
-                        InvalidTokenException.CODE_REFRESH_TOKEN_REUSED,
-                        "Refresh token reuse detected; all sessions have been revoked"
-                    );
+                    log.warn("Refresh token reuse detected for userId={}; revoking all active refresh and access tokens", userId);
+                    return new RefreshTxOutcome.ReuseDetected(userId);
                 }
                 return new RefreshTxOutcome.Rejected(
                     InvalidTokenException.CODE_TOKEN_REVOKED,
@@ -245,11 +273,18 @@ public class AuthService {
             return new RefreshTxOutcome.Success(buildTokenResponse(accessToken, newRawRefreshToken, user));
         });
 
-        if (outcome instanceof RefreshTxOutcome.Success(AuthTokenResponse response)) {
-            return response;
-        }
-        RefreshTxOutcome.Rejected rejected = (RefreshTxOutcome.Rejected) outcome;
-        throw new InvalidTokenException(rejected.errorCode(), rejected.message());
+        return switch (outcome) {
+            case RefreshTxOutcome.Success(AuthTokenResponse response) -> response;
+            case RefreshTxOutcome.ReuseDetected(UUID userId) -> {
+                tokenBlacklistService.revokeAllUserTokens(userId, jwtService.accessTokenTtl());
+                throw new InvalidTokenException(
+                    InvalidTokenException.CODE_REFRESH_TOKEN_REUSED,
+                    "Refresh token reuse detected; all sessions have been revoked"
+                );
+            }
+            case RefreshTxOutcome.Rejected(String errorCode, String message) ->
+                throw new InvalidTokenException(errorCode, message);
+        };
     }
 
     /**
@@ -287,6 +322,7 @@ public class AuthService {
 
         OffsetDateTime now = nowUtc();
         executeInTransaction(false, () -> {
+            userRepositorySupplier.get().lockUserByIdForUpdate(principal.userId());
             if (tokenHash != null) {
                 RefreshTokenEntity storedToken = refreshTokenRepositorySupplier.get()
                     .findByTokenHashForUpdate(tokenHash)
@@ -433,8 +469,17 @@ public class AuthService {
         return trimmed.length() > maxLength ? trimmed.substring(0, maxLength) : trimmed;
     }
 
-    private sealed interface RefreshTxOutcome permits RefreshTxOutcome.Success, RefreshTxOutcome.Rejected {
+    private sealed interface LoginTxOutcome
+        permits LoginTxOutcome.Success, LoginTxOutcome.InvalidCredentials, LoginTxOutcome.AccountDisabled {
+        record Success(AuthTokenResponse response) implements LoginTxOutcome {}
+        record InvalidCredentials() implements LoginTxOutcome {}
+        record AccountDisabled() implements LoginTxOutcome {}
+    }
+
+    private sealed interface RefreshTxOutcome
+        permits RefreshTxOutcome.Success, RefreshTxOutcome.ReuseDetected, RefreshTxOutcome.Rejected {
         record Success(AuthTokenResponse response) implements RefreshTxOutcome {}
+        record ReuseDetected(UUID userId) implements RefreshTxOutcome {}
         record Rejected(String errorCode, String message) implements RefreshTxOutcome {}
     }
 }
