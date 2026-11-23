@@ -137,7 +137,8 @@ public class DevHeaderAuthenticationFilter extends OncePerRequestFilter {
 
     private static boolean matchesAnyProtectedPrefix(String path) {
         return matchesProtectedPrefix(path, AUTH_PATH_PREFIX)
-            || matchesProtectedPrefix(path, ADMIN_PATH_PREFIX);
+            || matchesProtectedPrefix(path, ADMIN_PATH_PREFIX)
+            || JwtAuthenticationFilter.isDocumentPreviewContentPath(path, null);
     }
 
     private static boolean matchesProtectedPrefix(String path, String prefix) {

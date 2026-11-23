@@ -20,12 +20,15 @@ import com.documind.exception.DocumentStorageException;
 import com.documind.exception.DuplicateDocumentException;
 import com.documind.exception.InvalidDocumentRequestException;
 import com.documind.exception.ResourceNotFoundException;
+import com.documind.infrastructure.security.DocumentPreviewTokenService;
 import com.documind.infrastructure.storage.HashingBoundedInputStream;
 import com.documind.infrastructure.storage.MinioStorageService;
 import com.documind.repository.AuditLogRepository;
 import com.documind.repository.DepartmentRepository;
 import com.documind.repository.DocumentRepository;
 import com.documind.repository.UserRepository;
+import com.documind.service.auth.TokenBlacklistService;
+import jakarta.servlet.http.HttpServletResponse;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.ObjectProvider;
@@ -36,18 +39,21 @@ import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.PageRequest;
 import org.springframework.data.domain.Sort;
+import org.springframework.http.HttpHeaders;
+import org.springframework.http.HttpStatus;
 import org.springframework.security.access.prepost.PreAuthorize;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.support.TransactionSynchronization;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
 import org.springframework.transaction.support.TransactionTemplate;
 import org.springframework.web.multipart.MultipartFile;
+import software.amazon.awssdk.core.ResponseInputStream;
+import software.amazon.awssdk.services.s3.model.GetObjectResponse;
+import software.amazon.awssdk.services.s3.model.NoSuchKeyException;
 
 import java.io.IOException;
 import java.io.InputStream;
-import java.net.URL;
 import java.text.Normalizer;
-import java.time.Duration;
 import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
 import java.util.Locale;
@@ -57,6 +63,8 @@ import java.util.UUID;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Supplier;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 /**
  * Coordinates two-phase non-transactional MinIO S3 streaming and short atomic DB commits for document CRUD
@@ -71,6 +79,7 @@ public class DocumentService {
     private static final int MAX_IP_LENGTH = 45;
     private static final int HTTP_ACCEPTED = 202;
     private static final int HTTP_NO_CONTENT = 204;
+    private static final Pattern SINGLE_BYTE_RANGE_PATTERN = Pattern.compile("^bytes=(\\d*)-(\\d*)$");
 
     private final Supplier<DocumentRepository> documentRepositorySupplier;
     private final Supplier<DepartmentRepository> departmentRepositorySupplier;
@@ -78,6 +87,8 @@ public class DocumentService {
     private final Supplier<AuditLogRepository> auditLogRepositorySupplier;
     private final FileValidationService fileValidationService;
     private final MinioStorageService minioStorageService;
+    private final Supplier<DocumentPreviewTokenService> previewTokenServiceSupplier;
+    private final Supplier<TokenBlacklistService> tokenBlacklistServiceSupplier;
     private final Supplier<TransactionTemplate> transactionTemplateSupplier;
     private final ApplicationEventPublisher eventPublisher;
     private final Environment environment;
@@ -90,6 +101,8 @@ public class DocumentService {
         ObjectProvider<AuditLogRepository> auditLogRepositoryProvider,
         FileValidationService fileValidationService,
         MinioStorageService minioStorageService,
+        ObjectProvider<DocumentPreviewTokenService> previewTokenServiceProvider,
+        ObjectProvider<TokenBlacklistService> tokenBlacklistServiceProvider,
         ObjectProvider<TransactionTemplate> transactionTemplateProvider,
         ApplicationEventPublisher eventPublisher,
         Environment environment
@@ -101,6 +114,8 @@ public class DocumentService {
             () -> Objects.requireNonNull(auditLogRepositoryProvider, "auditLogRepositoryProvider must not be null").getObject(),
             fileValidationService,
             minioStorageService,
+            () -> Objects.requireNonNull(previewTokenServiceProvider, "previewTokenServiceProvider must not be null").getObject(),
+            () -> Objects.requireNonNull(tokenBlacklistServiceProvider, "tokenBlacklistServiceProvider must not be null").getObject(),
             () -> Objects.requireNonNull(transactionTemplateProvider, "transactionTemplateProvider must not be null").getObject(),
             eventPublisher,
             environment
@@ -119,12 +134,42 @@ public class DocumentService {
         Environment environment
     ) {
         this(
+            documentRepository,
+            departmentRepository,
+            userRepository,
+            auditLogRepository,
+            fileValidationService,
+            minioStorageService,
+            null,
+            null,
+            transactionTemplate,
+            eventPublisher,
+            environment
+        );
+    }
+
+    public DocumentService(
+        DocumentRepository documentRepository,
+        DepartmentRepository departmentRepository,
+        UserRepository userRepository,
+        AuditLogRepository auditLogRepository,
+        FileValidationService fileValidationService,
+        MinioStorageService minioStorageService,
+        DocumentPreviewTokenService previewTokenService,
+        TokenBlacklistService tokenBlacklistService,
+        TransactionTemplate transactionTemplate,
+        ApplicationEventPublisher eventPublisher,
+        Environment environment
+    ) {
+        this(
             () -> Objects.requireNonNull(documentRepository, "documentRepository must not be null"),
             () -> Objects.requireNonNull(departmentRepository, "departmentRepository must not be null"),
             () -> Objects.requireNonNull(userRepository, "userRepository must not be null"),
             () -> Objects.requireNonNull(auditLogRepository, "auditLogRepository must not be null"),
             fileValidationService,
             minioStorageService,
+            previewTokenService != null ? () -> previewTokenService : null,
+            tokenBlacklistService != null ? () -> tokenBlacklistService : null,
             () -> Objects.requireNonNull(transactionTemplate, "transactionTemplate must not be null"),
             eventPublisher,
             environment
@@ -138,6 +183,8 @@ public class DocumentService {
         Supplier<AuditLogRepository> auditLogRepositorySupplier,
         FileValidationService fileValidationService,
         MinioStorageService minioStorageService,
+        Supplier<DocumentPreviewTokenService> previewTokenServiceSupplier,
+        Supplier<TokenBlacklistService> tokenBlacklistServiceSupplier,
         Supplier<TransactionTemplate> transactionTemplateSupplier,
         ApplicationEventPublisher eventPublisher,
         Environment environment
@@ -148,6 +195,8 @@ public class DocumentService {
         this.auditLogRepositorySupplier = auditLogRepositorySupplier;
         this.fileValidationService = Objects.requireNonNull(fileValidationService, "fileValidationService must not be null");
         this.minioStorageService = Objects.requireNonNull(minioStorageService, "minioStorageService must not be null");
+        this.previewTokenServiceSupplier = previewTokenServiceSupplier;
+        this.tokenBlacklistServiceSupplier = tokenBlacklistServiceSupplier;
         this.transactionTemplateSupplier = transactionTemplateSupplier;
         this.eventPublisher = Objects.requireNonNull(eventPublisher, "eventPublisher must not be null");
         this.environment = Objects.requireNonNull(environment, "environment must not be null");
@@ -273,9 +322,9 @@ public class DocumentService {
     }
 
     /**
-     * Generates a short-lived inline MinIO presigned preview URL after enforcing role and department
-     * visibility via {@link DocumentVisibilityPolicy}. Appends {@code #page=X} for PDF documents when
-     * {@code page} is supplied and ignores the fragment for non-PDF formats.
+     * Generates a short-lived inline preview URL backed by download-time RBAC verification after enforcing
+     * role and department visibility via {@link DocumentVisibilityPolicy}. Appends {@code #page=X} for PDF
+     * documents when {@code page} is supplied and ignores the fragment for non-PDF formats.
      */
     @PreAuthorize("hasAnyRole('SYSTEM_ADMIN', 'DEPARTMENT_MANAGER', 'STANDARD_EMPLOYEE')")
     public DocumentPreviewUrlResponse getDocumentPreviewUrl(UUID documentId, Integer page, CallerContext caller) {
@@ -286,17 +335,13 @@ public class DocumentService {
             throw new InvalidDocumentRequestException("Preview page must be >= 1");
         }
         DocumentEntity document = loadReadableDocument(documentId, caller, "DOC_PREVIEW_URL_DENIED");
+        int currentVersion = document.getCurrentVersion() != null ? document.getCurrentVersion() : INITIAL_DOCUMENT_VERSION;
 
-        URL baseUrl = minioStorageService.generatePresignedGetUrl(document.getStorageKey(), document.getOriginalName());
-        if (baseUrl == null) {
-            throw new DocumentStorageException("Failed to generate presigned preview URL for document: " + documentId, null);
-        }
-        Duration expiry = minioStorageService.presignedExpiry();
-        OffsetDateTime expiresAt = OffsetDateTime.now(ZoneOffset.UTC).plus(expiry);
+        DocumentPreviewTokenService.IssuedPreviewUrl issued = previewTokenService()
+            .issuePreviewUrl(document.getId(), currentVersion, caller);
 
         Integer effectivePage = (document.isPdf() && page != null) ? page : null;
-        String previewUrl = MinioStorageService.appendPageFragment(baseUrl.toString(), effectivePage);
-        int currentVersion = document.getCurrentVersion() != null ? document.getCurrentVersion() : INITIAL_DOCUMENT_VERSION;
+        String previewUrl = MinioStorageService.appendPageFragment(issued.baseUrl(), effectivePage);
 
         log.info(
             "SECURITY_AUDIT action=DOC_PREVIEW_URL actorUserId={} actorRole={} documentId={} version={} page={}",
@@ -314,8 +359,103 @@ public class DocumentService {
             currentVersion,
             effectivePage,
             previewUrl,
-            expiresAt
+            issued.expiresAt()
         );
+    }
+
+    /**
+     * Enforces download-time RBAC, active user session revocation, and exact document version checks on an
+     * issued preview token before streaming inline bytes from MinIO without holding DB connections.
+     */
+    public void streamDocumentContent(
+        UUID documentId,
+        String rawToken,
+        String rangeHeader,
+        String ipAddress,
+        HttpServletResponse response
+    ) throws IOException {
+        if (documentId == null) {
+            throw new InvalidDocumentRequestException("Document ID must not be null");
+        }
+        Objects.requireNonNull(response, "HttpServletResponse must not be null");
+
+        DocumentPreviewTokenService.VerifiedPreviewClaims claims = previewTokenService().verifyToken(rawToken, documentId);
+        if (claims.jwtAuthenticated()
+            && tokenBlacklistService().isTokenRevoked(claims.accessTokenJti(), claims.userId(), claims.issuedAt())) {
+            log.warn(
+                "SECURITY_AUDIT action=DOC_PREVIEW_DOWNLOAD_DENIED reason=TOKEN_REVOKED actorUserId={} documentId={} version={}",
+                claims.userId(),
+                documentId,
+                claims.docVersion()
+            );
+            throw new DocumentAccessDeniedException("Session has been revoked");
+        }
+
+        CallerContext liveCaller = resolveVerifiedPreviewCaller(claims, ipAddress);
+        DocumentEntity document = documentRepository().findById(documentId)
+            .orElseThrow(() -> new DocumentNotFoundException(documentId));
+
+        int liveVersion = document.getCurrentVersion() != null ? document.getCurrentVersion() : INITIAL_DOCUMENT_VERSION;
+        if (liveVersion != claims.docVersion()) {
+            throw new DocumentNotFoundException(documentId);
+        }
+
+        if (!DocumentVisibilityPolicy.canRead(liveCaller, document.getDepartmentId(), document.getAccessLevel())) {
+            log.warn(
+                "SECURITY_AUDIT action=DOC_PREVIEW_DOWNLOAD_DENIED reason=ACL_DENIED actorUserId={} actorRole={} actorDeptId={} documentId={} docDeptId={} accessLevel={}",
+                liveCaller.userId(),
+                liveCaller.role(),
+                liveCaller.departmentId(),
+                document.getId(),
+                document.getDepartmentId(),
+                document.getAccessLevel()
+            );
+            throw new DocumentAccessDeniedException("You do not have permission to access this document");
+        }
+
+        long totalSize = document.getFileSizeBytes() != null ? document.getFileSizeBytes() : -1L;
+        ParsedByteRange byteRange = parseByteRange(rangeHeader, totalSize);
+        if (byteRange != null && !byteRange.satisfiable()) {
+            response.setStatus(HttpStatus.REQUESTED_RANGE_NOT_SATISFIABLE.value());
+            response.setHeader(HttpHeaders.CACHE_CONTROL, "private, no-store, max-age=0");
+            if (totalSize >= 0L) {
+                response.setHeader(HttpHeaders.CONTENT_RANGE, "bytes */" + totalSize);
+            }
+            return;
+        }
+
+        String s3Range = (byteRange != null) ? "bytes=" + byteRange.start() + "-" + byteRange.end() : null;
+        try (ResponseInputStream<GetObjectResponse> s3Stream = minioStorageService.openStream(document.getStorageKey(), s3Range)) {
+            GetObjectResponse s3Meta = s3Stream.response();
+            response.setStatus(byteRange != null ? HttpStatus.PARTIAL_CONTENT.value() : HttpStatus.OK.value());
+            response.setContentType(document.getMimeType());
+            response.setHeader(
+                HttpHeaders.CONTENT_DISPOSITION,
+                MinioStorageService.buildInlineContentDisposition(document.getOriginalName())
+            );
+            response.setHeader(HttpHeaders.ACCEPT_RANGES, "bytes");
+            response.setHeader(HttpHeaders.CACHE_CONTROL, "private, no-store, max-age=0");
+            response.setHeader("X-Content-Type-Options", "nosniff");
+            if (byteRange != null) {
+                long resolvedTotal = totalSize > 0L ? totalSize : (byteRange.end() + 1L);
+                response.setHeader(
+                    HttpHeaders.CONTENT_RANGE,
+                    "bytes " + byteRange.start() + "-" + byteRange.end() + "/" + resolvedTotal
+                );
+            }
+            Long contentLength = s3Meta != null ? s3Meta.contentLength() : null;
+            if (contentLength != null && contentLength >= 0L) {
+                response.setContentLengthLong(contentLength);
+            }
+            s3Stream.transferTo(response.getOutputStream());
+        } catch (DocumentStorageException ex) {
+            if (hasNoSuchKeyCause(ex)) {
+                throw new DocumentNotFoundException(documentId);
+            }
+            throw ex;
+        } catch (IOException clientAbort) {
+            log.debug("Client closed stream while downloading preview for document {}: {}", documentId, clientAbort.getMessage());
+        }
     }
 
     /**
@@ -958,6 +1098,107 @@ public class DocumentService {
 
     private TransactionTemplate transactionTemplate() {
         return transactionTemplateSupplier.get();
+    }
+
+    private DocumentPreviewTokenService previewTokenService() {
+        if (previewTokenServiceSupplier == null) {
+            throw new IllegalStateException("DocumentPreviewTokenService must be configured");
+        }
+        return Objects.requireNonNull(previewTokenServiceSupplier.get(), "DocumentPreviewTokenService must not be null");
+    }
+
+    private TokenBlacklistService tokenBlacklistService() {
+        if (tokenBlacklistServiceSupplier == null) {
+            throw new IllegalStateException("TokenBlacklistService must be configured");
+        }
+        return Objects.requireNonNull(tokenBlacklistServiceSupplier.get(), "TokenBlacklistService must not be null");
+    }
+
+    private CallerContext resolveVerifiedPreviewCaller(
+        DocumentPreviewTokenService.VerifiedPreviewClaims claims,
+        String ipAddress
+    ) {
+        Role effectiveRole = claims.role();
+        UUID effectiveDeptId = claims.departmentId();
+        if (effectiveRole != Role.SYSTEM_ADMIN && effectiveDeptId == null) {
+            throw new DocumentAccessDeniedException("Preview token department scope is missing");
+        }
+
+        UUID userId = claims.userId();
+        if (userId == null) {
+            return new CallerContext(null, effectiveDeptId, effectiveRole, ipAddress);
+        }
+
+        Optional<UserEntity> userOpt = userRepository().findById(userId);
+        if (userOpt.isEmpty()) {
+            if (!claims.jwtAuthenticated()
+                && DevCallerFallbackEnabledCondition.isDevFallbackActive(environment)
+                && DevFallbackCallerContextResolver.DEFAULT_DEV_USER_ID.equals(userId)) {
+                return new CallerContext(userId, effectiveDeptId, effectiveRole, ipAddress);
+            }
+            throw new DocumentAccessDeniedException("User account no longer exists");
+        }
+
+        UserEntity user = userOpt.get();
+        if (!user.isActive() || !user.getRole().canAssume(effectiveRole)) {
+            throw new DocumentAccessDeniedException("User account privileges have been revoked");
+        }
+        if (effectiveRole != Role.SYSTEM_ADMIN
+            && user.getRole() != Role.SYSTEM_ADMIN
+            && !Objects.equals(user.getDepartmentId(), effectiveDeptId)) {
+            throw new DocumentAccessDeniedException("User department membership has changed");
+        }
+        return new CallerContext(user.getId(), effectiveDeptId, effectiveRole, ipAddress);
+    }
+
+    private static ParsedByteRange parseByteRange(String rawRange, long totalSize) {
+        if (rawRange == null || rawRange.isBlank() || totalSize <= 0L) {
+            return null;
+        }
+        Matcher matcher = SINGLE_BYTE_RANGE_PATTERN.matcher(rawRange.trim());
+        if (!matcher.matches()) {
+            return null;
+        }
+        String startGroup = matcher.group(1);
+        String endGroup = matcher.group(2);
+        if (startGroup.isEmpty() && endGroup.isEmpty()) {
+            return null;
+        }
+        try {
+            long start;
+            long end;
+            if (startGroup.isEmpty()) {
+                long suffixLen = Long.parseLong(endGroup);
+                if (suffixLen <= 0L) {
+                    return new ParsedByteRange(0L, 0L, false);
+                }
+                start = Math.max(0L, totalSize - suffixLen);
+                end = totalSize - 1L;
+            } else {
+                start = Long.parseLong(startGroup);
+                end = endGroup.isEmpty() ? (totalSize - 1L) : Math.min(totalSize - 1L, Long.parseLong(endGroup));
+            }
+            if (start >= totalSize || start > end) {
+                return new ParsedByteRange(start, end, false);
+            }
+            return new ParsedByteRange(start, end, true);
+        } catch (NumberFormatException ex) {
+            return new ParsedByteRange(0L, 0L, false);
+        }
+    }
+
+    private static boolean hasNoSuchKeyCause(Throwable throwable) {
+        Throwable current = throwable;
+        while (current != null) {
+            if (current instanceof NoSuchKeyException) {
+                return true;
+            }
+            current = current.getCause();
+        }
+        return false;
+    }
+
+    private record ParsedByteRange(long start, long end, boolean satisfiable) {
     }
 
     private record TransferTarget(UUID departmentId, String fileHash) {

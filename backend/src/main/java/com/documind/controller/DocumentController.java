@@ -7,6 +7,7 @@ import com.documind.controller.dto.PageResponse;
 import com.documind.controller.dto.UpdateDocumentMetadataRequest;
 import com.documind.domain.enums.AccessLevel;
 import com.documind.domain.enums.DocumentStatus;
+import com.documind.infrastructure.security.ClientIpResolver;
 import com.documind.service.document.CallerContext;
 import com.documind.service.document.CallerContextResolver;
 import com.documind.service.document.DocumentService;
@@ -14,7 +15,9 @@ import io.swagger.v3.oas.annotations.Operation;
 import io.swagger.v3.oas.annotations.responses.ApiResponse;
 import io.swagger.v3.oas.annotations.tags.Tag;
 import jakarta.servlet.http.HttpServletRequest;
+import jakarta.servlet.http.HttpServletResponse;
 import jakarta.validation.Valid;
+import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
@@ -25,12 +28,14 @@ import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.PutMapping;
 import org.springframework.web.bind.annotation.RequestBody;
+import org.springframework.web.bind.annotation.RequestHeader;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RequestPart;
 import org.springframework.web.bind.annotation.RestController;
 import org.springframework.web.multipart.MultipartFile;
 
+import java.io.IOException;
 import java.util.Objects;
 import java.util.UUID;
 
@@ -115,10 +120,10 @@ public class DocumentController {
 
     @GetMapping("/{id}/preview-url")
     @Operation(
-        summary = "Get presigned document preview URL",
-        description = "Verifies RBAC read permissions before issuing a short-lived inline MinIO presigned GET URL with optional PDF #page=X anchor"
+        summary = "Get signed document preview URL",
+        description = "Verifies RBAC read permissions before issuing a short-lived download-gated inline preview URL with optional PDF #page=X anchor"
     )
-    @ApiResponse(responseCode = "200", description = "Short-lived inline presigned preview URL issued")
+    @ApiResponse(responseCode = "200", description = "Short-lived inline preview URL issued")
     public DocumentPreviewUrlResponse getDocumentPreviewUrl(
         @PathVariable("id") UUID id,
         @RequestParam(name = "page", required = false) Integer page,
@@ -126,6 +131,21 @@ public class DocumentController {
     ) {
         CallerContext caller = callerContextResolver.resolve(request);
         return documentService.getDocumentPreviewUrl(id, page, caller);
+    }
+
+    @GetMapping("/{id}/content")
+    @Operation(
+        summary = "Stream inline document content",
+        description = "Re-verifies signed preview token, active user session revocation, and live document RBAC ACL at download time before streaming from MinIO"
+    )
+    public void streamDocumentContent(
+        @PathVariable("id") UUID id,
+        @RequestParam(name = "token", required = false) String token,
+        @RequestHeader(name = HttpHeaders.RANGE, required = false) String rangeHeader,
+        HttpServletRequest request,
+        HttpServletResponse response
+    ) throws IOException {
+        documentService.streamDocumentContent(id, token, rangeHeader, ClientIpResolver.resolve(request), response);
     }
 
     @PutMapping(value = "/{id}", consumes = MediaType.MULTIPART_FORM_DATA_VALUE)

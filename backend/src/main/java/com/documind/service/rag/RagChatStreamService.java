@@ -11,6 +11,7 @@ import com.documind.exception.LlmProviderException;
 import com.documind.exception.ResourceNotFoundException;
 import com.documind.infrastructure.ai.AiProperties;
 import com.documind.infrastructure.config.IngestionAsyncConfig;
+import com.documind.infrastructure.security.PreviewBaseUrlResolver;
 import com.documind.service.chat.ChatSessionService;
 import com.documind.service.document.CallerContext;
 import com.documind.service.ingestion.OverlappingTokenTextSplitter;
@@ -59,6 +60,18 @@ import java.util.function.LongFunction;
  * synchronous pre-flight validation/RBAC/session-ownership checks return standard HTTP ProblemDetail
  * responses, while post-open execution runs on a Java 21 Virtual Thread emitting {@code citations},
  * {@code token}, {@code done}, and {@code error} events without blocking Reactor I/O loops.
+ *
+ * <p><b>Latency SLA Scope ({@code DA-16}):</b>
+ * <ul>
+ *   <li><b>Turn 1 (Zero-Rewrite Direct Retrieval Path, {@code recentHistory.isEmpty()}):</b>
+ *       {@code citations < 500 ms} and first visible streamed token {@code TTFT < 2,500 ms} end-to-end
+ *       on warm {@code bge-m3} + live streaming LLM provider.</li>
+ *   <li><b>Turn 2+ (Contextualized Multi-Turn Follow-Up Path):</b> executes synchronous standalone
+ *       query rewrite via {@link QueryContextualizerService} prior to {@code bge-m3} embedding;
+ *       the {@code < 500 ms} retrieval-to-citations threshold and {@code < 2,500 ms} answer-generation
+ *       TTFT threshold govern the post-rewrite retrieval and answer-streaming phases respectively
+ *       ({@code postRewriteCitationsMs < 500 ms}, {@code postCitationsFirstTokenMs < 2,500 ms}).</li>
+ * </ul>
  */
 @Service
 public class RagChatStreamService {
@@ -160,6 +173,7 @@ public class RagChatStreamService {
         );
 
         SecurityContext securityContextSnapshot = snapshotSecurityContext();
+        String requestBaseUrl = PreviewBaseUrlResolver.captureCurrentRequestOriginOrNull();
         long configuredTimeoutMs = ragProperties.sse().timeout().toMillis();
         long deadlineNanos = startedAtNanos + TimeUnit.MILLISECONDS.toNanos(configuredTimeoutMs);
         SseEmitter emitter = Objects.requireNonNull(
@@ -173,6 +187,7 @@ public class RagChatStreamService {
             turn,
             sessionId,
             securityContextSnapshot,
+            requestBaseUrl,
             emitter
         );
         StreamExecutionState state = new StreamExecutionState();
@@ -209,7 +224,10 @@ public class RagChatStreamService {
         );
         state.timeoutFuture.set(timeoutTask);
 
-        chatSseExecutor.execute(() -> runStreamPipeline(ctx, state));
+        chatSseExecutor.execute(() -> PreviewBaseUrlResolver.runWithBaseUrl(
+            ctx.requestBaseUrl(),
+            () -> runStreamPipeline(ctx, state)
+        ));
         return emitter;
     }
 
@@ -222,10 +240,15 @@ public class RagChatStreamService {
             }
 
             // Step 1: Contextualize follow-up queries on Turn 2+ only (Turn 1 skipped for optimal TTFT)
-            QueryContextualizerService.ContextualizedQuery contextualized =
-                (!ctx.turn().recentHistory().isEmpty() && ctx.turn().contextualizerService() != null)
-                    ? ctx.turn().contextualizerService().contextualize(ctx.turn().normalizedQuestion(), ctx.turn().recentHistory())
-                    : QueryContextualizerService.ContextualizedQuery.skipped(ctx.turn().normalizedQuestion());
+            boolean followUpTurn = !ctx.turn().recentHistory().isEmpty() && ctx.turn().contextualizerService() != null;
+            long rewriteStartedAtNanos = System.nanoTime();
+            QueryContextualizerService.ContextualizedQuery contextualized = followUpTurn
+                ? ctx.turn().contextualizerService().contextualize(ctx.turn().normalizedQuestion(), ctx.turn().recentHistory())
+                : QueryContextualizerService.ContextualizedQuery.skipped(ctx.turn().normalizedQuestion());
+            long rewriteCompletedAtNanos = System.nanoTime();
+            long rewriteLatencyMs = followUpTurn
+                ? TimeUnit.NANOSECONDS.toMillis(rewriteCompletedAtNanos - rewriteStartedAtNanos)
+                : 0L;
             state.rewritePromptTokens.set(contextualized.promptTokens());
             state.rewriteCompletionTokens.set(contextualized.completionTokens());
             state.currentProvider.set(contextualized.provider());
@@ -279,11 +302,23 @@ public class RagChatStreamService {
                 return;
             }
 
-            // Step 4: Emit structured citations immediately (< 500ms) prior to LLM generation
+            // Step 4: Emit structured citations immediately (< 500ms post-rewrite / end-to-end Turn 1) prior to LLM generation
             List<CitationDto> retrievedCitations = chunks.stream().map(RetrievedChunk::citation).toList();
             if (!sendEvent(ctx, state, EVENT_CITATIONS, new ChatStreamCitationsEvent(retrievedCitations, contextualized.rewrittenQuery()))) {
                 handleClientDisconnected(ctx, state);
                 return;
+            }
+            if (log.isDebugEnabled()) {
+                long postRewriteCitationsMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - rewriteCompletedAtNanos);
+                long totalCitationsMs = RagChatService.elapsedMillis(ctx.startedAtNanos());
+                log.debug(
+                    "SSE citations emitted: sessionId={}, followUpTurn={}, rewriteMs={}, postRewriteCitationsMs={}, totalCitationsMs={}",
+                    ctx.sessionId(),
+                    followUpTurn,
+                    rewriteLatencyMs,
+                    postRewriteCitationsMs,
+                    totalCitationsMs
+                );
             }
 
             // Layer 2b Pre-Prompt RBAC Hard Guard enforced inside GroundedSystemPromptService
@@ -1010,6 +1045,7 @@ public class RagChatStreamService {
         RagChatService.PreparedChatTurn turn,
         UUID sessionId,
         SecurityContext securityContextSnapshot,
+        String requestBaseUrl,
         SseEmitter emitter
     ) {
     }

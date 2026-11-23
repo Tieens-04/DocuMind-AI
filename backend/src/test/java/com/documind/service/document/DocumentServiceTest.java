@@ -22,12 +22,17 @@ import com.documind.exception.DuplicateDocumentException;
 import com.documind.exception.InvalidDocumentRequestException;
 import com.documind.exception.ResourceNotFoundException;
 import com.documind.exception.UnsupportedDocumentTypeException;
+import com.documind.infrastructure.security.CustomUserDetails;
+import com.documind.infrastructure.security.DocumentPreviewTokenService;
+import com.documind.infrastructure.security.JwtProperties;
+import com.documind.infrastructure.security.PreviewBaseUrlResolver;
 import com.documind.infrastructure.storage.HashingBoundedInputStream;
 import com.documind.infrastructure.storage.MinioStorageService;
 import com.documind.repository.AuditLogRepository;
 import com.documind.repository.DepartmentRepository;
 import com.documind.repository.DocumentRepository;
 import com.documind.repository.UserRepository;
+import com.documind.service.auth.TokenBlacklistService;
 import jakarta.persistence.criteria.CriteriaBuilder;
 import jakarta.persistence.criteria.CriteriaQuery;
 import jakarta.persistence.criteria.Expression;
@@ -50,7 +55,10 @@ import org.springframework.data.domain.Pageable;
 import org.springframework.data.domain.Sort;
 import org.springframework.data.jpa.domain.Specification;
 import org.springframework.mock.env.MockEnvironment;
+import org.springframework.mock.web.MockHttpServletResponse;
 import org.springframework.mock.web.MockMultipartFile;
+import org.springframework.security.authentication.UsernamePasswordAuthenticationToken;
+import org.springframework.security.core.context.SecurityContextHolder;
 import org.springframework.transaction.TransactionDefinition;
 import org.springframework.transaction.TransactionException;
 import org.springframework.transaction.TransactionSystemException;
@@ -59,13 +67,16 @@ import org.springframework.transaction.support.DefaultTransactionStatus;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
 import org.springframework.transaction.support.TransactionTemplate;
 
+import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.lang.reflect.Method;
 import java.net.URI;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
+import java.time.Clock;
 import java.time.Duration;
+import java.time.Instant;
 import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
 import java.util.HexFormat;
@@ -73,6 +84,10 @@ import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
 import java.util.concurrent.atomic.AtomicBoolean;
+import software.amazon.awssdk.core.ResponseInputStream;
+import software.amazon.awssdk.http.AbortableInputStream;
+import software.amazon.awssdk.services.s3.model.GetObjectResponse;
+import software.amazon.awssdk.services.s3.model.NoSuchKeyException;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -109,6 +124,8 @@ class DocumentServiceTest {
     private AuditLogRepository auditLogRepository;
     private FileValidationService fileValidationService;
     private MinioStorageService minioStorageService;
+    private DocumentPreviewTokenService previewTokenService;
+    private TokenBlacklistService tokenBlacklistService;
     private RecordingTransactionManager transactionManager;
     private TransactionTemplate transactionTemplate;
     private ApplicationEventPublisher eventPublisher;
@@ -129,6 +146,16 @@ class DocumentServiceTest {
         environment = new MockEnvironment();
         environment.setActiveProfiles("dev");
         environment.setProperty("documind.security.dev-caller-fallback.enabled", "true");
+        SecurityContextHolder.clearContext();
+
+        previewTokenService = new DocumentPreviewTokenService(
+            new JwtProperties("document-service-test-hmac-secret-key-min-32-bytes", "documind-ai", Duration.ofMinutes(15), Duration.ofDays(7)),
+            environment,
+            PreviewBaseUrlResolver.fixed("http://localhost:8081"),
+            Duration.ofMinutes(15),
+            Clock.systemUTC()
+        );
+        tokenBlacklistService = mock(TokenBlacklistService.class);
 
         when(minioStorageService.buildStorageKey(any(UUID.class), any(UUID.class), anyInt(), anyString()))
             .thenAnswer(inv -> "departments/" + inv.getArgument(0) + "/" + inv.getArgument(1)
@@ -141,6 +168,8 @@ class DocumentServiceTest {
             auditLogRepository,
             fileValidationService,
             minioStorageService,
+            previewTokenService,
+            tokenBlacklistService,
             transactionTemplate,
             eventPublisher,
             environment
@@ -1425,11 +1454,7 @@ class DocumentServiceTest {
             .isInstanceOf(DocumentAccessDeniedException.class);
         verifyNoInteractions(minioStorageService);
 
-        // Authorized PDF with ?page=4 -> appends #page=4 and returns expiresAt
-        when(minioStorageService.presignedExpiry()).thenReturn(Duration.ofMinutes(15));
-        when(minioStorageService.generatePresignedGetUrl(hrPdf.getStorageKey(), "hr-policy-v2.pdf"))
-            .thenReturn(URI.create("http://localhost:9000/documind-documents/" + hrPdf.getStorageKey() + "?X-Amz-Signature=sig").toURL());
-
+        // Authorized PDF with ?page=4 -> issues download-gated URL with #page=4 and returns expiresAt
         OffsetDateTime beforeCall = OffsetDateTime.now(ZoneOffset.UTC);
         DocumentPreviewUrlResponse adminPreview = documentService.getDocumentPreviewUrl(DOC_ID, 4, sysAdmin);
         OffsetDateTime afterCall = OffsetDateTime.now(ZoneOffset.UTC);
@@ -1440,7 +1465,9 @@ class DocumentServiceTest {
         assertThat(adminPreview.fileExtension()).isEqualTo("pdf");
         assertThat(adminPreview.currentVersion()).isEqualTo(2);
         assertThat(adminPreview.pageNumber()).isEqualTo(4);
-        assertThat(adminPreview.previewUrl()).endsWith("?X-Amz-Signature=sig#page=4");
+        assertThat(adminPreview.previewUrl())
+            .startsWith("http://localhost:8081/api/v1/documents/" + DOC_ID + "/content?token=")
+            .endsWith("#page=4");
         assertThat(adminPreview.expiresAt())
             .isAfterOrEqualTo(beforeCall.plusMinutes(15).minusSeconds(2))
             .isBeforeOrEqualTo(afterCall.plusMinutes(15).plusSeconds(2));
@@ -1455,28 +1482,75 @@ class DocumentServiceTest {
         hrPdf.setOriginalName("guide.docx");
         hrPdf.setFileExtension("docx");
         hrPdf.setMimeType("application/vnd.openxmlformats-officedocument.wordprocessingml.document");
-        when(minioStorageService.generatePresignedGetUrl(hrPdf.getStorageKey(), "guide.docx"))
-            .thenReturn(URI.create("http://localhost:9000/documind-documents/" + hrPdf.getStorageKey() + "?X-Amz-Signature=sig2").toURL());
 
         DocumentPreviewUrlResponse docxPreview = documentService.getDocumentPreviewUrl(DOC_ID, 4, itEmployee);
         assertThat(docxPreview.pageNumber()).isNull();
         assertThat(docxPreview.fileExtension()).isEqualTo("docx");
         assertThat(docxPreview.previewUrl()).doesNotContain("#page=");
 
-        // 502: Storage presigner returning null or throwing DocumentStorageException surfaces cleanly
-        when(minioStorageService.generatePresignedGetUrl(hrPdf.getStorageKey(), "guide.docx")).thenReturn(null);
-        assertThatThrownBy(() -> documentService.getDocumentPreviewUrl(DOC_ID, null, itEmployee))
-            .isInstanceOf(DocumentStorageException.class);
-        when(minioStorageService.generatePresignedGetUrl(hrPdf.getStorageKey(), "guide.docx"))
-            .thenThrow(new DocumentStorageException("Presigner failed", null));
-        assertThatThrownBy(() -> documentService.getDocumentPreviewUrl(DOC_ID, null, itEmployee))
-            .isInstanceOf(DocumentStorageException.class);
+        // Download-time RBAC check: extract issued token for itEmployee and tighten ACL to CONFIDENTIAL -> 403 immediately!
+        String docxToken = URI.create(docxPreview.previewUrl()).getQuery().substring("token=".length());
+        byte[] docxPayload = "DOCX-BYTES".getBytes(StandardCharsets.UTF_8);
+        hrPdf.setFileSizeBytes((long) docxPayload.length);
+        when(minioStorageService.openStream(eq(hrPdf.getStorageKey()), eq(null))).thenAnswer(inv -> new ResponseInputStream<>(
+            GetObjectResponse.builder().contentLength((long) docxPayload.length).build(),
+            AbortableInputStream.create(new ByteArrayInputStream(docxPayload))
+        ));
+        MockHttpServletResponse okResp = new MockHttpServletResponse();
+        documentService.streamDocumentContent(DOC_ID, docxToken, null, "127.0.0.1", okResp);
+        assertThat(okResp.getStatus()).isEqualTo(200);
+        assertThat(okResp.getContentAsByteArray()).isEqualTo(docxPayload);
+        assertThat(okResp.getHeader("Cache-Control")).contains("no-store");
 
-        // Verify SECURITY_AUDIT log hygiene: records both allow & deny actions and NEVER logs SigV4 signature
+        // Range request out-of-bounds -> 416, valid range -> 206
+        MockHttpServletResponse invalidRangeResp = new MockHttpServletResponse();
+        documentService.streamDocumentContent(DOC_ID, docxToken, "bytes=999-1000", "127.0.0.1", invalidRangeResp);
+        assertThat(invalidRangeResp.getStatus()).isEqualTo(416);
+
+        when(minioStorageService.openStream(eq(hrPdf.getStorageKey()), eq("bytes=0-3"))).thenAnswer(inv -> new ResponseInputStream<>(
+            GetObjectResponse.builder().contentLength(4L).build(),
+            AbortableInputStream.create(new ByteArrayInputStream(docxPayload, 0, 4))
+        ));
+        MockHttpServletResponse partialResp = new MockHttpServletResponse();
+        documentService.streamDocumentContent(DOC_ID, docxToken, "bytes=0-3", "127.0.0.1", partialResp);
+        assertThat(partialResp.getStatus()).isEqualTo(206);
+        assertThat(partialResp.getHeader("Content-Range")).isEqualTo("bytes 0-3/10");
+
+        // Missing S3 object -> 404 DocumentNotFoundException
+        when(minioStorageService.openStream(eq(hrPdf.getStorageKey()), eq(null)))
+            .thenThrow(new DocumentStorageException("missing", NoSuchKeyException.builder().message("missing").build()));
+        assertThatThrownBy(() -> documentService.streamDocumentContent(DOC_ID, docxToken, null, "127.0.0.1", new MockHttpServletResponse()))
+            .isInstanceOf(DocumentNotFoundException.class);
+
+        // ACL tightened to CONFIDENTIAL -> already-issued docxToken immediately throws DocumentAccessDeniedException (403)!
+        hrPdf.setAccessLevel(AccessLevel.CONFIDENTIAL);
+        assertThatThrownBy(() -> documentService.streamDocumentContent(DOC_ID, docxToken, null, "127.0.0.1", new MockHttpServletResponse()))
+            .isInstanceOf(DocumentAccessDeniedException.class);
+
+        // Revoked JWT session on download -> 403 DocumentAccessDeniedException
+        CustomUserDetails jwtPrincipal = new CustomUserDetails(
+            HR_USER_ID, HR_DEPT_ID, "mgr@documind.ai", "HR Manager", Role.DEPARTMENT_MANAGER, "revoked-jti", Instant.now().plusSeconds(900)
+        );
+        SecurityContextHolder.getContext().setAuthentication(
+            new UsernamePasswordAuthenticationToken(jwtPrincipal, null, jwtPrincipal.getAuthorities())
+        );
+        when(userRepository.findById(HR_USER_ID)).thenReturn(Optional.of(user(HR_USER_ID, hrDept, Role.DEPARTMENT_MANAGER, true)));
+        DocumentPreviewUrlResponse jwtPreview = documentService.getDocumentPreviewUrl(
+            DOC_ID, null, new CallerContext(HR_USER_ID, HR_DEPT_ID, Role.DEPARTMENT_MANAGER, "127.0.0.1")
+        );
+        String jwtPreviewToken = URI.create(jwtPreview.previewUrl()).getQuery().substring("token=".length());
+        when(tokenBlacklistService.isTokenRevoked(eq("revoked-jti"), eq(HR_USER_ID), any(Instant.class))).thenReturn(true);
+        assertThatThrownBy(() -> documentService.streamDocumentContent(DOC_ID, jwtPreviewToken, null, "127.0.0.1", new MockHttpServletResponse()))
+            .isInstanceOf(DocumentAccessDeniedException.class);
+        SecurityContextHolder.clearContext();
+
+        // Verify SECURITY_AUDIT log hygiene: records both allow & deny actions and NEVER logs preview token query string
         assertThat(output.getOut())
             .contains("SECURITY_AUDIT action=DOC_PREVIEW_URL_DENIED")
             .contains("SECURITY_AUDIT action=DOC_PREVIEW_URL")
-            .doesNotContain("X-Amz-Signature");
+            .contains("SECURITY_AUDIT action=DOC_PREVIEW_DOWNLOAD_DENIED")
+            .doesNotContain(docxToken)
+            .doesNotContain(jwtPreviewToken);
 
         // Verify method-level @PreAuthorize Defense-in-Depth annotations exist on both DA-17 service methods
         Method replaceMethod = DocumentService.class.getMethod(

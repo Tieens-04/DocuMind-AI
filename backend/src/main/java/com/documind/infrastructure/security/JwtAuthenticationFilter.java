@@ -36,6 +36,8 @@ public class JwtAuthenticationFilter extends OncePerRequestFilter {
     private static final String BEARER_PREFIX = "Bearer ";
     private static final String LOGIN_PATH = "/api/v1/auth/login";
     private static final String REFRESH_PATH = "/api/v1/auth/refresh";
+    private static final String DOCUMENTS_PREFIX = "/api/v1/documents/";
+    private static final String CONTENT_SUFFIX = "/content";
 
     private final JwtService jwtService;
     private final TokenBlacklistService tokenBlacklistService;
@@ -66,12 +68,29 @@ public class JwtAuthenticationFilter extends OncePerRequestFilter {
 
     @Override
     protected boolean shouldNotFilter(HttpServletRequest request) {
+        String servletPath = request.getServletPath();
+        String path = (servletPath != null && !servletPath.isEmpty()) ? servletPath : request.getRequestURI();
+        if (HttpMethod.GET.matches(request.getMethod()) && isDocumentPreviewContentPath(path, request.getContextPath())) {
+            return true;
+        }
         if (!HttpMethod.POST.matches(request.getMethod())) {
             return false;
         }
-        String servletPath = request.getServletPath();
-        String path = (servletPath != null && !servletPath.isEmpty()) ? servletPath : request.getRequestURI();
         return LOGIN_PATH.equals(path) || REFRESH_PATH.equals(path);
+    }
+
+    public static boolean isDocumentPreviewContentPath(String rawPath, String contextPath) {
+        if (rawPath == null || rawPath.isEmpty()) {
+            return false;
+        }
+        String path = (contextPath != null && !contextPath.isEmpty() && rawPath.startsWith(contextPath))
+            ? rawPath.substring(contextPath.length())
+            : rawPath;
+        if (!path.startsWith(DOCUMENTS_PREFIX) || !path.endsWith(CONTENT_SUFFIX)) {
+            return false;
+        }
+        String segment = path.substring(DOCUMENTS_PREFIX.length(), path.length() - CONTENT_SUFFIX.length());
+        return !segment.isEmpty() && segment.indexOf('/') < 0;
     }
 
     @Override
