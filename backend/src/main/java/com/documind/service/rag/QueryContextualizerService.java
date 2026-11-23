@@ -33,8 +33,10 @@ import java.util.regex.Pattern;
 /**
  * Rewrites terse multi-turn follow-up questions into standalone semantic queries using up to the
  * 6 most recent conversation turns before {@code bge-m3} vector embedding. Skips LLM invocation
- * completely on Turn 1 ({@code history.isEmpty()}) to optimize TTFT, and fails open to the
- * original normalized question if rewrite providers fail or return invalid output.
+ * completely on Turn 1 ({@code history.isEmpty()}) so Turn 1 preserves end-to-end
+ * {@code citations < 500 ms} and {@code TTFT < 2,500 ms}, while Turn 2+ incurs one synchronous
+ * standalone-query rewrite round-trip prior to the {@code < 500 ms} post-rewrite vector retrieval
+ * phase. Fails open to the original normalized question if rewrite providers fail or return invalid output.
  */
 @Service
 public class QueryContextualizerService {
