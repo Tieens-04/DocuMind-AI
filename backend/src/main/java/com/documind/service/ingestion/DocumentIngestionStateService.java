@@ -7,6 +7,7 @@ import com.documind.domain.event.DocumentUploadedEvent;
 import com.documind.infrastructure.vector.DocumentChunkVectorRepository;
 import com.documind.repository.DepartmentRepository;
 import com.documind.repository.DocumentRepository;
+import com.documind.service.rag.RagCacheService;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
@@ -18,6 +19,7 @@ import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.UUID;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Supplier;
 
 /**
@@ -40,13 +42,15 @@ public class DocumentIngestionStateService {
     private final Supplier<DepartmentRepository> departmentRepositorySupplier;
     private final Supplier<DocumentChunkVectorRepository> chunkVectorRepositorySupplier;
     private final Supplier<TransactionTemplate> transactionTemplateSupplier;
+    private final Supplier<RagCacheService> ragCacheServiceLookup;
 
     @Autowired
     public DocumentIngestionStateService(
         ObjectProvider<DocumentRepository> documentRepositoryProvider,
         ObjectProvider<DepartmentRepository> departmentRepositoryProvider,
         ObjectProvider<DocumentChunkVectorRepository> chunkVectorRepositoryProvider,
-        ObjectProvider<TransactionTemplate> transactionTemplateProvider
+        ObjectProvider<TransactionTemplate> transactionTemplateProvider,
+        ObjectProvider<RagCacheService> ragCacheServiceProvider
     ) {
         Objects.requireNonNull(documentRepositoryProvider, "documentRepositoryProvider must not be null");
         Objects.requireNonNull(departmentRepositoryProvider, "departmentRepositoryProvider must not be null");
@@ -56,6 +60,9 @@ public class DocumentIngestionStateService {
         this.departmentRepositorySupplier = departmentRepositoryProvider::getObject;
         this.chunkVectorRepositorySupplier = chunkVectorRepositoryProvider::getObject;
         this.transactionTemplateSupplier = transactionTemplateProvider::getObject;
+        this.ragCacheServiceLookup = ragCacheServiceProvider != null
+            ? ragCacheServiceProvider::getIfAvailable
+            : () -> null;
     }
 
     public DocumentIngestionStateService(
@@ -63,6 +70,16 @@ public class DocumentIngestionStateService {
         DepartmentRepository departmentRepository,
         DocumentChunkVectorRepository chunkVectorRepository,
         TransactionTemplate transactionTemplate
+    ) {
+        this(documentRepository, departmentRepository, chunkVectorRepository, transactionTemplate, null);
+    }
+
+    public DocumentIngestionStateService(
+        DocumentRepository documentRepository,
+        DepartmentRepository departmentRepository,
+        DocumentChunkVectorRepository chunkVectorRepository,
+        TransactionTemplate transactionTemplate,
+        RagCacheService ragCacheService
     ) {
         Objects.requireNonNull(documentRepository, "documentRepository must not be null");
         Objects.requireNonNull(departmentRepository, "departmentRepository must not be null");
@@ -72,6 +89,7 @@ public class DocumentIngestionStateService {
         this.departmentRepositorySupplier = () -> departmentRepository;
         this.chunkVectorRepositorySupplier = () -> chunkVectorRepository;
         this.transactionTemplateSupplier = () -> transactionTemplate;
+        this.ragCacheServiceLookup = () -> ragCacheService;
     }
 
     public boolean isPersistenceAvailable() {
@@ -127,6 +145,9 @@ public class DocumentIngestionStateService {
         if (chunkCount < 1) {
             throw new IllegalArgumentException("chunkCount must be >= 1");
         }
+        record PendingCompletionSync(boolean allDepartments, UUID departmentId) {
+        }
+        AtomicReference<PendingCompletionSync> pendingSyncRef = new AtomicReference<>();
         Boolean completed = transactionTemplateSupplier.get().execute(status -> {
             DocumentRepository docRepo = documentRepository();
             DocumentChunkVectorRepository chunkRepo = chunkVectorRepositorySupplier.get();
@@ -145,11 +166,24 @@ public class DocumentIngestionStateService {
             UUID effectiveDeptId = current != null ? current.getDepartmentId() : context.departmentId();
             if (effectiveAccess == AccessLevel.PUBLIC) {
                 departmentRepositorySupplier.get().incrementAllCacheVersions();
+                pendingSyncRef.set(new PendingCompletionSync(true, null));
             } else {
                 departmentRepositorySupplier.get().incrementCacheVersion(effectiveDeptId);
+                pendingSyncRef.set(new PendingCompletionSync(false, effectiveDeptId));
             }
             return true;
         });
+        if (Boolean.TRUE.equals(completed)) {
+            PendingCompletionSync pendingSync = pendingSyncRef.get();
+            RagCacheService cacheService = ragCacheServiceLookup.get();
+            if (pendingSync != null && cacheService != null) {
+                if (pendingSync.allDepartments()) {
+                    cacheService.schedulePostCommitSyncForAllDepartments();
+                } else if (pendingSync.departmentId() != null) {
+                    cacheService.schedulePostCommitSyncForDepartments(List.of(pendingSync.departmentId()));
+                }
+            }
+        }
         return Boolean.TRUE.equals(completed);
     }
 

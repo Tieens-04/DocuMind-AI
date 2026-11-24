@@ -28,6 +28,7 @@ import com.documind.repository.DepartmentRepository;
 import com.documind.repository.DocumentRepository;
 import com.documind.repository.UserRepository;
 import com.documind.service.auth.TokenBlacklistService;
+import com.documind.service.rag.RagCacheService;
 import jakarta.servlet.http.HttpServletResponse;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -56,9 +57,11 @@ import java.io.InputStream;
 import java.text.Normalizer;
 import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
+import java.util.LinkedHashSet;
 import java.util.Locale;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
@@ -90,6 +93,7 @@ public class DocumentService {
     private final Supplier<DocumentPreviewTokenService> previewTokenServiceSupplier;
     private final Supplier<TokenBlacklistService> tokenBlacklistServiceSupplier;
     private final Supplier<TransactionTemplate> transactionTemplateSupplier;
+    private final Supplier<RagCacheService> ragCacheServiceSupplier;
     private final ApplicationEventPublisher eventPublisher;
     private final Environment environment;
 
@@ -104,6 +108,7 @@ public class DocumentService {
         ObjectProvider<DocumentPreviewTokenService> previewTokenServiceProvider,
         ObjectProvider<TokenBlacklistService> tokenBlacklistServiceProvider,
         ObjectProvider<TransactionTemplate> transactionTemplateProvider,
+        ObjectProvider<RagCacheService> ragCacheServiceProvider,
         ApplicationEventPublisher eventPublisher,
         Environment environment
     ) {
@@ -117,6 +122,7 @@ public class DocumentService {
             () -> Objects.requireNonNull(previewTokenServiceProvider, "previewTokenServiceProvider must not be null").getObject(),
             () -> Objects.requireNonNull(tokenBlacklistServiceProvider, "tokenBlacklistServiceProvider must not be null").getObject(),
             () -> Objects.requireNonNull(transactionTemplateProvider, "transactionTemplateProvider must not be null").getObject(),
+            () -> ragCacheServiceProvider != null ? ragCacheServiceProvider.getIfAvailable() : null,
             eventPublisher,
             environment
         );
@@ -143,6 +149,7 @@ public class DocumentService {
             null,
             null,
             transactionTemplate,
+            null,
             eventPublisher,
             environment
         );
@@ -162,6 +169,36 @@ public class DocumentService {
         Environment environment
     ) {
         this(
+            documentRepository,
+            departmentRepository,
+            userRepository,
+            auditLogRepository,
+            fileValidationService,
+            minioStorageService,
+            previewTokenService,
+            tokenBlacklistService,
+            transactionTemplate,
+            null,
+            eventPublisher,
+            environment
+        );
+    }
+
+    public DocumentService(
+        DocumentRepository documentRepository,
+        DepartmentRepository departmentRepository,
+        UserRepository userRepository,
+        AuditLogRepository auditLogRepository,
+        FileValidationService fileValidationService,
+        MinioStorageService minioStorageService,
+        DocumentPreviewTokenService previewTokenService,
+        TokenBlacklistService tokenBlacklistService,
+        TransactionTemplate transactionTemplate,
+        RagCacheService ragCacheService,
+        ApplicationEventPublisher eventPublisher,
+        Environment environment
+    ) {
+        this(
             () -> Objects.requireNonNull(documentRepository, "documentRepository must not be null"),
             () -> Objects.requireNonNull(departmentRepository, "departmentRepository must not be null"),
             () -> Objects.requireNonNull(userRepository, "userRepository must not be null"),
@@ -171,6 +208,7 @@ public class DocumentService {
             previewTokenService != null ? () -> previewTokenService : null,
             tokenBlacklistService != null ? () -> tokenBlacklistService : null,
             () -> Objects.requireNonNull(transactionTemplate, "transactionTemplate must not be null"),
+            ragCacheService != null ? () -> ragCacheService : null,
             eventPublisher,
             environment
         );
@@ -186,6 +224,7 @@ public class DocumentService {
         Supplier<DocumentPreviewTokenService> previewTokenServiceSupplier,
         Supplier<TokenBlacklistService> tokenBlacklistServiceSupplier,
         Supplier<TransactionTemplate> transactionTemplateSupplier,
+        Supplier<RagCacheService> ragCacheServiceSupplier,
         ApplicationEventPublisher eventPublisher,
         Environment environment
     ) {
@@ -198,6 +237,7 @@ public class DocumentService {
         this.previewTokenServiceSupplier = previewTokenServiceSupplier;
         this.tokenBlacklistServiceSupplier = tokenBlacklistServiceSupplier;
         this.transactionTemplateSupplier = transactionTemplateSupplier;
+        this.ragCacheServiceSupplier = ragCacheServiceSupplier;
         this.eventPublisher = Objects.requireNonNull(eventPublisher, "eventPublisher must not be null");
         this.environment = Objects.requireNonNull(environment, "environment must not be null");
     }
@@ -242,15 +282,19 @@ public class DocumentService {
         StagedUpload stagedUpload = streamToStorage(file, department.getId(), INITIAL_DOCUMENT_VERSION);
 
         // Phase 2: Short atomic DB commit with compensating S3 deletion on duplicate or failure
+        AtomicReference<PendingCacheSync> pendingSyncRef = new AtomicReference<>();
         try {
-            return transactionTemplate().execute(status -> persistDocumentMetadata(
+            DocumentResponse uploaded = transactionTemplate().execute(status -> persistDocumentMetadata(
                 department,
                 uploadedBy,
                 stagedUpload,
                 effectiveAccessLevel,
                 caller.ipAddress(),
-                startedAtNanos
+                startedAtNanos,
+                pendingSyncRef
             ));
+            executePendingCacheSync(pendingSyncRef.get());
+            return uploaded;
         } catch (DataIntegrityViolationException ex) {
             minioStorageService.deleteObjectQuietly(stagedUpload.storageKey());
             // Query winner outside the rolled-back transaction (PostgreSQL aborts statements in failed tx)
@@ -504,6 +548,7 @@ public class DocumentService {
         AtomicReference<UUID> lockedDeptIdRef = new AtomicReference<>(preCheckDeptId);
 
         // Phase 2: Short atomic DB commit with compensating S3 cleanup on failure or duplicate race
+        AtomicReference<PendingCacheSync> pendingSyncRef = new AtomicReference<>();
         try {
             DocumentResponse replaced = transactionTemplate().execute(status -> persistReplacementMetadata(
                 documentId,
@@ -511,8 +556,10 @@ public class DocumentService {
                 accessLevel,
                 caller,
                 startedAtNanos,
-                lockedDeptIdRef
+                lockedDeptIdRef,
+                pendingSyncRef
             ));
+            executePendingCacheSync(pendingSyncRef.get());
 
             log.info(
                 "SECURITY_AUDIT action=DOC_REINDEX actorUserId={} documentId={} departmentId={} version={} accessLevel={}",
@@ -544,7 +591,8 @@ public class DocumentService {
         AccessLevel accessLevel,
         CallerContext caller,
         long startedAtNanos,
-        AtomicReference<UUID> lockedDeptIdRef
+        AtomicReference<UUID> lockedDeptIdRef,
+        AtomicReference<PendingCacheSync> pendingSyncRef
     ) {
         DocumentEntity locked = documentRepository().findByIdForUpdate(documentId)
             .orElseThrow(() -> new DocumentNotFoundException(documentId));
@@ -596,7 +644,11 @@ public class DocumentService {
         // PostgreSQL V6 trigger already bumps cache_version when original_name or access_level changed;
         // increment explicitly only when both remained unchanged so cache_version always advances by +1.
         if (!triggerBumpsCacheVersion) {
-            incrementCacheVersion(effectiveAccessLevel, lockedDeptId);
+            pendingSyncRef.set(incrementCacheVersion(effectiveAccessLevel, lockedDeptId));
+        } else {
+            boolean affectsAllDepartments = oldAccessLevel == AccessLevel.PUBLIC
+                || effectiveAccessLevel == AccessLevel.PUBLIC;
+            pendingSyncRef.set(PendingCacheSync.of(affectsAllDepartments, lockedDeptId));
         }
 
         if (oldStorageKey != null && !Objects.equals(oldStorageKey, saved.getStorageKey())) {
@@ -670,6 +722,7 @@ public class DocumentService {
         requireCallerDepartment(caller);
 
         AtomicReference<TransferTarget> transferTargetRef = new AtomicReference<>();
+        AtomicReference<PendingCacheSync> pendingSyncRef = new AtomicReference<>();
 
         try {
             DocumentResponse updated = transactionTemplate().execute(status -> {
@@ -681,6 +734,8 @@ public class DocumentService {
                     throw new DocumentAccessDeniedException("You do not have permission to update this document");
                 }
 
+                UUID oldDepartmentId = document.getDepartmentId();
+                AccessLevel oldAccessLevel = document.getAccessLevel();
                 boolean chunkSyncedMetadataChanged = false;
 
                 if (request.departmentId() != null && !Objects.equals(request.departmentId(), document.getDepartmentId())) {
@@ -730,11 +785,17 @@ public class DocumentService {
                 }
 
                 DocumentEntity saved = documentRepository().saveAndFlush(document);
+                if (chunkSyncedMetadataChanged) {
+                    boolean affectsAllDepartments = oldAccessLevel == AccessLevel.PUBLIC
+                        || saved.getAccessLevel() == AccessLevel.PUBLIC;
+                    pendingSyncRef.set(PendingCacheSync.of(affectsAllDepartments, oldDepartmentId, saved.getDepartmentId()));
+                }
                 if (requeueActiveIngestion) {
                     publishUploadedEvent(saved);
                 }
                 return DocumentResponse.from(saved);
             });
+            executePendingCacheSync(pendingSyncRef.get());
 
             log.info(
                 "SECURITY_AUDIT action=DOC_METADATA_UPDATE actorUserId={} documentId={} departmentId={} accessLevel={}",
@@ -774,6 +835,7 @@ public class DocumentService {
         }
         requireCallerDepartment(caller);
 
+        AtomicReference<PendingCacheSync> pendingSyncRef = new AtomicReference<>();
         transactionTemplate().executeWithoutResult(status -> {
             UserEntity auditUser = resolveVerifiedActor(caller, caller.isSystemAdmin() ? null : caller.departmentId());
             DocumentEntity document = documentRepository().findByIdForUpdate(documentId)
@@ -799,9 +861,10 @@ public class DocumentService {
                 startedAtNanos
             );
             // Increment after delete/audit while entities remain attached (query clears persistence context)
-            incrementCacheVersion(accessLevel, documentDepartmentId);
+            pendingSyncRef.set(incrementCacheVersion(accessLevel, documentDepartmentId));
             scheduleDeleteAfterCommit(storageKey);
         });
+        executePendingCacheSync(pendingSyncRef.get());
     }
 
     private UUID resolveUploadDepartmentId(UUID targetDepartmentId, CallerContext caller) {
@@ -876,7 +939,8 @@ public class DocumentService {
         StagedUpload stagedUpload,
         AccessLevel accessLevel,
         String ipAddress,
-        long startedAtNanos
+        long startedAtNanos,
+        AtomicReference<PendingCacheSync> pendingSyncRef
     ) {
         Optional<DocumentEntity> existing = documentRepository()
             .findByDepartmentIdAndFileHash(department.getId(), stagedUpload.fileHash());
@@ -893,7 +957,7 @@ public class DocumentService {
         applyStagedUpload(entity, uploadedBy, stagedUpload, accessLevel, INITIAL_DOCUMENT_VERSION);
 
         DocumentEntity saved = documentRepository().saveAndFlush(entity);
-        incrementCacheVersion(accessLevel, department.getId());
+        pendingSyncRef.set(incrementCacheVersion(accessLevel, department.getId()));
         saveAuditLog(
             uploadedBy,
             department,
@@ -1001,11 +1065,42 @@ public class DocumentService {
         return user;
     }
 
-    private void incrementCacheVersion(AccessLevel accessLevel, UUID departmentId) {
+    private PendingCacheSync incrementCacheVersion(AccessLevel accessLevel, UUID departmentId) {
         if (accessLevel == AccessLevel.PUBLIC) {
             departmentRepository().incrementAllCacheVersions();
-        } else {
-            departmentRepository().incrementCacheVersion(departmentId);
+            return PendingCacheSync.of(true);
+        }
+        departmentRepository().incrementCacheVersion(departmentId);
+        return PendingCacheSync.of(false, departmentId);
+    }
+
+    private void executePendingCacheSync(PendingCacheSync pendingSync) {
+        if (pendingSync == null) {
+            return;
+        }
+        RagCacheService cacheService = ragCacheServiceSupplier != null ? ragCacheServiceSupplier.get() : null;
+        if (cacheService == null) {
+            return;
+        }
+        if (pendingSync.allDepartments()) {
+            cacheService.schedulePostCommitSyncForAllDepartments();
+        } else if (!pendingSync.departmentIds().isEmpty()) {
+            cacheService.schedulePostCommitSyncForDepartments(pendingSync.departmentIds());
+        }
+    }
+
+    private record PendingCacheSync(boolean allDepartments, Set<UUID> departmentIds) {
+        static PendingCacheSync of(boolean allDepartments, UUID... ids) {
+            if (allDepartments) {
+                return new PendingCacheSync(true, Set.of());
+            }
+            Set<UUID> targets = new LinkedHashSet<>();
+            for (UUID deptId : ids) {
+                if (deptId != null) {
+                    targets.add(deptId);
+                }
+            }
+            return new PendingCacheSync(false, Set.copyOf(targets));
         }
     }
 

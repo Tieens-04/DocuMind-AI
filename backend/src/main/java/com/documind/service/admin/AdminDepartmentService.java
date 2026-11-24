@@ -5,14 +5,18 @@ import com.documind.controller.dto.admin.AdminDepartmentResponse;
 import com.documind.controller.dto.admin.CreateDepartmentRequest;
 import com.documind.controller.dto.admin.UpdateDepartmentRequest;
 import com.documind.domain.entity.DepartmentEntity;
+import com.documind.domain.entity.UserEntity;
 import com.documind.exception.AdminConflictException;
 import com.documind.exception.InvalidAdminRequestException;
 import com.documind.exception.ResourceNotFoundException;
 import com.documind.repository.DepartmentRepository;
 import com.documind.repository.DocumentRepository;
 import com.documind.repository.UserRepository;
+import com.documind.service.rag.RagCacheService;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.ObjectProvider;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.context.annotation.Lazy;
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.data.domain.Page;
@@ -23,9 +27,12 @@ import org.springframework.stereotype.Service;
 import org.springframework.transaction.PlatformTransactionManager;
 
 import java.text.Normalizer;
+import java.util.List;
 import java.util.Locale;
 import java.util.Objects;
 import java.util.UUID;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Supplier;
 import java.util.regex.Pattern;
 
 /**
@@ -44,17 +51,32 @@ public class AdminDepartmentService {
     private final UserRepository userRepository;
     private final DocumentRepository documentRepository;
     private final PlatformTransactionManager transactionManager;
+    private final Supplier<RagCacheService> ragCacheServiceLookup;
 
+    @Autowired
     public AdminDepartmentService(
         @Lazy DepartmentRepository departmentRepository,
         @Lazy UserRepository userRepository,
         @Lazy DocumentRepository documentRepository,
-        @Lazy PlatformTransactionManager transactionManager
+        @Lazy PlatformTransactionManager transactionManager,
+        ObjectProvider<RagCacheService> ragCacheServiceProvider
     ) {
         this.departmentRepository = Objects.requireNonNull(departmentRepository, "departmentRepository must not be null");
         this.userRepository = Objects.requireNonNull(userRepository, "userRepository must not be null");
         this.documentRepository = Objects.requireNonNull(documentRepository, "documentRepository must not be null");
         this.transactionManager = Objects.requireNonNull(transactionManager, "transactionManager must not be null");
+        this.ragCacheServiceLookup = ragCacheServiceProvider != null
+            ? ragCacheServiceProvider::getIfAvailable
+            : () -> null;
+    }
+
+    public AdminDepartmentService(
+        DepartmentRepository departmentRepository,
+        UserRepository userRepository,
+        DocumentRepository documentRepository,
+        PlatformTransactionManager transactionManager
+    ) {
+        this(departmentRepository, userRepository, documentRepository, transactionManager, null);
     }
 
     public AdminDepartmentResponse createDepartment(CreateDepartmentRequest request, UUID actorUserId) {
@@ -91,6 +113,11 @@ public class AdminDepartmentService {
                 "A department with code '" + normalizedCode + "' already exists",
                 ex
             );
+        }
+
+        RagCacheService cacheService = ragCacheServiceLookup.get();
+        if (cacheService != null) {
+            cacheService.schedulePostCommitSyncForDepartments(List.of(created.id()));
         }
 
         log.info(
@@ -193,10 +220,22 @@ public class AdminDepartmentService {
         if (departmentId == null) {
             throw new InvalidAdminRequestException("Department ID must not be null");
         }
+        record DeletedDepartmentSync(UUID carryDepartmentId) {
+        }
+        AtomicReference<DeletedDepartmentSync> syncRef = new AtomicReference<>();
         String deletedCode;
         try {
             deletedCode = AdminServiceSupport.executeInTransaction(transactionManager, false, () -> {
-                AdminServiceSupport.verifyActiveSystemAdmin(userRepository, actorUserId);
+                UserEntity actor = AdminServiceSupport.verifyActiveSystemAdmin(userRepository, actorUserId);
+                UUID preferredCarryId = (actor != null
+                    && actor.getDepartmentId() != null
+                    && !actor.getDepartmentId().equals(departmentId))
+                    ? actor.getDepartmentId()
+                    : null;
+                if (preferredCarryId != null) {
+                    departmentRepository.lockDepartmentsInOrder(List.of(departmentId, preferredCarryId));
+                }
+
                 DepartmentEntity entity = departmentRepository.findByIdForUpdate(departmentId)
                     .orElseThrow(() -> new ResourceNotFoundException("Department not found: " + departmentId));
 
@@ -208,9 +247,20 @@ public class AdminDepartmentService {
                     );
                 }
 
+                long retiredVersion = entity.getCacheVersion() != null ? Math.max(1L, entity.getCacheVersion()) : 1L;
                 String code = entity.getCode();
                 departmentRepository.delete(entity);
                 departmentRepository.flush();
+
+                // Carry retired version (+1) onto a surviving department so SUM(cache_version) for ADMIN:GLOBAL
+                // advances strictly monotonically and never reuses historical global cache_version keys.
+                UUID effectiveCarryId = preferredCarryId != null
+                    ? preferredCarryId
+                    : departmentRepository.findFirstSurvivingDepartmentIdForUpdate(departmentId).orElse(null);
+                if (effectiveCarryId != null) {
+                    departmentRepository.addCacheVersionDelta(effectiveCarryId, retiredVersion + 1L);
+                }
+                syncRef.set(new DeletedDepartmentSync(effectiveCarryId));
                 return code;
             });
         } catch (DataIntegrityViolationException ex) {
@@ -219,6 +269,17 @@ public class AdminDepartmentService {
                 "Cannot delete department while users or documents are still assigned to it",
                 ex
             );
+        }
+
+        RagCacheService cacheService = ragCacheServiceLookup.get();
+        if (cacheService != null) {
+            DeletedDepartmentSync sync = syncRef.get();
+            if (sync != null && sync.carryDepartmentId() != null) {
+                cacheService.schedulePostCommitSyncForDepartments(List.of(sync.carryDepartmentId()));
+            } else {
+                cacheService.schedulePostCommitSyncForAllDepartments();
+            }
+            cacheService.schedulePostCommitDeleteDepartmentVersionKey(departmentId);
         }
 
         log.info(
