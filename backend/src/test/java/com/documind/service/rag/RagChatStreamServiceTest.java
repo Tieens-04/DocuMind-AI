@@ -1016,12 +1016,185 @@ class RagChatStreamServiceTest {
         assertThat(done.tokenUsage().totalTokens()).isEqualTo(113);
     }
 
+    @Test
+    void streamReplaysL1CacheHitPublishesGroundedMissBeforeDoneAndHandles499And404DuringReplay() throws Exception {
+        RagCacheService ragCacheService = mock(RagCacheService.class);
+        RagChatService cachedChatService = new RagChatService(
+            vectorRetrievalService,
+            groundedSystemPromptService,
+            rbacVectorFilterFactory,
+            groqChatClient,
+            providerOf(geminiChatClient),
+            providerOf(userRepository),
+            providerOf(departmentRepository),
+            providerOf(auditLogRepository),
+            providerOf(transactionTemplate),
+            providerOf(chatSessionService),
+            providerOf(queryContextualizerService),
+            providerOf(ragCacheService),
+            aiProperties,
+            ragProperties,
+            environment
+        );
+        CallerContext caller = authenticateUser(HR_USER_ID, HR_DEPT_ID, Role.STANDARD_EMPLOYEE);
+        UserEntity actor = activeUser(HR_USER_ID, HR_DEPT_ID, Role.STANDARD_EMPLOYEE);
+        when(userRepository.findById(HR_USER_ID)).thenReturn(Optional.of(actor));
+
+        RetrievedChunk hit = sampleChunk();
+        UUID sessionId = UUID.randomUUID();
+        UUID l1MsgId = UUID.randomUUID();
+
+        // 1. L1 replay: citations -> token -> done with cacheHit=true, cacheTier=L1, 0 tokens, 0 retrieval/LLM calls
+        RagCacheService.CacheLookupResult l1HitResult = RagCacheService.CacheLookupResult.hit(
+            CacheTier.L1,
+            3L,
+            "Nhân viên chính thức được hưởng 12 ngày phép năm.",
+            null,
+            List.of(hit.citation()),
+            RagConstants.PROVIDER_GROQ,
+            null,
+            400_000L,
+            0L,
+            0L
+        );
+        when(ragCacheService.lookupL1(any(RbacVectorScope.class), eq("Chính sách phép năm?"), eq(List.of()), any()))
+            .thenReturn(new RagCacheService.L1LookupResult(l1HitResult, 3L, 400_000L, false));
+        when(chatSessionService.recordCompletedTurn(any()))
+            .thenReturn(new ChatSessionService.PersistedTurnResult(sessionId, l1MsgId));
+
+        RecordingSseEmitter l1Emitter = new RecordingSseEmitter(10_000L);
+        RagChatStreamService streamService = buildServiceWithChatService(cachedChatService, ragProperties, timeout -> l1Emitter);
+        streamService.openStream("Chính sách phép năm?", null, null, caller);
+        assertThat(l1Emitter.awaitCompleted(5, TimeUnit.SECONDS)).isTrue();
+
+        verifyNoInteractions(vectorRetrievalService, groqChatModel, geminiChatModel, queryContextualizerService);
+        verify(ragCacheService, never()).lookupL2(any(), any(), anyLong(), anyLong());
+        assertThat(l1Emitter.events()).hasSize(3);
+        assertThat(l1Emitter.events().get(0).name()).isEqualTo("citations");
+        assertThat(((ChatStreamCitationsEvent) l1Emitter.events().get(0).payload()).citations())
+            .containsExactly(hit.citation());
+        assertThat(l1Emitter.events().get(1).name()).isEqualTo("token");
+        assertThat(((ChatStreamTokenEvent) l1Emitter.events().get(1).payload()).delta())
+            .isEqualTo("Nhân viên chính thức được hưởng 12 ngày phép năm.");
+        assertThat(l1Emitter.events().get(2).name()).isEqualTo("done");
+        ChatStreamDoneEvent l1Done = (ChatStreamDoneEvent) l1Emitter.events().get(2).payload();
+        assertThat(l1Done.cacheHit()).isTrue();
+        assertThat(l1Done.cacheTier()).isEqualTo(CacheTier.L1);
+        assertThat(l1Done.messageId()).isEqualTo(l1MsgId);
+        assertThat(l1Done.tokenUsage().totalTokens()).isZero();
+        assertThat(l1Done.modelProvider()).isEqualTo(RagConstants.PROVIDER_GROQ);
+
+        ArgumentCaptor<ChatSessionService.CompletedTurnCommand> l1CmdCaptor =
+            ArgumentCaptor.forClass(ChatSessionService.CompletedTurnCommand.class);
+        verify(chatSessionService).recordCompletedTurn(l1CmdCaptor.capture());
+        assertThat(l1CmdCaptor.getValue().cacheTier()).isEqualTo(CacheTier.L1);
+        verify(ragCacheService, never()).publishIfCurrent(any(), anyLong(), any(), any(), any(), any(), any(), any(), eq(false), any());
+
+        // 2. Grounded MISS -> publishes to cache BEFORE done event with version captured before retrieval
+        clearInvocations(chatSessionService, ragCacheService);
+        float[] queryVec = new float[]{0.5f, 0.5f};
+        when(ragCacheService.lookupL1(any(RbacVectorScope.class), eq("Chính sách thử việc?"), eq(List.of()), any()))
+            .thenReturn(new RagCacheService.L1LookupResult(null, 7L, 500_000L, false));
+        when(ragCacheService.lookupL2(any(RbacVectorScope.class), eq("Chính sách thử việc?"), eq(7L), eq(500_000L)))
+            .thenReturn(RagCacheService.CacheLookupResult.miss(7L, queryVec, 500_000L, 2_000_000L, 3_000_000L));
+        when(ragCacheService.readAuthoritativeVersion(any(RbacVectorScope.class))).thenReturn(7L);
+        when(vectorRetrievalService.retrieve(eq("Chính sách thử việc?"), any(RbacVectorScope.class)))
+            .thenReturn(List.of(hit));
+        when(groqChatModel.stream(any(Prompt.class))).thenReturn(Flux.just(
+            textChunk("Thử việc 60 ngày."),
+            usageOnlyChunk(80, 15)
+        ));
+        org.mockito.Mockito.doReturn(new ChatSessionService.PersistedTurnResult(sessionId, UUID.randomUUID()))
+            .when(chatSessionService).recordCompletedTurn(any());
+
+        RecordingSseEmitter missEmitter = new RecordingSseEmitter(10_000L);
+        RagChatStreamService missService = buildServiceWithChatService(cachedChatService, ragProperties, timeout -> missEmitter);
+        missService.openStream("Chính sách thử việc?", null, null, caller);
+        assertThat(missEmitter.awaitCompleted(5, TimeUnit.SECONDS)).isTrue();
+
+        verify(ragCacheService).publishIfCurrent(
+            any(RbacVectorScope.class),
+            eq(7L),
+            eq("Chính sách thử việc?"),
+            eq(null),
+            eq(List.of()),
+            eq(queryVec),
+            eq("Thử việc 60 ngày."),
+            eq(List.of(hit.citation())),
+            eq(false),
+            eq(RagConstants.PROVIDER_GROQ)
+        );
+        ChatStreamDoneEvent missDone = (ChatStreamDoneEvent) missEmitter.events().getLast().payload();
+        assertThat(missDone.cacheHit()).isFalse();
+        assertThat(missDone.cacheTier()).isEqualTo(CacheTier.NONE);
+
+        // 3. Client disconnect (499) during L1 replay -> skips recordCompletedTurn and logs single 499 audit with CacheTier.L1
+        clearInvocations(chatSessionService);
+        CountDownLatch audit499Latch = new CountDownLatch(1);
+        org.mockito.Mockito.doAnswer(inv -> {
+            audit499Latch.countDown();
+            return null;
+        }).when(chatSessionService).recordFailureAudit(
+            any(), any(), any(), any(), anyInt(), anyInt(), anyLong(), any(), eq(499), eq(CacheTier.L1), any()
+        );
+        RecordingSseEmitter disconnectEmitter = new RecordingSseEmitter(10_000L);
+        disconnectEmitter.failOnSendNumber(2, new IOException("Broken pipe on token replay"));
+        RagChatStreamService disconnectService = buildServiceWithChatService(cachedChatService, ragProperties, timeout -> disconnectEmitter);
+        disconnectService.openStream("Chính sách phép năm?", null, null, caller);
+        assertThat(audit499Latch.await(5, TimeUnit.SECONDS)).isTrue();
+        verify(chatSessionService, never()).recordCompletedTurn(any());
+
+        // 4. Mid-flight deleted session (404) during L1 replay -> emits RESOURCE_NOT_FOUND error without double failure audit
+        clearInvocations(chatSessionService);
+        UUID deletedSessionId = UUID.randomUUID();
+        when(chatSessionService.loadAuthorizedHistoryForTurn(eq(deletedSessionId), eq(HR_USER_ID), any()))
+            .thenReturn(List.of());
+        when(chatSessionService.recordCompletedTurn(any()))
+            .thenThrow(new ResourceNotFoundException("Chat session not found: " + deletedSessionId));
+
+        RecordingSseEmitter deletedSessionEmitter = new RecordingSseEmitter(10_000L);
+        RagChatStreamService deletedService = buildServiceWithChatService(cachedChatService, ragProperties, timeout -> deletedSessionEmitter);
+        deletedService.openStream("Chính sách phép năm?", deletedSessionId, null, caller);
+        assertThat(deletedSessionEmitter.awaitCompleted(5, TimeUnit.SECONDS)).isTrue();
+
+        assertThat(deletedSessionEmitter.events().getLast().name()).isEqualTo("error");
+        ChatStreamErrorEvent notFoundErr = (ChatStreamErrorEvent) deletedSessionEmitter.events().getLast().payload();
+        assertThat(notFoundErr.errorCode()).isEqualTo("RESOURCE_NOT_FOUND");
+        verify(chatSessionService, never()).recordFailureAudit(
+            any(), any(), any(), any(), anyInt(), anyInt(), anyLong(), any(), anyInt(), any(), any()
+        );
+
+        // 5. Exception thrown by publishIfCurrent after DB turn commit must still emit terminal done event cleanly
+        clearInvocations(chatSessionService, ragCacheService);
+        org.mockito.Mockito.doThrow(new IllegalStateException("Simulated cache publish failure"))
+            .when(ragCacheService).publishIfCurrent(any(), anyLong(), any(), any(), any(), any(), any(), any(), eq(false), any());
+        org.mockito.Mockito.doReturn(new ChatSessionService.PersistedTurnResult(sessionId, UUID.randomUUID()))
+            .when(chatSessionService).recordCompletedTurn(any());
+        when(groqChatModel.stream(any(Prompt.class))).thenReturn(Flux.just(
+            textChunk("Thử việc 60 ngày."),
+            usageOnlyChunk(80, 15)
+        ));
+        RecordingSseEmitter guardedPublishEmitter = new RecordingSseEmitter(10_000L);
+        RagChatStreamService guardedService = buildServiceWithChatService(cachedChatService, ragProperties, timeout -> guardedPublishEmitter);
+        guardedService.openStream("Chính sách thử việc?", null, null, caller);
+        assertThat(guardedPublishEmitter.awaitCompleted(5, TimeUnit.SECONDS)).isTrue();
+        assertThat(guardedPublishEmitter.events().getLast().name()).isEqualTo("done");
+    }
+
     private RagChatStreamService buildService(
         RagProperties props,
         java.util.function.LongFunction<SseEmitter> emitterFactory
     ) {
+        return buildServiceWithChatService(ragChatService, props, emitterFactory);
+    }
+
+    private RagChatStreamService buildServiceWithChatService(
+        RagChatService customRagChatService,
+        RagProperties props,
+        java.util.function.LongFunction<SseEmitter> emitterFactory
+    ) {
         RagChatStreamService service = new RagChatStreamService(
-            ragChatService,
+            customRagChatService,
             vectorRetrievalService,
             groundedSystemPromptService,
             groqChatClient,

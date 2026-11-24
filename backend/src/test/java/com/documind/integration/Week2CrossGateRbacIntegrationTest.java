@@ -539,6 +539,10 @@ class Week2CrossGateRbacIntegrationTest {
                         .doesNotContain(fixture.doc().originalName());
                 }
 
+                // Flush L1/L2 cache between /ask and /stream so /stream still verifies live RBAC vector retrieval
+                AbstractIntegrationTest.flushRedis(stringRedisTemplate);
+                jdbcTemplate.update("DELETE FROM semantic_cache");
+
                 recordingChatModel.reset();
                 List<SseFrame> sseFrames = client.collectAllSseFrames(
                     port,
@@ -565,8 +569,24 @@ class Week2CrossGateRbacIntegrationTest {
                     }
                     assertThat(citesExpectedDoc).isTrue();
                     assertThat(sseFrames.getLast().event()).isEqualTo("done");
-                    assertThat(objectMapper.readTree(sseFrames.getLast().data()).path("abstained").asBoolean()).isFalse();
+                    JsonNode sseDone = objectMapper.readTree(sseFrames.getLast().data());
+                    assertThat(sseDone.path("abstained").asBoolean()).isFalse();
+                    assertThat(sseDone.path("cacheHit").asBoolean()).isFalse();
+                    assertThat(sseDone.path("cacheTier").asText()).isEqualTo("NONE");
                     assertThat(recordingChatModel.callCount()).isEqualTo(1);
+
+                    // Repeat on same scope immediately hits caller-scoped L1 cache with 0 LLM calls
+                    recordingChatModel.reset();
+                    List<SseFrame> l1RepeatFrames = client.collectAllSseFrames(
+                        port,
+                        Map.of("question", fixture.query()),
+                        jwt
+                    );
+                    JsonNode repeatDone = objectMapper.readTree(l1RepeatFrames.getLast().data());
+                    assertThat(repeatDone.path("abstained").asBoolean()).isFalse();
+                    assertThat(repeatDone.path("cacheHit").asBoolean()).isTrue();
+                    assertThat(repeatDone.path("cacheTier").asText()).isEqualTo("L1");
+                    assertThat(recordingChatModel.callCount()).isZero();
                 } else {
                     client.assertDeterministicSseRefusal(
                         sseFrames,

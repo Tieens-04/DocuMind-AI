@@ -639,6 +639,8 @@ class MultiTurnSessionChatIntegrationTest {
         // Part (b): Two concurrent POST /api/v1/chat/ask requests racing into Phase 3 on the same sessionId
         // serialize cleanly under FOR UPDATE and preserve strictly alternating USER -> ASSISTANT pairs
         chatModel.reset();
+        AbstractIntegrationTest.flushRedis(stringRedisTemplate);
+        jdbcTemplate.update("DELETE FROM semantic_cache");
         HttpResponse<String> freshSessionRaw = sendAuthed("POST", "/api/v1/chat/sessions", hrEmployeeJwt, null);
         assertThat(freshSessionRaw.statusCode()).isEqualTo(201);
         UUID racingSessionId = objectMapper.readValue(freshSessionRaw.body(), ChatSessionResponse.class).id();

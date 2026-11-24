@@ -9,6 +9,7 @@ import com.documind.exception.DocumentExtractionException;
 import com.documind.infrastructure.vector.DocumentChunkVectorRepository;
 import com.documind.repository.DepartmentRepository;
 import com.documind.repository.DocumentRepository;
+import com.documind.service.rag.RagCacheService;
 import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
 import org.mockito.InOrder;
@@ -625,6 +626,53 @@ class DocumentIngestionWorkerTest {
             var method = DocumentIngestionWorker.class.getDeclaredMethod("recoverStaleDocumentsScheduled");
             assertThat(method.isAnnotationPresent(org.springframework.scheduling.annotation.Scheduled.class)).isTrue();
         }).doesNotThrowAnyException();
+    }
+
+    @Test
+    void markCompletedSchedulesPostCommitCacheSyncForDepartmentAndPublicScopes() {
+        UUID docId = UUID.randomUUID();
+        UUID deptId = UUID.randomUUID();
+        DocumentRepository docRepo = mock(DocumentRepository.class);
+        DepartmentRepository deptRepo = mock(DepartmentRepository.class);
+        DocumentChunkVectorRepository chunkRepo = mock(DocumentChunkVectorRepository.class);
+        RagCacheService ragCacheService = mock(RagCacheService.class);
+        TransactionTemplate txTemplate = new TransactionTemplate(new NoOpTransactionManager());
+
+        DocumentIngestionStateService stateService = new DocumentIngestionStateService(
+            docRepo,
+            deptRepo,
+            chunkRepo,
+            txTemplate,
+            ragCacheService
+        );
+
+        var dept = new com.documind.domain.entity.DepartmentEntity();
+        dept.setId(deptId);
+        DocumentEntity doc = new DocumentEntity();
+        doc.setId(docId);
+        doc.setDepartment(dept);
+        doc.setAccessLevel(AccessLevel.DEPARTMENT);
+
+        DocumentIngestionContext ctx = new DocumentIngestionContext(
+            docId, deptId, "departments/" + deptId + "/" + docId + "/v1/doc.txt", "doc.txt", "txt", AccessLevel.DEPARTMENT, 1
+        );
+
+        when(docRepo.markCompleted(docId, 1, 5)).thenReturn(1);
+        when(docRepo.findById(docId)).thenReturn(Optional.of(doc));
+        assertThat(stateService.markCompleted(ctx, 5)).isTrue();
+        verify(deptRepo).incrementCacheVersion(deptId);
+        verify(ragCacheService).schedulePostCommitSyncForDepartments(List.of(deptId));
+
+        doc.setAccessLevel(AccessLevel.PUBLIC);
+        assertThat(stateService.markCompleted(ctx, 5)).isTrue();
+        verify(deptRepo).incrementAllCacheVersions();
+        verify(ragCacheService).schedulePostCommitSyncForAllDepartments();
+
+        // Superseded version (0 rows updated) -> never triggers cache sync
+        org.mockito.Mockito.clearInvocations(ragCacheService);
+        when(docRepo.markCompleted(docId, 1, 5)).thenReturn(0);
+        assertThat(stateService.markCompleted(ctx, 5)).isFalse();
+        verifyNoInteractions(ragCacheService);
     }
 
     private static final class NoOpTransactionManager extends AbstractPlatformTransactionManager {
