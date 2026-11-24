@@ -9,7 +9,7 @@ import java.time.Duration;
 
 /**
  * Configuration properties controlling vector retrieval bounds, excerpt sizing, LLM ask safeguards,
- * conversation memory windows, and typed SSE streaming timeouts.
+ * conversation memory windows, typed SSE streaming timeouts, and two-tier RBAC-scoped RAG caching.
  */
 @Validated
 @ConfigurationProperties(prefix = "documind.rag")
@@ -17,7 +17,8 @@ public record RagProperties(
     RetrievalProperties retrieval,
     LlmProperties llm,
     MemoryProperties memory,
-    SseProperties sse
+    SseProperties sse,
+    CacheProperties cache
 ) {
 
     public static final int DEFAULT_TOP_K = 5;
@@ -30,6 +31,11 @@ public record RagProperties(
     public static final int DEFAULT_MAX_HISTORY_MESSAGE_CHARS = 1000;
     public static final int DEFAULT_AUTO_TITLE_MAX_CHARS = 80;
     public static final Duration DEFAULT_SSE_TIMEOUT = Duration.ofSeconds(120);
+    public static final boolean DEFAULT_CACHE_ENABLED = true;
+    public static final Duration DEFAULT_CACHE_L1_TTL = Duration.ofMinutes(30);
+    public static final Duration DEFAULT_CACHE_L2_TTL = Duration.ofHours(24);
+    public static final double DEFAULT_CACHE_SEMANTIC_THRESHOLD = 0.94d;
+    public static final Duration DEFAULT_CACHE_VERSION_TTL = Duration.ofHours(24);
 
     @ConstructorBinding
     public RagProperties {
@@ -37,14 +43,24 @@ public record RagProperties(
         llm = llm != null ? llm : LlmProperties.defaults();
         memory = memory != null ? memory : MemoryProperties.defaults();
         sse = sse != null ? sse : SseProperties.defaults();
+        cache = cache != null ? cache : CacheProperties.defaults();
     }
 
     public RagProperties(RetrievalProperties retrieval, LlmProperties llm) {
-        this(retrieval, llm, MemoryProperties.defaults(), SseProperties.defaults());
+        this(retrieval, llm, MemoryProperties.defaults(), SseProperties.defaults(), CacheProperties.defaults());
     }
 
     public RagProperties(RetrievalProperties retrieval, LlmProperties llm, MemoryProperties memory) {
-        this(retrieval, llm, memory, SseProperties.defaults());
+        this(retrieval, llm, memory, SseProperties.defaults(), CacheProperties.defaults());
+    }
+
+    public RagProperties(
+        RetrievalProperties retrieval,
+        LlmProperties llm,
+        MemoryProperties memory,
+        SseProperties sse
+    ) {
+        this(retrieval, llm, memory, sse, CacheProperties.defaults());
     }
 
     public static RagProperties defaults() {
@@ -52,7 +68,8 @@ public record RagProperties(
             RetrievalProperties.defaults(),
             LlmProperties.defaults(),
             MemoryProperties.defaults(),
-            SseProperties.defaults()
+            SseProperties.defaults(),
+            CacheProperties.defaults()
         );
     }
 
@@ -156,6 +173,56 @@ public record RagProperties(
 
         public static SseProperties defaults() {
             return new SseProperties(DEFAULT_SSE_TIMEOUT);
+        }
+    }
+
+    public record CacheProperties(
+        @DefaultValue("true") boolean enabled,
+        @DefaultValue("30m") Duration l1Ttl,
+        @DefaultValue("24h") Duration l2Ttl,
+        @DefaultValue("0.94") double semanticSimilarityThreshold,
+        @DefaultValue("24h") Duration versionTtl
+    ) {
+
+        private static final Duration MIN_TTL = Duration.ofSeconds(1);
+        private static final Duration MAX_L1_TTL = Duration.ofDays(7);
+        private static final Duration MAX_L2_TTL = Duration.ofDays(30);
+        private static final Duration MAX_VERSION_TTL = Duration.ofDays(30);
+
+        @ConstructorBinding
+        public CacheProperties {
+            if (l1Ttl == null || l1Ttl.compareTo(MIN_TTL) < 0 || l1Ttl.compareTo(MAX_L1_TTL) > 0) {
+                throw new IllegalArgumentException(
+                    "cache.l1Ttl must be between " + MIN_TTL + " and " + MAX_L1_TTL
+                );
+            }
+            if (l2Ttl == null || l2Ttl.compareTo(MIN_TTL) < 0 || l2Ttl.compareTo(MAX_L2_TTL) > 0) {
+                throw new IllegalArgumentException(
+                    "cache.l2Ttl must be between " + MIN_TTL + " and " + MAX_L2_TTL
+                );
+            }
+            if (!Double.isFinite(semanticSimilarityThreshold)
+                || semanticSimilarityThreshold < 0.50d
+                || semanticSimilarityThreshold > 1.0d) {
+                throw new IllegalArgumentException(
+                    "cache.semanticSimilarityThreshold must be between 0.50 and 1.0"
+                );
+            }
+            if (versionTtl == null || versionTtl.compareTo(MIN_TTL) < 0 || versionTtl.compareTo(MAX_VERSION_TTL) > 0) {
+                throw new IllegalArgumentException(
+                    "cache.versionTtl must be between " + MIN_TTL + " and " + MAX_VERSION_TTL
+                );
+            }
+        }
+
+        public static CacheProperties defaults() {
+            return new CacheProperties(
+                DEFAULT_CACHE_ENABLED,
+                DEFAULT_CACHE_L1_TTL,
+                DEFAULT_CACHE_L2_TTL,
+                DEFAULT_CACHE_SEMANTIC_THRESHOLD,
+                DEFAULT_CACHE_VERSION_TTL
+            );
         }
     }
 }
