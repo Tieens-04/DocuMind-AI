@@ -2,6 +2,7 @@ package com.documind.infrastructure.vector;
 
 import com.documind.domain.model.CitationPayload;
 
+import java.time.OffsetDateTime;
 import java.util.List;
 import java.util.UUID;
 
@@ -17,7 +18,8 @@ public record SemanticCacheEntry(
     String responseContent,
     List<CitationPayload> citations,
     String modelProvider,
-    double similarityScore
+    double similarityScore,
+    OffsetDateTime expiresAt
 ) {
 
     public SemanticCacheEntry {

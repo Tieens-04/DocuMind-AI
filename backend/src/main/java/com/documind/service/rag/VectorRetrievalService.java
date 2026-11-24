@@ -159,7 +159,13 @@ public class VectorRetrievalService {
 
             String baseUrl = presignedUrlMemo.computeIfAbsent(
                 parent.getId(),
-                id -> generateBasePresignedUrl(parent, rbacScope.caller())
+                id -> DocumentPreviewTokenService.tryIssuePreviewBaseUrl(
+                    previewTokenService,
+                    parent.getId(),
+                    parent.getCurrentVersion(),
+                    rbacScope.caller(),
+                    log
+                )
             ).orElse(null);
 
             String citationUrl = MinioStorageService.appendPageFragment(baseUrl, candidate.pageNumber());
@@ -208,18 +214,6 @@ public class VectorRetrievalService {
             throw new InvalidChatRequestException("Question must not be blank");
         }
         return cleaned;
-    }
-
-    private Optional<String> generateBasePresignedUrl(DocumentEntity parent, CallerContext caller) {
-        try {
-            int version = parent.getCurrentVersion() != null ? parent.getCurrentVersion() : 1;
-            DocumentPreviewTokenService.IssuedPreviewUrl issued =
-                previewTokenService.issuePreviewUrl(parent.getId(), version, caller);
-            return issued != null && issued.baseUrl() != null ? Optional.of(issued.baseUrl()) : Optional.empty();
-        } catch (RuntimeException ex) {
-            log.warn("Failed to generate citation preview URL for document {}: {}", parent.getId(), ex.getMessage());
-            return Optional.empty();
-        }
     }
 
     private static boolean isEligibleChunk(

@@ -24,6 +24,7 @@ import com.documind.infrastructure.storage.MinioStorageService;
 import com.documind.repository.AuditLogRepository;
 import com.documind.repository.ChatMessageRepository;
 import com.documind.repository.ChatSessionRepository;
+import com.documind.repository.ChatTurnPersistenceRepository;
 import com.documind.repository.DepartmentRepository;
 import com.documind.repository.DocumentRepository;
 import com.documind.repository.UserRepository;
@@ -34,6 +35,7 @@ import com.documind.service.rag.RbacVectorScope;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.ObjectProvider;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.PageRequest;
 import org.springframework.data.domain.Sort;
@@ -88,7 +90,35 @@ public class ChatSessionService {
     private final DocumentPreviewTokenService previewTokenService;
     private final RbacVectorFilterFactory rbacVectorFilterFactory;
     private final ObjectProvider<TransactionTemplate> transactionTemplateProvider;
+    private final ObjectProvider<ChatTurnPersistenceRepository> chatTurnPersistenceRepositoryProvider;
     private final RagProperties ragProperties;
+
+    @Autowired
+    public ChatSessionService(
+        ObjectProvider<ChatSessionRepository> chatSessionRepositoryProvider,
+        ObjectProvider<ChatMessageRepository> chatMessageRepositoryProvider,
+        ObjectProvider<UserRepository> userRepositoryProvider,
+        ObjectProvider<DepartmentRepository> departmentRepositoryProvider,
+        ObjectProvider<DocumentRepository> documentRepositoryProvider,
+        ObjectProvider<AuditLogRepository> auditLogRepositoryProvider,
+        DocumentPreviewTokenService previewTokenService,
+        RbacVectorFilterFactory rbacVectorFilterFactory,
+        ObjectProvider<TransactionTemplate> transactionTemplateProvider,
+        ObjectProvider<ChatTurnPersistenceRepository> chatTurnPersistenceRepositoryProvider,
+        RagProperties ragProperties
+    ) {
+        this.chatSessionRepositoryProvider = Objects.requireNonNull(chatSessionRepositoryProvider, "chatSessionRepositoryProvider must not be null");
+        this.chatMessageRepositoryProvider = Objects.requireNonNull(chatMessageRepositoryProvider, "chatMessageRepositoryProvider must not be null");
+        this.userRepositoryProvider = Objects.requireNonNull(userRepositoryProvider, "userRepositoryProvider must not be null");
+        this.departmentRepositoryProvider = Objects.requireNonNull(departmentRepositoryProvider, "departmentRepositoryProvider must not be null");
+        this.documentRepositoryProvider = Objects.requireNonNull(documentRepositoryProvider, "documentRepositoryProvider must not be null");
+        this.auditLogRepositoryProvider = Objects.requireNonNull(auditLogRepositoryProvider, "auditLogRepositoryProvider must not be null");
+        this.previewTokenService = Objects.requireNonNull(previewTokenService, "previewTokenService must not be null");
+        this.rbacVectorFilterFactory = Objects.requireNonNull(rbacVectorFilterFactory, "rbacVectorFilterFactory must not be null");
+        this.transactionTemplateProvider = Objects.requireNonNull(transactionTemplateProvider, "transactionTemplateProvider must not be null");
+        this.chatTurnPersistenceRepositoryProvider = chatTurnPersistenceRepositoryProvider;
+        this.ragProperties = Objects.requireNonNull(ragProperties, "ragProperties must not be null");
+    }
 
     public ChatSessionService(
         ObjectProvider<ChatSessionRepository> chatSessionRepositoryProvider,
@@ -102,16 +132,19 @@ public class ChatSessionService {
         ObjectProvider<TransactionTemplate> transactionTemplateProvider,
         RagProperties ragProperties
     ) {
-        this.chatSessionRepositoryProvider = Objects.requireNonNull(chatSessionRepositoryProvider, "chatSessionRepositoryProvider must not be null");
-        this.chatMessageRepositoryProvider = Objects.requireNonNull(chatMessageRepositoryProvider, "chatMessageRepositoryProvider must not be null");
-        this.userRepositoryProvider = Objects.requireNonNull(userRepositoryProvider, "userRepositoryProvider must not be null");
-        this.departmentRepositoryProvider = Objects.requireNonNull(departmentRepositoryProvider, "departmentRepositoryProvider must not be null");
-        this.documentRepositoryProvider = Objects.requireNonNull(documentRepositoryProvider, "documentRepositoryProvider must not be null");
-        this.auditLogRepositoryProvider = Objects.requireNonNull(auditLogRepositoryProvider, "auditLogRepositoryProvider must not be null");
-        this.previewTokenService = Objects.requireNonNull(previewTokenService, "previewTokenService must not be null");
-        this.rbacVectorFilterFactory = Objects.requireNonNull(rbacVectorFilterFactory, "rbacVectorFilterFactory must not be null");
-        this.transactionTemplateProvider = Objects.requireNonNull(transactionTemplateProvider, "transactionTemplateProvider must not be null");
-        this.ragProperties = Objects.requireNonNull(ragProperties, "ragProperties must not be null");
+        this(
+            chatSessionRepositoryProvider,
+            chatMessageRepositoryProvider,
+            userRepositoryProvider,
+            departmentRepositoryProvider,
+            documentRepositoryProvider,
+            auditLogRepositoryProvider,
+            previewTokenService,
+            rbacVectorFilterFactory,
+            transactionTemplateProvider,
+            null,
+            ragProperties
+        );
     }
 
     @PreAuthorize("hasAnyRole('SYSTEM_ADMIN', 'DEPARTMENT_MANAGER', 'STANDARD_EMPLOYEE')")
@@ -289,6 +322,41 @@ public class ChatSessionService {
         Objects.requireNonNull(command, "command must not be null");
         Objects.requireNonNull(command.actor(), "command.actor must not be null");
 
+        if (command.sessionId() == null && chatTurnPersistenceRepositoryProvider != null) {
+            ChatTurnPersistenceRepository turnRepository = chatTurnPersistenceRepositoryProvider.getIfAvailable();
+            if (turnRepository != null) {
+                OffsetDateTime userCreatedAt = resolveMonotonicTimestamp(null);
+                OffsetDateTime assistantCreatedAt = resolveMonotonicTimestamp(userCreatedAt);
+                OffsetDateTime auditCreatedAt = OffsetDateTime.now(ZoneOffset.UTC).truncatedTo(ChronoUnit.MICROS);
+                List<CitationPayload> citationPayloads = command.citations().stream()
+                    .map(CitationDto::toCitationPayload)
+                    .toList();
+                ChatTurnPersistenceRepository.PersistedNewSessionTurn inserted =
+                    turnRepository.insertNewSessionTurnAtomically(
+                        new ChatTurnPersistenceRepository.NewSessionTurnInsert(
+                            command.actor().getId(),
+                            command.auditDepartmentId(),
+                            deriveAutoTitle(command.userQuestion()),
+                            command.userQuestion(),
+                            command.rewrittenQuery(),
+                            command.assistantAnswer(),
+                            citationPayloads,
+                            command.abstained(),
+                            command.cacheTier(),
+                            command.promptTokens(),
+                            command.completionTokens(),
+                            command.latencyMs(),
+                            command.modelProvider(),
+                            truncateIp(command.ipAddress()),
+                            userCreatedAt,
+                            assistantCreatedAt,
+                            auditCreatedAt
+                        )
+                    );
+                return new PersistedTurnResult(inserted.sessionId(), inserted.assistantMessageId());
+            }
+        }
+
         PersistedTurnResult persisted = transactionTemplateProvider.getObject().execute(status -> {
             ChatSessionRepository sessionRepo = chatSessionRepositoryProvider.getObject();
             ChatMessageRepository messageRepo = chatMessageRepositoryProvider.getObject();
@@ -319,6 +387,7 @@ public class ChatSessionService {
                         null,
                         command.userQuestion(),
                         command.abstained(),
+                        command.cacheTier(),
                         command.promptTokens(),
                         command.completionTokens(),
                         command.latencyMs(),
@@ -365,7 +434,7 @@ public class ChatSessionService {
             assistantMessage.setRewrittenQuery(command.rewrittenQuery());
             assistantMessage.setCitations(citationPayloads);
             assistantMessage.setAbstained(command.abstained());
-            assistantMessage.setCacheTier(CacheTier.NONE);
+            assistantMessage.setCacheTier(command.cacheTier());
             assistantMessage.setPromptTokens(Math.max(0, command.promptTokens()));
             assistantMessage.setCompletionTokens(Math.max(0, command.completionTokens()));
             assistantMessage.setLatencyMs(Math.max(0L, command.latencyMs()));
@@ -379,6 +448,7 @@ public class ChatSessionService {
                 session,
                 command.userQuestion(),
                 command.abstained(),
+                command.cacheTier(),
                 command.promptTokens(),
                 command.completionTokens(),
                 command.latencyMs(),
@@ -442,6 +512,39 @@ public class ChatSessionService {
         int statusCode,
         String ipAddress
     ) {
+        recordFailureAudit(
+            actor,
+            auditDepartmentId,
+            sessionId,
+            queryText,
+            promptTokens,
+            completionTokens,
+            latencyMs,
+            failedProvider,
+            statusCode,
+            CacheTier.NONE,
+            ipAddress
+        );
+    }
+
+    /**
+     * Records a non-200 failure or client-abort ({@code 499} / {@code 502} / {@code 504}) {@link AuditLogEntity}
+     * preserving the active {@link CacheTier} when an in-flight cache replay was aborted.
+     */
+    @PreAuthorize("hasAnyRole('SYSTEM_ADMIN', 'DEPARTMENT_MANAGER', 'STANDARD_EMPLOYEE')")
+    public void recordFailureAudit(
+        UserEntity actor,
+        UUID auditDepartmentId,
+        UUID sessionId,
+        String queryText,
+        int promptTokens,
+        int completionTokens,
+        long latencyMs,
+        String failedProvider,
+        int statusCode,
+        CacheTier cacheTier,
+        String ipAddress
+    ) {
         transactionTemplateProvider.getObject().executeWithoutResult(status -> {
             ChatSessionEntity session = (sessionId != null && actor != null)
                 ? chatSessionRepositoryProvider.getObject()
@@ -457,6 +560,7 @@ public class ChatSessionService {
                 session,
                 queryText,
                 true,
+                cacheTier != null ? cacheTier : CacheTier.NONE,
                 promptTokens,
                 completionTokens,
                 latencyMs,
@@ -581,7 +685,13 @@ public class ChatSessionService {
             DocumentEntity parent = parentsById.get(payload.documentId());
             String baseUrl = presignedUrlMemo.computeIfAbsent(
                 parent.getId(),
-                id -> generateBasePresignedUrl(parent, scope.caller())
+                id -> DocumentPreviewTokenService.tryIssuePreviewBaseUrl(
+                    previewTokenService,
+                    parent.getId(),
+                    parent.getCurrentVersion(),
+                    scope.caller(),
+                    log
+                )
             ).orElse(null);
             Integer effectivePage = parent.isPdf() ? payload.pageNumber() : null;
             String citationUrl = MinioStorageService.appendPageFragment(baseUrl, effectivePage);
@@ -597,18 +707,6 @@ public class ChatSessionService {
             ));
         }
         return List.copyOf(result);
-    }
-
-    private Optional<String> generateBasePresignedUrl(DocumentEntity parent, CallerContext caller) {
-        try {
-            int version = parent.getCurrentVersion() != null ? parent.getCurrentVersion() : 1;
-            DocumentPreviewTokenService.IssuedPreviewUrl issued =
-                previewTokenService.issuePreviewUrl(parent.getId(), version, caller);
-            return issued != null && issued.baseUrl() != null ? Optional.of(issued.baseUrl()) : Optional.empty();
-        } catch (RuntimeException ex) {
-            log.warn("Failed to re-sign historical citation URL for document {}: {}", parent.getId(), ex.getMessage());
-            return Optional.empty();
-        }
     }
 
     private ChatSessionEntity requireOwnedSession(UUID sessionId, UUID ownerUserId) {
@@ -655,6 +753,7 @@ public class ChatSessionService {
         ChatSessionEntity session,
         String queryText,
         boolean abstained,
+        CacheTier cacheTier,
         int promptTokens,
         int completionTokens,
         long latencyMs,
@@ -669,7 +768,7 @@ public class ChatSessionService {
         auditLog.setActionType(AuditActionType.CHAT_QUERY);
         auditLog.setQueryText(queryText);
         auditLog.setAbstained(abstained);
-        auditLog.setCacheTier(CacheTier.NONE);
+        auditLog.setCacheTier(cacheTier != null ? cacheTier : CacheTier.NONE);
         auditLog.setPromptTokens(Math.max(0, promptTokens));
         auditLog.setCompletionTokens(Math.max(0, completionTokens));
         auditLog.setLatencyMs(Math.max(0L, latencyMs));
@@ -757,6 +856,7 @@ public class ChatSessionService {
         List<CitationDto> citations,
         boolean abstained,
         String modelProvider,
+        CacheTier cacheTier,
         int promptTokens,
         int completionTokens,
         long latencyMs,
@@ -764,6 +864,40 @@ public class ChatSessionService {
     ) {
         public CompletedTurnCommand {
             citations = citations != null ? List.copyOf(citations) : List.of();
+            cacheTier = cacheTier != null ? cacheTier : CacheTier.NONE;
+        }
+
+        public CompletedTurnCommand(
+            UserEntity actor,
+            UUID auditDepartmentId,
+            UUID sessionId,
+            String userQuestion,
+            String rewrittenQuery,
+            String assistantAnswer,
+            List<CitationDto> citations,
+            boolean abstained,
+            String modelProvider,
+            int promptTokens,
+            int completionTokens,
+            long latencyMs,
+            String ipAddress
+        ) {
+            this(
+                actor,
+                auditDepartmentId,
+                sessionId,
+                userQuestion,
+                rewrittenQuery,
+                assistantAnswer,
+                citations,
+                abstained,
+                modelProvider,
+                CacheTier.NONE,
+                promptTokens,
+                completionTokens,
+                latencyMs,
+                ipAddress
+            );
         }
     }
 
