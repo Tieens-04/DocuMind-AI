@@ -650,6 +650,91 @@ class ChatSessionServiceTest {
     }
 
     @Test
+    void recordCompletedTurnPersistsCacheTierAndCacheHitFlagOnAssistantMessageAndAuditFor200And404() {
+        CallerContext employee = new CallerContext(HR_EMPLOYEE_USER_ID, HR_DEPT_ID, Role.STANDARD_EMPLOYEE, "10.0.0.9");
+        setJwtPrincipal(employee);
+        UserEntity actor = userRepository.findById(HR_EMPLOYEE_USER_ID).orElseThrow();
+
+        UUID sessionId = UUID.randomUUID();
+        ChatSessionEntity session = new ChatSessionEntity();
+        session.setId(sessionId);
+        session.setTitle(ChatSessionService.DEFAULT_SESSION_TITLE);
+        when(chatSessionRepository.findByIdAndUserIdForUpdate(sessionId, HR_EMPLOYEE_USER_ID))
+            .thenReturn(Optional.of(session));
+        when(chatMessageRepository.findFirstBySessionIdOrderByCreatedAtDescIdDesc(sessionId))
+            .thenReturn(Optional.empty());
+
+        List<ChatMessageEntity> savedMessages = new ArrayList<>();
+        when(chatMessageRepository.save(any(ChatMessageEntity.class))).thenAnswer(inv -> {
+            ChatMessageEntity msg = inv.getArgument(0);
+            if (msg.getId() == null) {
+                msg.setId(UUID.randomUUID());
+            }
+            savedMessages.add(msg);
+            return msg;
+        });
+
+        service.recordCompletedTurn(new ChatSessionService.CompletedTurnCommand(
+            actor,
+            HR_DEPT_ID,
+            sessionId,
+            "Quy định phép năm?",
+            null,
+            "12 ngày phép năm.",
+            List.of(),
+            false,
+            RagConstants.PROVIDER_GROQ,
+            CacheTier.L1,
+            0,
+            0,
+            8L,
+            "10.0.0.9"
+        ));
+
+        assertThat(savedMessages).hasSize(2);
+        assertThat(savedMessages.get(0).getRole()).isEqualTo(MessageRole.USER);
+        assertThat(savedMessages.get(0).getCacheTier()).isEqualTo(CacheTier.NONE);
+        assertThat(savedMessages.get(1).getRole()).isEqualTo(MessageRole.ASSISTANT);
+        assertThat(savedMessages.get(1).getCacheTier()).isEqualTo(CacheTier.L1);
+
+        ArgumentCaptor<AuditLogEntity> audit200Captor = ArgumentCaptor.forClass(AuditLogEntity.class);
+        verify(auditLogRepository).save(audit200Captor.capture());
+        assertThat(audit200Captor.getValue().isCacheHit()).isTrue();
+        assertThat(audit200Captor.getValue().getCacheTier()).isEqualTo(CacheTier.L1);
+        assertThat(audit200Captor.getValue().getPromptTokens()).isZero();
+        assertThat(audit200Captor.getValue().getCompletionTokens()).isZero();
+
+        // Deleted session (404) preserves L2 cacheHit & cacheTier on audit log
+        clearInvocations(auditLogRepository);
+        UUID deletedId = UUID.randomUUID();
+        when(chatSessionRepository.findByIdAndUserIdForUpdate(deletedId, HR_EMPLOYEE_USER_ID))
+            .thenReturn(Optional.empty());
+
+        assertThatThrownBy(() -> service.recordCompletedTurn(new ChatSessionService.CompletedTurnCommand(
+            actor,
+            HR_DEPT_ID,
+            deletedId,
+            "Phép năm bao nhiêu ngày?",
+            null,
+            "12 ngày phép năm.",
+            List.of(),
+            false,
+            RagConstants.PROVIDER_GROQ,
+            CacheTier.L2,
+            0,
+            0,
+            25L,
+            "10.0.0.9"
+        ))).isInstanceOf(ResourceNotFoundException.class);
+
+        ArgumentCaptor<AuditLogEntity> audit404Captor = ArgumentCaptor.forClass(AuditLogEntity.class);
+        verify(auditLogRepository).save(audit404Captor.capture());
+        assertThat(audit404Captor.getValue().getStatusCode()).isEqualTo(404);
+        assertThat(audit404Captor.getValue().isCacheHit()).isTrue();
+        assertThat(audit404Captor.getValue().getCacheTier()).isEqualTo(CacheTier.L2);
+    }
+
+    @Test
     void renameSessionNormalizesNfcAndRejectsInvalidTitles() {
         CallerContext employee = new CallerContext(HR_EMPLOYEE_USER_ID, HR_DEPT_ID, Role.STANDARD_EMPLOYEE, null);
         setJwtPrincipal(employee);

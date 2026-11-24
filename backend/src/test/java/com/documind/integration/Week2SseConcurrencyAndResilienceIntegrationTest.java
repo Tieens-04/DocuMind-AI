@@ -197,6 +197,7 @@ class Week2SseConcurrencyAndResilienceIntegrationTest {
         groqModel.reset();
         geminiModel.reset();
         AbstractIntegrationTest.flushRedis(stringRedisTemplate);
+        jdbcTemplate.update("DELETE FROM semantic_cache");
         jdbcTemplate.update("DELETE FROM chat_messages");
         jdbcTemplate.update("DELETE FROM chat_sessions");
         jdbcTemplate.update("DELETE FROM audit_logs");
@@ -630,6 +631,10 @@ class Week2SseConcurrencyAndResilienceIntegrationTest {
         assertThat(turn3Done.path("tokenUsage").path("promptTokens").asInt()).isEqualTo(45);
         assertThat(turn3Done.path("tokenUsage").path("completionTokens").asInt()).isEqualTo(14);
         assertThat(groqModel.answerCallCount()).isEqualTo(1);
+
+        // Clear cache before synthetic [SOFT_REFUSAL] prompt so the toy 14-axis test embedder does not collide with Turn 1 at L2
+        AbstractIntegrationTest.flushRedis(stringRedisTemplate);
+        jdbcTemplate.update("DELETE FROM semantic_cache");
 
         List<SseFrame> softRefusalFrames = client.collectAllSseFrames(
             port,

@@ -176,6 +176,27 @@ public class SemanticCacheVectorRepository {
         float[] queryEmbedding,
         double minSimilarity
     ) {
+        Optional<SemanticCacheEntry> match = findBestMatchWithoutIncrement(
+            rbacScope,
+            scopeVersion,
+            queryEmbedding,
+            minSimilarity
+        );
+        match.ifPresent(entry -> recordHit(entry.id()));
+        return match;
+    }
+
+    /**
+     * Finds the highest-similarity non-expired entry matching {@code rbacScope} and {@code scopeVersion}
+     * without incrementing {@code hit_count}, allowing callers to verify version freshness and live RBAC
+     * citations before accounting a hit via {@link #recordHit(UUID)}.
+     */
+    public Optional<SemanticCacheEntry> findBestMatchWithoutIncrement(
+        String rbacScope,
+        long scopeVersion,
+        float[] queryEmbedding,
+        double minSimilarity
+    ) {
         validateScopeAndVersion(rbacScope, scopeVersion);
         if (!Double.isFinite(minSimilarity)) {
             throw new IllegalArgumentException("minSimilarity must be finite");
@@ -199,12 +220,17 @@ public class SemanticCacheVectorRepository {
             match = queryBestMatch(rbacScope, scopeVersion, vectorLiteral, minSimilarity);
         }
 
-        if (match != null && match.isPresent()) {
-            UUID matchedId = match.get().id();
-            incrementHitCount(matchedId, txManager);
-        }
-
         return match != null ? match : Optional.empty();
+    }
+
+    /**
+     * Records a semantic cache hit against {@code entryId} safely even inside a read-only transaction.
+     */
+    public void recordHit(UUID entryId) {
+        if (entryId == null) {
+            return;
+        }
+        incrementHitCount(entryId, transactionManagerSupplier.get());
     }
 
     /**
@@ -250,6 +276,7 @@ public class SemanticCacheVectorRepository {
                            response_content,
                            citations::text AS citations_json,
                            model_provider,
+                           expires_at,
                            (query_embedding <=> CAST(:vec AS vector)) AS cosine_distance
                     FROM semantic_cache
                     WHERE rbac_scope = :scope
@@ -266,6 +293,7 @@ public class SemanticCacheVectorRepository {
                        response_content,
                        citations_json,
                        model_provider,
+                       expires_at,
                        (1.0 - cosine_distance) AS similarity_score
                 FROM relaxed_candidates
                 WHERE (1.0 - cosine_distance) >= :minSimilarity
@@ -285,7 +313,8 @@ public class SemanticCacheVectorRepository {
                 rs.getString("response_content"),
                 deserializeCitations(rs.getString("citations_json")),
                 rs.getString("model_provider"),
-                rs.getDouble("similarity_score")
+                rs.getDouble("similarity_score"),
+                rs.getObject("expires_at", OffsetDateTime.class)
             ))
             .optional();
     }

@@ -20,6 +20,7 @@
 - **Deterministic refusal & zero-leak SSE**: When `similaritySearch` returns 0 hits, short-circuit in Java with `RagConstants.SAFE_REFUSAL_MESSAGE` (`0` Answer LLM tokens); never hold HikariCP DB connections open while streaming SSE on Virtual Threads (`documind-sse-vt-`).
 - **Stream token accounting (`streamUsage: true`)**: Stream via `chatClient.prompt()...stream().chatResponse()` (never `.stream().content()`) with `CL100K_BASE` fallback so `audit_logs` always records accurate `prompt_tokens` and `completion_tokens`.
 - **Immediate JWT revocation & fail-closed auth**: Keep `documind.security.dev-caller-fallback.enabled=false` in `application.yml`, enforce Redis blacklist revocation (`0s` cutoff on role/department change), and fail closed (`503`) if Redis auth state store is unavailable.
+- **Two-tier RBAC-scoped RAG cache & monotonic invalidation**: Pin L1 (`documind:rag:l1:{v1|ctx:v1}:`) and L2 (`semantic_cache`, cosine `>= 0.94`) to `(scope.cacheScopeKey(), authoritativeDbVersion)` with `MGET` TOCTOU reconciliation, live citation/preview re-verification, sync L1 SSE replay (`< 50ms`), and post-TX single-Lua Redis sync (carrying `retiredVersion + 1` on empty department deletion so `ADMIN:GLOBAL` never regresses).
 - **FlintFlow port coexistence**: Keep canonical host ports in `.env.example` / `docker-compose.yml` (`5432`, `6380`, `9000/9001`, `8081`, `3002`, `11434`) and never collide with `flintflow-*` containers.
 
 ---
@@ -33,6 +34,7 @@
 - **RFC 9110 Error Contract**: `backend/src/main/java/com/documind/controller/advice/GlobalExceptionHandler.java`
 - **Singleton Testcontainers & Real-JWT Integration Suites**: `backend/src/test/java/com/documind/support/AbstractIntegrationTest.java`, `backend/src/test/java/com/documind/controller/VectorRbacRetrievalIntegrationTest.java`, `backend/src/test/java/com/documind/controller/TypedSseChatStreamingIntegrationTest.java`
 - **Milestone 2 Cross-Gate RBAC & Concurrent SSE Suites**: `backend/src/test/java/com/documind/support/Week2SseTestClient.java`, `backend/src/test/java/com/documind/integration/Week2CrossGateRbacIntegrationTest.java`, `backend/src/test/java/com/documind/integration/Week2SseConcurrencyAndResilienceIntegrationTest.java`
+- **RBAC-Scoped Two-Tier RAG Cache & Turn-1 CTE Persistence**: `backend/src/main/java/com/documind/service/rag/RagCacheService.java`, `backend/src/main/java/com/documind/infrastructure/vector/SemanticCacheVectorRepository.java`, `backend/src/main/java/com/documind/repository/ChatTurnPersistenceRepository.java`, `backend/src/test/java/com/documind/integration/ScopedRagCacheIntegrationTest.java`
 
 ---
 

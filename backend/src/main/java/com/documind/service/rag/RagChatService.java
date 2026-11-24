@@ -20,6 +20,7 @@ import com.documind.service.chat.ChatSessionService;
 import com.documind.service.document.CallerContext;
 import com.documind.service.document.DevCallerFallbackEnabledCondition;
 import com.documind.service.document.DevFallbackCallerContextResolver;
+import org.hibernate.Hibernate;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.ai.chat.client.ChatClient;
@@ -69,6 +70,7 @@ public class RagChatService {
     private final ObjectProvider<TransactionTemplate> transactionTemplateProvider;
     private final ObjectProvider<ChatSessionService> chatSessionServiceProvider;
     private final ObjectProvider<QueryContextualizerService> queryContextualizerServiceProvider;
+    private final ObjectProvider<RagCacheService> ragCacheServiceProvider;
     private final AiProperties aiProperties;
     private final RagProperties ragProperties;
     private final Environment environment;
@@ -86,6 +88,7 @@ public class RagChatService {
         ObjectProvider<TransactionTemplate> transactionTemplateProvider,
         ObjectProvider<ChatSessionService> chatSessionServiceProvider,
         ObjectProvider<QueryContextualizerService> queryContextualizerServiceProvider,
+        ObjectProvider<RagCacheService> ragCacheServiceProvider,
         AiProperties aiProperties,
         RagProperties ragProperties,
         Environment environment
@@ -101,9 +104,45 @@ public class RagChatService {
         this.transactionTemplateProvider = Objects.requireNonNull(transactionTemplateProvider, "transactionTemplateProvider must not be null");
         this.chatSessionServiceProvider = Objects.requireNonNull(chatSessionServiceProvider, "chatSessionServiceProvider must not be null");
         this.queryContextualizerServiceProvider = Objects.requireNonNull(queryContextualizerServiceProvider, "queryContextualizerServiceProvider must not be null");
+        this.ragCacheServiceProvider = ragCacheServiceProvider;
         this.aiProperties = aiProperties;
         this.ragProperties = Objects.requireNonNull(ragProperties, "ragProperties must not be null");
         this.environment = Objects.requireNonNull(environment, "environment must not be null");
+    }
+
+    public RagChatService(
+        VectorRetrievalService vectorRetrievalService,
+        GroundedSystemPromptService groundedSystemPromptService,
+        RbacVectorFilterFactory rbacVectorFilterFactory,
+        ChatClient groqChatClient,
+        ObjectProvider<ChatClient> geminiChatClientProvider,
+        ObjectProvider<UserRepository> userRepositoryProvider,
+        ObjectProvider<DepartmentRepository> departmentRepositoryProvider,
+        ObjectProvider<AuditLogRepository> auditLogRepositoryProvider,
+        ObjectProvider<TransactionTemplate> transactionTemplateProvider,
+        ObjectProvider<ChatSessionService> chatSessionServiceProvider,
+        ObjectProvider<QueryContextualizerService> queryContextualizerServiceProvider,
+        AiProperties aiProperties,
+        RagProperties ragProperties,
+        Environment environment
+    ) {
+        this(
+            vectorRetrievalService,
+            groundedSystemPromptService,
+            rbacVectorFilterFactory,
+            groqChatClient,
+            geminiChatClientProvider,
+            userRepositoryProvider,
+            departmentRepositoryProvider,
+            auditLogRepositoryProvider,
+            transactionTemplateProvider,
+            chatSessionServiceProvider,
+            queryContextualizerServiceProvider,
+            null,
+            aiProperties,
+            ragProperties,
+            environment
+        );
     }
 
     /**
@@ -145,6 +184,48 @@ public class RagChatService {
         ChatSessionService chatSessionService = turn.chatSessionService();
         QueryContextualizerService contextualizerService = turn.contextualizerService();
         List<ChatMessageEntity> recentHistory = turn.recentHistory();
+        UUID auditDepartmentId = turn.auditDepartmentId();
+        RagCacheService cacheService = turn.ragCacheService();
+
+        RagCacheService.CacheLookupResult cacheLookup = cacheService != null
+            ? cacheService.lookup(rbacScope, normalizedQuestion, recentHistory, turn.preloadedDepartmentVersion())
+            : RagCacheService.CacheLookupResult.miss(1L, null, 0L, 0L, 0L);
+
+        if (cacheLookup.isHit()) {
+            long latencyMs = elapsedMillis(startedAtNanos);
+            ChatSessionService.PersistedTurnResult persisted = persistCompletedTurnOrAuditOnly(
+                chatSessionService,
+                verifiedActor,
+                auditDepartmentId,
+                sessionId,
+                normalizedQuestion,
+                cacheLookup.rewrittenQuery(),
+                cacheLookup.answer(),
+                cacheLookup.citations(),
+                false,
+                cacheLookup.modelProvider(),
+                cacheLookup.cacheTier(),
+                0,
+                0,
+                latencyMs,
+                verifiedCaller.ipAddress()
+            );
+            return new ChatAskResponse(
+                persisted != null ? persisted.sessionId() : null,
+                persisted != null ? persisted.assistantMessageId() : null,
+                cacheLookup.rewrittenQuery(),
+                cacheLookup.answer(),
+                false,
+                cacheLookup.citations(),
+                cacheLookup.modelProvider(),
+                true,
+                cacheLookup.cacheTier(),
+                0,
+                0,
+                latencyMs
+            );
+        }
+
         boolean skipRewrite = recentHistory.isEmpty();
 
         // Turn 1 bypasses QueryContextualizerService completely (0 rewrite tokens, optimal TTFT)
@@ -153,7 +234,9 @@ public class RagChatService {
                 ? contextualizerService.contextualize(normalizedQuestion, recentHistory)
                 : QueryContextualizerService.ContextualizedQuery.skipped(normalizedQuestion);
 
-        UUID auditDepartmentId = turn.auditDepartmentId();
+        long versionBeforeRetrieval = cacheService != null
+            ? cacheService.readAuthoritativeVersion(rbacScope)
+            : cacheLookup.capturedVersion();
 
         List<RetrievedChunk> chunks;
         try {
@@ -208,6 +291,7 @@ public class RagChatService {
                 List.of(),
                 true,
                 effectiveProvider,
+                CacheTier.NONE,
                 totalPromptTokens,
                 totalCompletionTokens,
                 latencyMs,
@@ -273,11 +357,31 @@ public class RagChatService {
             finalCitations,
             llmRefused,
             result.provider(),
+            CacheTier.NONE,
             totalPromptTokens,
             totalCompletionTokens,
             latencyMs,
             verifiedCaller.ipAddress()
         );
+
+        if (cacheService != null && !llmRefused && !finalCitations.isEmpty()) {
+            try {
+                cacheService.publishIfCurrent(
+                    rbacScope,
+                    versionBeforeRetrieval,
+                    normalizedQuestion,
+                    contextualized.rewrittenQuery(),
+                    recentHistory,
+                    cacheLookup.queryEmbedding(),
+                    finalAnswer,
+                    finalCitations,
+                    false,
+                    result.provider()
+                );
+            } catch (RuntimeException ex) {
+                log.warn("Best-effort RAG cache publish failed for scope={}: {}", rbacScope.cacheScopeKey(), ex.getMessage());
+            }
+        }
 
         return new ChatAskResponse(
             persisted != null ? persisted.sessionId() : null,
@@ -287,6 +391,8 @@ public class RagChatService {
             llmRefused,
             finalCitations,
             result.provider(),
+            false,
+            CacheTier.NONE,
             totalPromptTokens,
             totalCompletionTokens,
             latencyMs
@@ -311,6 +417,7 @@ public class RagChatService {
 
         ChatSessionService chatSessionService = chatSessionServiceProvider.getIfAvailable();
         QueryContextualizerService contextualizerService = queryContextualizerServiceProvider.getIfAvailable();
+        RagCacheService ragCacheService = ragCacheServiceProvider != null ? ragCacheServiceProvider.getIfAvailable() : null;
 
         List<ChatMessageEntity> recentHistory = List.of();
         if (sessionId != null) {
@@ -324,12 +431,29 @@ public class RagChatService {
             rbacScope,
             verifiedCaller,
             verifiedActor,
+            extractPreloadedDepartmentVersion(verifiedActor, verifiedCaller),
             resolveAuditDepartmentId(rbacScope),
             normalizedQuestion,
             List.copyOf(recentHistory),
             chatSessionService,
-            contextualizerService
+            contextualizerService,
+            ragCacheService
         );
+    }
+
+    private static Long extractPreloadedDepartmentVersion(UserEntity verifiedActor, CallerContext verifiedCaller) {
+        if (verifiedActor == null || verifiedCaller == null || verifiedCaller.departmentId() == null) {
+            return null;
+        }
+        DepartmentEntity dept = verifiedActor.getDepartment();
+        if (dept == null || !Hibernate.isInitialized(dept)) {
+            return null;
+        }
+        if (!Objects.equals(dept.getId(), verifiedCaller.departmentId())) {
+            return null;
+        }
+        Long version = dept.getCacheVersion();
+        return (version != null && version >= 1L) ? version : null;
     }
 
     Prompt buildAnswerPrompt(
@@ -398,11 +522,13 @@ public class RagChatService {
         List<CitationDto> finalCitations,
         boolean abstained,
         String provider,
+        CacheTier cacheTier,
         int totalPromptTokens,
         int totalCompletionTokens,
         long latencyMs,
         String ipAddress
     ) {
+        CacheTier effectiveCacheTier = cacheTier != null ? cacheTier : CacheTier.NONE;
         if (chatSessionService != null && verifiedActor != null) {
             return chatSessionService.recordCompletedTurn(
                 new ChatSessionService.CompletedTurnCommand(
@@ -415,6 +541,7 @@ public class RagChatService {
                     finalCitations,
                     abstained,
                     provider,
+                    effectiveCacheTier,
                     totalPromptTokens,
                     totalCompletionTokens,
                     latencyMs,
@@ -427,6 +554,7 @@ public class RagChatService {
             auditDepartmentId,
             normalizedQuestion,
             abstained,
+            effectiveCacheTier,
             totalPromptTokens,
             totalCompletionTokens,
             latencyMs,
@@ -552,20 +680,67 @@ public class RagChatService {
         String failedProvider,
         int statusCode
     ) {
+        recordFailureAuditQuietly(
+            verifiedActor,
+            auditDepartmentId,
+            sessionId,
+            chatSessionService,
+            ipAddress,
+            queryText,
+            promptTokens,
+            completionTokens,
+            latencyMs,
+            failedProvider,
+            statusCode,
+            CacheTier.NONE
+        );
+    }
+
+    void recordFailureAuditQuietly(
+        UserEntity verifiedActor,
+        UUID auditDepartmentId,
+        UUID sessionId,
+        ChatSessionService chatSessionService,
+        String ipAddress,
+        String queryText,
+        int promptTokens,
+        int completionTokens,
+        long latencyMs,
+        String failedProvider,
+        int statusCode,
+        CacheTier cacheTier
+    ) {
+        CacheTier effectiveCacheTier = cacheTier != null ? cacheTier : CacheTier.NONE;
         try {
             if (chatSessionService != null) {
-                chatSessionService.recordFailureAudit(
-                    verifiedActor,
-                    auditDepartmentId,
-                    sessionId,
-                    queryText,
-                    promptTokens,
-                    completionTokens,
-                    latencyMs,
-                    failedProvider,
-                    statusCode,
-                    ipAddress
-                );
+                if (effectiveCacheTier == CacheTier.NONE) {
+                    chatSessionService.recordFailureAudit(
+                        verifiedActor,
+                        auditDepartmentId,
+                        sessionId,
+                        queryText,
+                        promptTokens,
+                        completionTokens,
+                        latencyMs,
+                        failedProvider,
+                        statusCode,
+                        ipAddress
+                    );
+                } else {
+                    chatSessionService.recordFailureAudit(
+                        verifiedActor,
+                        auditDepartmentId,
+                        sessionId,
+                        queryText,
+                        promptTokens,
+                        completionTokens,
+                        latencyMs,
+                        failedProvider,
+                        statusCode,
+                        effectiveCacheTier,
+                        ipAddress
+                    );
+                }
                 return;
             }
             saveAuditLog(
@@ -573,6 +748,7 @@ public class RagChatService {
                 auditDepartmentId,
                 queryText,
                 true,
+                effectiveCacheTier,
                 promptTokens,
                 completionTokens,
                 latencyMs,
@@ -590,6 +766,7 @@ public class RagChatService {
         UUID departmentId,
         String queryText,
         boolean abstained,
+        CacheTier cacheTier,
         int promptTokens,
         int completionTokens,
         long latencyMs,
@@ -607,7 +784,7 @@ public class RagChatService {
             auditLog.setActionType(AuditActionType.CHAT_QUERY);
             auditLog.setQueryText(queryText);
             auditLog.setAbstained(abstained);
-            auditLog.setCacheTier(CacheTier.NONE);
+            auditLog.setCacheTier(cacheTier != null ? cacheTier : CacheTier.NONE);
             auditLog.setPromptTokens(Math.max(0, promptTokens));
             auditLog.setCompletionTokens(Math.max(0, completionTokens));
             auditLog.setLatencyMs(Math.max(0L, latencyMs));
@@ -664,11 +841,13 @@ public class RagChatService {
         RbacVectorScope rbacScope,
         CallerContext verifiedCaller,
         UserEntity verifiedActor,
+        Long preloadedDepartmentVersion,
         UUID auditDepartmentId,
         String normalizedQuestion,
         List<ChatMessageEntity> recentHistory,
         ChatSessionService chatSessionService,
-        QueryContextualizerService contextualizerService
+        QueryContextualizerService contextualizerService,
+        RagCacheService ragCacheService
     ) {
     }
 

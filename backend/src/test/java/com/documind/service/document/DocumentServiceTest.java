@@ -33,6 +33,7 @@ import com.documind.repository.DepartmentRepository;
 import com.documind.repository.DocumentRepository;
 import com.documind.repository.UserRepository;
 import com.documind.service.auth.TokenBlacklistService;
+import com.documind.service.rag.RagCacheService;
 import jakarta.persistence.criteria.CriteriaBuilder;
 import jakarta.persistence.criteria.CriteriaQuery;
 import jakarta.persistence.criteria.Expression;
@@ -1561,6 +1562,136 @@ class DocumentServiceTest {
             "getDocumentPreviewUrl", UUID.class, Integer.class, CallerContext.class
         );
         assertThat(previewMethod.isAnnotationPresent(org.springframework.security.access.prepost.PreAuthorize.class)).isTrue();
+    }
+
+    @Test
+    void documentMutationsScheduleScopeAwareCacheVersionSyncAndSkipOnNoOpOrRollback() throws Exception {
+        RagCacheService ragCacheService = mock(RagCacheService.class);
+        DocumentService cacheAwareService = new DocumentService(
+            documentRepository,
+            departmentRepository,
+            userRepository,
+            auditLogRepository,
+            fileValidationService,
+            minioStorageService,
+            previewTokenService,
+            tokenBlacklistService,
+            transactionTemplate,
+            ragCacheService,
+            eventPublisher,
+            environment
+        );
+
+        DepartmentEntity hrDept = department(HR_DEPT_ID, "HR");
+        DepartmentEntity itDept = department(IT_DEPT_ID, "IT");
+        CallerContext hrManager = new CallerContext(null, HR_DEPT_ID, Role.DEPARTMENT_MANAGER, "127.0.0.1");
+        CallerContext sysAdmin = new CallerContext(ADMIN_USER_ID, IT_DEPT_ID, Role.SYSTEM_ADMIN, "127.0.0.1");
+        when(departmentRepository.findById(HR_DEPT_ID)).thenReturn(Optional.of(hrDept));
+        when(departmentRepository.findById(IT_DEPT_ID)).thenReturn(Optional.of(itDept));
+        when(userRepository.findById(ADMIN_USER_ID)).thenReturn(Optional.of(user(ADMIN_USER_ID, itDept, Role.SYSTEM_ADMIN, true)));
+        when(documentRepository.saveAndFlush(any(DocumentEntity.class))).thenAnswer(inv -> {
+            DocumentEntity doc = inv.getArgument(0);
+            if (doc.getId() == null) {
+                doc.setId(DOC_ID);
+            }
+            return doc;
+        });
+
+        // 1. Upload DEPARTMENT -> schedules sync for owning department only
+        drainUploadStream();
+        when(documentRepository.findByDepartmentIdAndFileHash(eq(HR_DEPT_ID), anyString())).thenReturn(Optional.empty());
+        cacheAwareService.uploadDocument(
+            new MockMultipartFile("file", "hr.txt", "text/plain", "HR policy".getBytes(StandardCharsets.UTF_8)),
+            AccessLevel.DEPARTMENT,
+            hrManager
+        );
+        verify(ragCacheService).schedulePostCommitSyncForDepartments(java.util.Set.of(HR_DEPT_ID));
+        verify(ragCacheService, never()).schedulePostCommitSyncForAllDepartments();
+
+        // 2. Upload PUBLIC -> schedules sync for ALL departments
+        clearInvocations(ragCacheService);
+        cacheAwareService.uploadDocument(
+            new MockMultipartFile("file", "pub.txt", "text/plain", "Public policy".getBytes(StandardCharsets.UTF_8)),
+            AccessLevel.PUBLIC,
+            hrManager
+        );
+        verify(ragCacheService).schedulePostCommitSyncForAllDepartments();
+
+        // 3. PATCH metadata: rename DEPARTMENT -> syncs HR only
+        clearInvocations(ragCacheService);
+        DocumentEntity hrDoc = document(DOC_ID, hrDept, AccessLevel.DEPARTMENT, DocumentStatus.COMPLETED);
+        when(documentRepository.findByIdForUpdate(DOC_ID)).thenReturn(Optional.of(hrDoc));
+        cacheAwareService.updateDocumentMetadata(DOC_ID, new UpdateDocumentMetadataRequest("renamed.pdf", null, null), hrManager);
+        verify(ragCacheService).schedulePostCommitSyncForDepartments(java.util.Set.of(HR_DEPT_ID));
+
+        // 4. PATCH metadata: transfer HR -> IT (DEPARTMENT) -> syncs BOTH HR and IT
+        clearInvocations(ragCacheService);
+        when(documentRepository.findByDepartmentIdAndFileHash(eq(IT_DEPT_ID), anyString())).thenReturn(Optional.empty());
+        cacheAwareService.updateDocumentMetadata(DOC_ID, new UpdateDocumentMetadataRequest(null, null, IT_DEPT_ID), sysAdmin);
+        verify(ragCacheService).schedulePostCommitSyncForDepartments(java.util.Set.of(HR_DEPT_ID, IT_DEPT_ID));
+
+        // 5. PATCH metadata: reclassify DEPARTMENT -> PUBLIC -> syncs ALL departments
+        clearInvocations(ragCacheService);
+        cacheAwareService.updateDocumentMetadata(DOC_ID, new UpdateDocumentMetadataRequest(null, AccessLevel.PUBLIC, null), sysAdmin);
+        verify(ragCacheService).schedulePostCommitSyncForAllDepartments();
+
+        // 6. PATCH metadata: no-op (same values) -> skips cache sync
+        clearInvocations(ragCacheService);
+        cacheAwareService.updateDocumentMetadata(DOC_ID, new UpdateDocumentMetadataRequest("renamed.pdf", AccessLevel.PUBLIC, IT_DEPT_ID), sysAdmin);
+        verifyNoInteractions(ragCacheService);
+
+        // 7. PUT replace (trigger-handled accessLevel change) -> syncs ALL because old/new includes PUBLIC
+        clearInvocations(ragCacheService);
+        when(documentRepository.findById(DOC_ID)).thenReturn(Optional.of(hrDoc));
+        when(minioStorageService.buildStorageKey(eq(IT_DEPT_ID), any(UUID.class), anyInt(), anyString()))
+            .thenReturn("departments/" + IT_DEPT_ID + "/v2/v2.pdf");
+        cacheAwareService.replaceDocument(
+            DOC_ID,
+            new MockMultipartFile("file", "v2.pdf", "application/pdf", "%PDF-1.4\n%%EOF\n".getBytes(StandardCharsets.UTF_8)),
+            AccessLevel.DEPARTMENT,
+            sysAdmin
+        );
+        verify(ragCacheService).schedulePostCommitSyncForAllDepartments();
+
+        // 8. DELETE DEPARTMENT doc -> syncs owning department
+        clearInvocations(ragCacheService);
+        hrDoc.setAccessLevel(AccessLevel.DEPARTMENT);
+        cacheAwareService.deleteDocument(DOC_ID, sysAdmin);
+        verify(ragCacheService).schedulePostCommitSyncForDepartments(java.util.Set.of(IT_DEPT_ID));
+
+        // 9. Rollback during delete with REAL RagCacheService -> afterCommit never runs, Redis untouched
+        org.springframework.data.redis.core.StringRedisTemplate redisTemplate =
+            mock(org.springframework.data.redis.core.StringRedisTemplate.class);
+        RagCacheService realCacheService = new RagCacheService(
+            redisTemplate,
+            departmentRepository,
+            documentRepository,
+            null,
+            null,
+            previewTokenService,
+            new com.fasterxml.jackson.databind.ObjectMapper(),
+            com.documind.service.rag.RagProperties.defaults(),
+            Clock.systemUTC()
+        );
+        DocumentService rollbackService = new DocumentService(
+            documentRepository,
+            departmentRepository,
+            userRepository,
+            auditLogRepository,
+            fileValidationService,
+            minioStorageService,
+            previewTokenService,
+            tokenBlacklistService,
+            transactionTemplate,
+            realCacheService,
+            eventPublisher,
+            environment
+        );
+        transactionManager.setRollbackOnCommitFailure(true);
+        transactionManager.failOnCommit = true;
+        assertThatThrownBy(() -> rollbackService.deleteDocument(DOC_ID, sysAdmin))
+            .isInstanceOf(TransactionSystemException.class);
+        verifyNoInteractions(redisTemplate);
     }
 
     private void drainUploadStream() {

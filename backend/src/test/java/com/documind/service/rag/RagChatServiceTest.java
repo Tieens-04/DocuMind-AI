@@ -665,6 +665,166 @@ class RagChatServiceTest {
         assertThat(oddResponse.modelProvider()).isEqualTo(RagConstants.PROVIDER_GEMINI);
     }
 
+    @Test
+    void askShortCircuitsOnL1AndL2CacheHitsAndPublishesGroundedMissesWithCapturedVersion() {
+        ChatSessionService sessionService = mock(ChatSessionService.class);
+        QueryContextualizerService contextualizerService = mock(QueryContextualizerService.class);
+        RagCacheService ragCacheService = mock(RagCacheService.class);
+        RagChatService service = createServiceWithCache(
+            "unconfigured-api-key",
+            ragProperties,
+            sessionService,
+            contextualizerService,
+            ragCacheService
+        );
+
+        CallerContext caller = new CallerContext(HR_USER_ID, HR_DEPT_ID, Role.STANDARD_EMPLOYEE, "10.0.0.5");
+        setJwtPrincipal(caller);
+
+        RetrievedChunk chunk = sampleChunk(HR_DEPT_ID, AccessLevel.DEPARTMENT, "handbook.pdf", 3, "12 ngày phép năm.");
+        UUID sessionId = UUID.randomUUID();
+        UUID l1MsgId = UUID.randomUUID();
+        UUID l2MsgId = UUID.randomUUID();
+        UUID missMsgId = UUID.randomUUID();
+
+        // 1. L1 cache hit -> 0 retrieval/LLM calls, 0 tokens, CacheTier.L1 persisted
+        when(ragCacheService.lookup(any(RbacVectorScope.class), eq("Nghỉ phép năm bao nhiêu ngày?"), eq(List.of()), any()))
+            .thenReturn(RagCacheService.CacheLookupResult.hit(
+                CacheTier.L1,
+                4L,
+                "12 ngày phép năm [Nguồn: handbook.pdf - Trang 3].",
+                null,
+                List.of(chunk.citation()),
+                RagConstants.PROVIDER_GROQ,
+                null,
+                500_000L,
+                0L,
+                0L
+            ));
+        when(sessionService.recordCompletedTurn(any()))
+            .thenReturn(new ChatSessionService.PersistedTurnResult(sessionId, l1MsgId));
+
+        ChatAskResponse l1Response = service.ask("Nghỉ phép năm bao nhiêu ngày?", null, null, caller);
+
+        assertThat(l1Response.cacheHit()).isTrue();
+        assertThat(l1Response.cacheTier()).isEqualTo(CacheTier.L1);
+        assertThat(l1Response.promptTokens()).isZero();
+        assertThat(l1Response.completionTokens()).isZero();
+        assertThat(l1Response.messageId()).isEqualTo(l1MsgId);
+        assertThat(l1Response.citations()).containsExactly(chunk.citation());
+        verifyNoInteractions(contextualizerService, vectorRetrievalService, groqChatModel, geminiChatModel);
+        verify(ragCacheService, never()).publishIfCurrent(any(), any(Long.class), any(), any(), any(), any(), any(), any(), any(Boolean.class), any());
+
+        ArgumentCaptor<ChatSessionService.CompletedTurnCommand> l1CmdCaptor =
+            ArgumentCaptor.forClass(ChatSessionService.CompletedTurnCommand.class);
+        verify(sessionService).recordCompletedTurn(l1CmdCaptor.capture());
+        assertThat(l1CmdCaptor.getValue().cacheTier()).isEqualTo(CacheTier.L1);
+        assertThat(l1CmdCaptor.getValue().promptTokens()).isZero();
+        assertThat(l1CmdCaptor.getValue().completionTokens()).isZero();
+
+        // 2. L2 semantic hit -> 0 retrieval/LLM calls, 0 tokens, CacheTier.L2 persisted
+        clearInvocations(sessionService);
+        float[] queryVector = new float[]{1.0f, 0.0f};
+        when(ragCacheService.lookup(any(RbacVectorScope.class), eq("Phép năm được mấy ngày?"), eq(List.of()), any()))
+            .thenReturn(RagCacheService.CacheLookupResult.hit(
+                CacheTier.L2,
+                4L,
+                "12 ngày phép năm [Nguồn: handbook.pdf - Trang 3].",
+                null,
+                List.of(chunk.citation()),
+                RagConstants.PROVIDER_GROQ,
+                queryVector,
+                400_000L,
+                3_000_000L,
+                5_000_000L
+            ));
+        when(sessionService.recordCompletedTurn(any()))
+            .thenReturn(new ChatSessionService.PersistedTurnResult(sessionId, l2MsgId));
+
+        ChatAskResponse l2Response = service.ask("Phép năm được mấy ngày?", null, null, caller);
+        assertThat(l2Response.cacheHit()).isTrue();
+        assertThat(l2Response.cacheTier()).isEqualTo(CacheTier.L2);
+        assertThat(l2Response.messageId()).isEqualTo(l2MsgId);
+        assertThat(l2Response.promptTokens()).isZero();
+        verifyNoInteractions(vectorRetrievalService, groqChatModel, geminiChatModel);
+
+        // 3. Grounded MISS -> executes retrieval + LLM, persists CacheTier.NONE, publishes with version captured before retrieval
+        clearInvocations(sessionService, ragCacheService);
+        when(ragCacheService.lookup(any(RbacVectorScope.class), eq("Chính sách thử việc?"), eq(List.of()), any()))
+            .thenReturn(RagCacheService.CacheLookupResult.miss(5L, queryVector, 500_000L, 2_000_000L, 4_000_000L));
+        when(ragCacheService.readAuthoritativeVersion(any(RbacVectorScope.class))).thenReturn(5L);
+        when(vectorRetrievalService.retrieve(eq("Chính sách thử việc?"), any(RbacVectorScope.class)))
+            .thenReturn(List.of(chunk));
+        when(groqChatModel.call(any(Prompt.class)))
+            .thenReturn(chatResponse("Thời gian thử việc là 60 ngày [Nguồn: handbook.pdf - Trang 3].", 120, 30));
+        when(sessionService.recordCompletedTurn(any()))
+            .thenReturn(new ChatSessionService.PersistedTurnResult(sessionId, missMsgId));
+
+        ChatAskResponse missResponse = service.ask("Chính sách thử việc?", null, null, caller);
+        assertThat(missResponse.cacheHit()).isFalse();
+        assertThat(missResponse.cacheTier()).isEqualTo(CacheTier.NONE);
+        assertThat(missResponse.promptTokens()).isEqualTo(120);
+        verify(ragCacheService).publishIfCurrent(
+            any(RbacVectorScope.class),
+            eq(5L),
+            eq("Chính sách thử việc?"),
+            eq(null),
+            eq(List.of()),
+            eq(queryVector),
+            eq("Thời gian thử việc là 60 ngày [Nguồn: handbook.pdf - Trang 3]."),
+            eq(List.of(chunk.citation())),
+            eq(false),
+            eq(RagConstants.PROVIDER_GROQ)
+        );
+
+        // 4. Abstained MISS -> never publishes to cache
+        clearInvocations(ragCacheService);
+        when(ragCacheService.lookup(any(RbacVectorScope.class), eq("Giá vàng hôm nay?"), eq(List.of()), any()))
+            .thenReturn(RagCacheService.CacheLookupResult.miss(5L, queryVector, 500_000L, 2_000_000L, 4_000_000L));
+        when(vectorRetrievalService.retrieve(eq("Giá vàng hôm nay?"), any(RbacVectorScope.class)))
+            .thenReturn(List.of());
+        when(sessionService.recordCompletedTurn(any()))
+            .thenReturn(new ChatSessionService.PersistedTurnResult(sessionId, UUID.randomUUID()));
+
+        ChatAskResponse abstainedResponse = service.ask("Giá vàng hôm nay?", null, null, caller);
+        assertThat(abstainedResponse.abstained()).isTrue();
+        assertThat(abstainedResponse.cacheHit()).isFalse();
+        verify(ragCacheService, never()).publishIfCurrent(any(), any(Long.class), any(), any(), any(), any(), any(), any(), any(Boolean.class), any());
+    }
+
+    private RagChatService createServiceWithCache(
+        String geminiApiKey,
+        RagProperties props,
+        ChatSessionService chatSessionService,
+        QueryContextualizerService queryContextualizerService,
+        RagCacheService ragCacheService
+    ) {
+        AiProperties aiProperties = new AiProperties(new AiProperties.GeminiProperties(
+            "https://generativelanguage.googleapis.com/v1beta/openai",
+            "/chat/completions",
+            geminiApiKey,
+            "gemini-3.5-flash",
+            0.1d
+        ));
+        return new RagChatService(
+            vectorRetrievalService,
+            groundedSystemPromptService,
+            rbacVectorFilterFactory,
+            groqChatClient,
+            providerOf(geminiChatClient),
+            providerOf(userRepository),
+            providerOf(departmentRepository),
+            providerOf(auditLogRepository),
+            providerOf(transactionTemplate),
+            providerOf(chatSessionService),
+            providerOf(queryContextualizerService),
+            providerOf(ragCacheService),
+            aiProperties,
+            props,
+            environment
+        );
+    }
+
     private RagChatService createMultiTurnService(
         String geminiApiKey,
         RagProperties props,

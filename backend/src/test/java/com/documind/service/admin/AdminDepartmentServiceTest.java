@@ -13,8 +13,10 @@ import com.documind.exception.ResourceNotFoundException;
 import com.documind.repository.DepartmentRepository;
 import com.documind.repository.DocumentRepository;
 import com.documind.repository.UserRepository;
+import com.documind.service.rag.RagCacheService;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.data.domain.PageImpl;
 import org.springframework.data.domain.PageRequest;
@@ -240,6 +242,51 @@ class AdminDepartmentServiceTest {
     }
 
     @Test
+    void createAndDeleteDepartmentPreserveGlobalCacheVersionMonotonicityAndSyncRedis() {
+        RagCacheService ragCacheService = mock(RagCacheService.class);
+        AdminDepartmentService cacheAwareService = new AdminDepartmentService(
+            departmentRepository,
+            userRepository,
+            documentRepository,
+            new StubTransactionManager(),
+            providerOf(ragCacheService)
+        );
+
+        UUID actorDeptId = UUID.fromString("11111111-1111-1111-1111-111111111111");
+        DepartmentEntity actorDept = department(actorDeptId, "IT", "IT");
+        UserEntity actorWithDept = activeAdmin(ADMIN_ID);
+        actorWithDept.setDepartment(actorDept);
+        when(userRepository.findById(ADMIN_ID)).thenReturn(Optional.of(actorWithDept));
+
+        when(departmentRepository.findByCodeIgnoreCase("LEGAL")).thenReturn(Optional.empty());
+        when(departmentRepository.saveAndFlush(any(DepartmentEntity.class))).thenAnswer(inv -> {
+            DepartmentEntity entity = inv.getArgument(0);
+            entity.setId(DEPT_ID);
+            OffsetDateTime now = OffsetDateTime.now(ZoneOffset.UTC);
+            entity.setCreatedAt(now);
+            entity.setUpdatedAt(now);
+            return entity;
+        });
+
+        cacheAwareService.createDepartment(new CreateDepartmentRequest("LEGAL", "Legal", null), ADMIN_ID);
+        verify(ragCacheService).schedulePostCommitSyncForDepartments(List.of(DEPT_ID));
+
+        DepartmentEntity retiredDept = department(DEPT_ID, "LEGAL", "Legal");
+        retiredDept.setCacheVersion(5L);
+        when(departmentRepository.findByIdForUpdate(DEPT_ID)).thenReturn(Optional.of(retiredDept));
+        when(userRepository.existsByDepartmentId(DEPT_ID)).thenReturn(false);
+        when(documentRepository.existsByDepartmentId(DEPT_ID)).thenReturn(false);
+
+        cacheAwareService.deleteDepartment(DEPT_ID, ADMIN_ID);
+
+        verify(departmentRepository).lockDepartmentsInOrder(List.of(DEPT_ID, actorDeptId));
+        verify(departmentRepository).delete(retiredDept);
+        verify(departmentRepository).addCacheVersionDelta(actorDeptId, 6L);
+        verify(ragCacheService).schedulePostCommitSyncForDepartments(List.of(actorDeptId));
+        verify(ragCacheService).schedulePostCommitDeleteDepartmentVersionKey(DEPT_ID);
+    }
+
+    @Test
     void blocksInactiveOrDemotedAdminActorEvenWithoutRedisRevocation() {
         UserEntity inactiveAdmin = activeAdmin(ADMIN_ID);
         inactiveAdmin.setIsActive(false);
@@ -302,5 +349,29 @@ class AdminDepartmentServiceTest {
         @Override
         protected void doRollback(DefaultTransactionStatus status) throws TransactionException {
         }
+    }
+
+    private static <T> ObjectProvider<T> providerOf(T instance) {
+        return new ObjectProvider<>() {
+            @Override
+            public T getObject(Object... args) {
+                return instance;
+            }
+
+            @Override
+            public T getIfAvailable() {
+                return instance;
+            }
+
+            @Override
+            public T getIfUnique() {
+                return instance;
+            }
+
+            @Override
+            public T getObject() {
+                return instance;
+            }
+        };
     }
 }

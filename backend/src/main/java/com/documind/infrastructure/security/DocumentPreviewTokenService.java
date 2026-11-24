@@ -12,6 +12,7 @@ import io.jsonwebtoken.JwtException;
 import io.jsonwebtoken.JwtParser;
 import io.jsonwebtoken.Jwts;
 import io.jsonwebtoken.security.Keys;
+import org.slf4j.Logger;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.core.env.Environment;
 import org.springframework.core.env.Profiles;
@@ -288,6 +289,30 @@ public class DocumentPreviewTokenService {
             throw new DocumentAccessDeniedException("Missing role claim in preview token");
         }
         return Role.valueOf(raw.trim());
+    }
+
+    public static java.util.Optional<String> tryIssuePreviewBaseUrl(
+        DocumentPreviewTokenService tokenService,
+        UUID documentId,
+        Integer currentVersion,
+        CallerContext caller,
+        Logger log
+    ) {
+        if (tokenService == null || documentId == null || caller == null) {
+            return java.util.Optional.empty();
+        }
+        try {
+            int version = currentVersion != null ? currentVersion : 1;
+            IssuedPreviewUrl issued = tokenService.issuePreviewUrl(documentId, version, caller);
+            return issued != null && issued.baseUrl() != null
+                ? java.util.Optional.of(issued.baseUrl())
+                : java.util.Optional.empty();
+        } catch (RuntimeException ex) {
+            if (log != null) {
+                log.warn("Failed to generate citation preview URL for document {}: {}", documentId, ex.getMessage());
+            }
+            return java.util.Optional.empty();
+        }
     }
 
     public record IssuedPreviewUrl(

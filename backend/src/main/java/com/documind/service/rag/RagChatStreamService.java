@@ -172,6 +172,16 @@ public class RagChatStreamService {
             caller
         );
 
+        RagCacheService cacheService = turn.ragCacheService();
+        RagCacheService.L1LookupResult l1Outcome = cacheService != null
+            ? cacheService.lookupL1(
+                turn.rbacScope(),
+                turn.normalizedQuestion(),
+                turn.recentHistory(),
+                turn.preloadedDepartmentVersion()
+            )
+            : null;
+
         SecurityContext securityContextSnapshot = snapshotSecurityContext();
         String requestBaseUrl = PreviewBaseUrlResolver.captureCurrentRequestOriginOrNull();
         long configuredTimeoutMs = ragProperties.sse().timeout().toMillis();
@@ -188,7 +198,8 @@ public class RagChatStreamService {
             sessionId,
             securityContextSnapshot,
             requestBaseUrl,
-            emitter
+            emitter,
+            l1Outcome
         );
         StreamExecutionState state = new StreamExecutionState();
 
@@ -213,6 +224,15 @@ public class RagChatStreamService {
             }
         });
 
+        // Synchronous L1 fast-path avoids Virtual Thread + Tomcat AsyncContext dispatch overhead on exact hits
+        if (l1Outcome != null && l1Outcome.isHit()) {
+            PreviewBaseUrlResolver.runWithBaseUrl(
+                requestBaseUrl,
+                () -> executeSyncL1CacheReplay(ctx, state, l1Outcome.hitResult())
+            );
+            return emitter;
+        }
+
         ScheduledFuture<?> timeoutTask = timeoutScheduler.schedule(
             () -> {
                 if (!state.terminalHandled.get()) {
@@ -231,6 +251,35 @@ public class RagChatStreamService {
         return emitter;
     }
 
+    private void executeSyncL1CacheReplay(
+        StreamExecutionContext ctx,
+        StreamExecutionState state,
+        RagCacheService.CacheLookupResult hit
+    ) {
+        try {
+            handleCacheHitReplay(ctx, state, hit);
+        } catch (Throwable unexpected) {
+            if (unexpected instanceof Error err) {
+                throw err;
+            }
+            log.error("Unhandled exception during synchronous SSE L1 cache replay", unexpected);
+            emitFailureAndClose(
+                ctx,
+                state,
+                ChatStreamErrorEvent.CODE_INTERNAL_ERROR,
+                "An unexpected internal error occurred",
+                state.currentProvider.get(),
+                false,
+                HttpStatus.INTERNAL_SERVER_ERROR.value()
+            );
+        } finally {
+            state.detachWorkerAndCleanup();
+            if (state.terminalHandled.get()) {
+                completeQuietly(ctx.emitter());
+            }
+        }
+    }
+
     private void runStreamPipeline(StreamExecutionContext ctx, StreamExecutionState state) {
         SecurityContextHolder.setContext(ctx.securityContextSnapshot());
         state.registerWorker(Thread.currentThread());
@@ -239,7 +288,36 @@ public class RagChatStreamService {
                 return;
             }
 
-            // Step 1: Contextualize follow-up queries on Turn 2+ only (Turn 1 skipped for optimal TTFT)
+            RagCacheService cacheService = ctx.turn().ragCacheService();
+            RagCacheService.L1LookupResult l1Outcome = ctx.l1Outcome();
+            RagCacheService.CacheLookupResult cacheLookup;
+            if (cacheService != null && l1Outcome != null && !l1Outcome.contextual()) {
+                cacheLookup = cacheService.lookupL2(
+                    ctx.turn().rbacScope(),
+                    ctx.turn().normalizedQuestion(),
+                    l1Outcome.capturedVersion(),
+                    l1Outcome.l1LookupNanos()
+                );
+            } else if (l1Outcome != null) {
+                cacheLookup = RagCacheService.CacheLookupResult.miss(
+                    l1Outcome.capturedVersion(),
+                    null,
+                    l1Outcome.l1LookupNanos(),
+                    0L,
+                    0L
+                );
+            } else {
+                cacheLookup = RagCacheService.CacheLookupResult.miss(1L, null, 0L, 0L, 0L);
+            }
+
+            if (checkAbortOrTimeout(ctx, state)) {
+                return;
+            }
+            if (cacheLookup.isHit()) {
+                handleCacheHitReplay(ctx, state, cacheLookup);
+                return;
+            }
+
             boolean followUpTurn = !ctx.turn().recentHistory().isEmpty() && ctx.turn().contextualizerService() != null;
             long rewriteStartedAtNanos = System.nanoTime();
             QueryContextualizerService.ContextualizedQuery contextualized = followUpTurn
@@ -256,6 +334,10 @@ public class RagChatStreamService {
             if (checkAbortOrTimeout(ctx, state)) {
                 return;
             }
+
+            long versionBeforeRetrieval = cacheService != null
+                ? cacheService.readAuthoritativeVersion(ctx.turn().rbacScope())
+                : cacheLookup.capturedVersion();
 
             // Step 2: RBAC-enforced vector retrieval
             List<RetrievedChunk> chunks;
@@ -331,13 +413,18 @@ public class RagChatStreamService {
             );
             state.activePromptRef.set(prompt);
 
-            // Step 5: Stream tokens from Groq with transparent pre-first-token failover to Gemini
             if (!streamWithPreTokenFailover(ctx, state, prompt)) {
                 return;
             }
 
-            // Step 6: doOnComplete — normalize soft-refusal, account tokens, persist atomically, emit done
-            completeAndPersistTurn(ctx, state, contextualized, retrievedCitations, prompt);
+            completeAndPersistTurn(
+                ctx,
+                state,
+                contextualized,
+                retrievedCitations,
+                prompt,
+                new CachePublishContext(cacheService, versionBeforeRetrieval, cacheLookup.queryEmbedding())
+            );
         } catch (Throwable unexpected) {
             if (unexpected instanceof Error err) {
                 throw err;
@@ -371,6 +458,37 @@ public class RagChatStreamService {
         }
     }
 
+    private void handleCacheHitReplay(
+        StreamExecutionContext ctx,
+        StreamExecutionState state,
+        RagCacheService.CacheLookupResult hit
+    ) {
+        state.activeCacheTier.set(hit.cacheTier());
+        state.currentProvider.set(hit.modelProvider());
+        if (!sendEvent(ctx, state, EVENT_CITATIONS, new ChatStreamCitationsEvent(hit.citations(), hit.rewrittenQuery()))) {
+            handleClientDisconnected(ctx, state);
+            return;
+        }
+        if (!sendEvent(ctx, state, EVENT_TOKEN, new ChatStreamTokenEvent(hit.answer()))) {
+            handleClientDisconnected(ctx, state);
+            return;
+        }
+        state.anyTokenEmitted.set(true);
+        persistTurnAndEmitTerminal(
+            ctx,
+            state,
+            hit.rewrittenQuery(),
+            hit.answer(),
+            hit.citations(),
+            false,
+            hit.modelProvider(),
+            hit.cacheTier(),
+            0,
+            0,
+            null
+        );
+    }
+
     private void handleDeterministicEmptyRefusal(
         StreamExecutionContext ctx,
         StreamExecutionState state,
@@ -392,8 +510,10 @@ public class RagChatStreamService {
             List.of(),
             true,
             contextualized.provider(),
+            CacheTier.NONE,
             contextualized.promptTokens(),
-            contextualized.completionTokens()
+            contextualized.completionTokens(),
+            null
         );
     }
 
@@ -687,7 +807,8 @@ public class RagChatStreamService {
         StreamExecutionState state,
         QueryContextualizerService.ContextualizedQuery contextualized,
         List<CitationDto> retrievedCitations,
-        Prompt prompt
+        Prompt prompt,
+        CachePublishContext publishContext
     ) {
         String trimmedAnswer = state.answerBuffer.toString().trim();
         boolean llmRefused = RagChatService.isSafeRefusalResponse(trimmedAnswer);
@@ -710,8 +831,10 @@ public class RagChatStreamService {
             finalCitations,
             llmRefused,
             state.currentProvider.get(),
+            CacheTier.NONE,
             totalPromptTokens,
-            totalCompletionTokens
+            totalCompletionTokens,
+            publishContext
         );
     }
 
@@ -723,8 +846,10 @@ public class RagChatStreamService {
         List<CitationDto> finalCitations,
         boolean abstained,
         String provider,
+        CacheTier cacheTier,
         int totalPromptTokens,
-        int totalCompletionTokens
+        int totalCompletionTokens,
+        CachePublishContext publishContext
     ) {
         if (checkAbortOrTimeout(ctx, state)) {
             return;
@@ -733,6 +858,7 @@ public class RagChatStreamService {
             return;
         }
 
+        CacheTier effectiveCacheTier = cacheTier != null ? cacheTier : CacheTier.NONE;
         long latencyMs = RagChatService.elapsedMillis(ctx.startedAtNanos());
         ChatSessionService.PersistedTurnResult persisted;
         try {
@@ -747,6 +873,7 @@ public class RagChatStreamService {
                 finalCitations,
                 abstained,
                 provider,
+                effectiveCacheTier,
                 totalPromptTokens,
                 totalCompletionTokens,
                 latencyMs,
@@ -775,7 +902,8 @@ public class RagChatStreamService {
                 totalCompletionTokens,
                 latencyMs,
                 provider,
-                HttpStatus.INTERNAL_SERVER_ERROR.value()
+                HttpStatus.INTERNAL_SERVER_ERROR.value(),
+                effectiveCacheTier
             );
             sendTerminalErrorAndComplete(
                 ctx.emitter(),
@@ -787,6 +915,29 @@ public class RagChatStreamService {
             return;
         }
 
+        if (publishContext != null
+            && publishContext.cacheService() != null
+            && effectiveCacheTier == CacheTier.NONE
+            && !abstained
+            && !finalCitations.isEmpty()) {
+            try {
+                publishContext.cacheService().publishIfCurrent(
+                    ctx.turn().rbacScope(),
+                    publishContext.versionBeforeRetrieval(),
+                    ctx.turn().normalizedQuestion(),
+                    rewrittenQuery,
+                    ctx.turn().recentHistory(),
+                    publishContext.queryEmbedding(),
+                    finalAnswer,
+                    finalCitations,
+                    false,
+                    provider
+                );
+            } catch (RuntimeException ex) {
+                log.warn("Best-effort SSE cache publish failed: {}", ex.getMessage());
+            }
+        }
+
         sendTerminalDoneAndComplete(
             ctx.emitter(),
             new ChatStreamDoneEvent(
@@ -794,8 +945,8 @@ public class RagChatStreamService {
                 persisted != null ? persisted.assistantMessageId() : null,
                 abstained,
                 provider,
-                false,
-                CacheTier.NONE,
+                effectiveCacheTier != CacheTier.NONE,
+                effectiveCacheTier,
                 ChatTokenUsageDto.of(totalPromptTokens, totalCompletionTokens),
                 latencyMs
             )
@@ -895,7 +1046,8 @@ public class RagChatStreamService {
             totalCompletionTokens(state, partialAnswerTokens),
             RagChatService.elapsedMillis(ctx.startedAtNanos()),
             state.currentProvider.get(),
-            STATUS_CLIENT_CLOSED_REQUEST
+            STATUS_CLIENT_CLOSED_REQUEST,
+            state.activeCacheTier.get()
         );
         completeQuietly(ctx.emitter());
     }
@@ -940,7 +1092,8 @@ public class RagChatStreamService {
             totalCompletionTokens(state, partialAnswerTokens),
             RagChatService.elapsedMillis(ctx.startedAtNanos()),
             provider,
-            auditStatusCode
+            auditStatusCode,
+            state.activeCacheTier.get()
         );
         sendTerminalErrorAndComplete(ctx.emitter(), errorCode, safeMessage, provider, retryable);
     }
@@ -1039,6 +1192,13 @@ public class RagChatStreamService {
         return copy;
     }
 
+    private record CachePublishContext(
+        RagCacheService cacheService,
+        long versionBeforeRetrieval,
+        float[] queryEmbedding
+    ) {
+    }
+
     private record StreamExecutionContext(
         long startedAtNanos,
         long deadlineNanos,
@@ -1046,7 +1206,8 @@ public class RagChatStreamService {
         UUID sessionId,
         SecurityContext securityContextSnapshot,
         String requestBaseUrl,
-        SseEmitter emitter
+        SseEmitter emitter,
+        RagCacheService.L1LookupResult l1Outcome
     ) {
     }
 
@@ -1064,6 +1225,7 @@ public class RagChatStreamService {
         final AtomicInteger priorAttemptCompletionTokens = new AtomicInteger(0);
         final AtomicInteger latestAnswerPromptTokens = new AtomicInteger(0);
         final AtomicInteger latestAnswerCompletionTokens = new AtomicInteger(0);
+        final AtomicReference<CacheTier> activeCacheTier = new AtomicReference<>(CacheTier.NONE);
         final AtomicReference<String> currentProvider = new AtomicReference<>(null);
         final AtomicReference<Prompt> activePromptRef = new AtomicReference<>(null);
         final AtomicReference<Disposable> activeSubscription = new AtomicReference<>(null);

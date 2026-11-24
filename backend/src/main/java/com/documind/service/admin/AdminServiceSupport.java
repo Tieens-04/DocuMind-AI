@@ -25,7 +25,7 @@ final class AdminServiceSupport {
     private AdminServiceSupport() {
     }
 
-    static void verifyActiveSystemAdmin(UserRepository userRepository, UUID actorUserId) {
+    static UserEntity verifyActiveSystemAdmin(UserRepository userRepository, UUID actorUserId) {
         if (actorUserId == null) {
             throw new AuthenticationRequiredException("Authenticated administrator principal is required");
         }
@@ -34,6 +34,7 @@ final class AdminServiceSupport {
         if (!actor.isActive() || actor.getRole() != Role.SYSTEM_ADMIN) {
             throw new AccessDeniedException("Administrator account is inactive or lacks SYSTEM_ADMIN privileges");
         }
+        return actor;
     }
 
     static <T> T executeInTransaction(

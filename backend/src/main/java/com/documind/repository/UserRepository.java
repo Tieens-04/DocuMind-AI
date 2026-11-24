@@ -23,6 +23,10 @@ public interface UserRepository extends JpaRepository<UserEntity, UUID>, JpaSpec
     @Query("SELECT u FROM UserEntity u WHERE LOWER(u.email) = LOWER(:email)")
     Optional<UserEntity> findByEmailIgnoreCase(@Param("email") String email);
 
+    @Override
+    @EntityGraph(attributePaths = "department")
+    Optional<UserEntity> findById(UUID id);
+
     @EntityGraph(attributePaths = "department")
     @Query("SELECT u FROM UserEntity u WHERE u.id = :id")
     Optional<UserEntity> findWithDepartmentById(@Param("id") UUID id);
