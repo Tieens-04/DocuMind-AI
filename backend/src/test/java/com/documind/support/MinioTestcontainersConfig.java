@@ -26,7 +26,18 @@ public class MinioTestcontainersConfig {
     private static final String MINIO_IMAGE =
         "cgr.dev/chainguard/minio:latest@sha256:634c989a2f1029162fc2676c263caa181213b9410449968532f750a6fb77532d";
 
-    private static final GenericContainer<?> SHARED_MINIO = new GenericContainer<>(DockerImageName.parse(MINIO_IMAGE))
+    private static final class SharedMinioContainer extends GenericContainer<SharedMinioContainer> {
+        SharedMinioContainer(DockerImageName dockerImageName) {
+            super(dockerImageName);
+        }
+
+        @Override
+        public void stop() {
+            // Keep JVM-wide singleton container alive across @DirtiesContext closes; Ryuk reaps on JVM exit.
+        }
+    }
+
+    private static final GenericContainer<?> SHARED_MINIO = new SharedMinioContainer(DockerImageName.parse(MINIO_IMAGE))
         .withEnv("MINIO_ROOT_USER", MINIO_ROOT_USER)
         .withEnv("MINIO_ROOT_PASSWORD", MINIO_ROOT_PASSWORD)
         .withCommand("server", "/data")
