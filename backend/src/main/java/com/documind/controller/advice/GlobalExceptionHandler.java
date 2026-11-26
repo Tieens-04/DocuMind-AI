@@ -15,6 +15,8 @@ import com.documind.exception.InvalidCredentialsException;
 import com.documind.exception.InvalidDocumentRequestException;
 import com.documind.exception.InvalidTokenException;
 import com.documind.exception.LlmProviderException;
+import com.documind.exception.RateLimitExceededException;
+import com.documind.exception.RateLimitStoreUnavailableException;
 import com.documind.exception.ResourceNotFoundException;
 import com.documind.exception.UnsupportedDocumentTypeException;
 import com.documind.infrastructure.storage.HashingBoundedInputStream;
@@ -24,6 +26,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpStatus;
+import org.springframework.http.MediaType;
 import org.springframework.http.ProblemDetail;
 import org.springframework.http.ResponseEntity;
 import org.springframework.http.converter.HttpMessageNotReadableException;
@@ -209,6 +212,43 @@ public class GlobalExceptionHandler {
             request
         );
         return ResponseEntity.of(problem).build();
+    }
+
+    @ExceptionHandler(RateLimitExceededException.class)
+    public ResponseEntity<ProblemDetail> handleRateLimitExceeded(
+        RateLimitExceededException ex,
+        HttpServletRequest request
+    ) {
+        ProblemDetail problem = buildProblem(
+            HttpStatus.TOO_MANY_REQUESTS,
+            "Too Many Requests",
+            ex.getMessage(),
+            "RATE_LIMIT_EXCEEDED",
+            request
+        );
+        problem.setProperty("retryAfterSeconds", ex.retryAfterSeconds());
+        return ResponseEntity.status(HttpStatus.TOO_MANY_REQUESTS)
+            .contentType(MediaType.APPLICATION_PROBLEM_JSON)
+            .header(HttpHeaders.RETRY_AFTER, String.valueOf(ex.retryAfterSeconds()))
+            .body(problem);
+    }
+
+    @ExceptionHandler(RateLimitStoreUnavailableException.class)
+    public ResponseEntity<ProblemDetail> handleRateLimitStoreUnavailable(
+        RateLimitStoreUnavailableException ex,
+        HttpServletRequest request
+    ) {
+        log.error("Rate limit store error on {}", request != null ? request.getRequestURI() : "unknown", ex);
+        ProblemDetail problem = buildProblem(
+            HttpStatus.SERVICE_UNAVAILABLE,
+            "Rate Limit Service Unavailable",
+            "Rate limiting store is temporarily unavailable",
+            "RATE_LIMIT_STORE_UNAVAILABLE",
+            request
+        );
+        return ResponseEntity.status(HttpStatus.SERVICE_UNAVAILABLE)
+            .contentType(MediaType.APPLICATION_PROBLEM_JSON)
+            .body(problem);
     }
 
     @ExceptionHandler(AccessDeniedException.class)
