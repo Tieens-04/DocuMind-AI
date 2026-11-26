@@ -10,6 +10,7 @@ import com.documind.infrastructure.storage.StorageProperties;
 import com.documind.infrastructure.vector.DocumentChunkVectorRepository;
 import com.documind.repository.DepartmentRepository;
 import com.documind.repository.DocumentRepository;
+import com.documind.service.audit.AuditLogService;
 import com.documind.service.rag.RagConstants;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
@@ -91,7 +92,12 @@ import static org.assertj.core.api.Assertions.assertThat;
         "DOCUMIND_ENV_FILE=.env.test-isolated",
         "spring.main.allow-bean-definition-overriding=true",
         "documind.ingestion.worker.enabled=true",
-        "documind.security.dev-caller-fallback.enabled=true"
+        "documind.security.dev-caller-fallback.enabled=true",
+        "documind.rate-limit.chat.viewer-limit=500",
+        "documind.rate-limit.chat.manager-limit=500",
+        "documind.rate-limit.chat.admin-limit=500",
+        "documind.rate-limit.upload.manager-limit=200",
+        "documind.rate-limit.upload.admin-limit=200"
     }
 )
 @ActiveProfiles("dev")
@@ -149,8 +155,14 @@ public abstract class AbstractIntegrationTest {
     @Autowired
     protected EmbeddingModel embeddingModel;
 
+    @Autowired(required = false)
+    protected AuditLogService auditLogService;
+
     @BeforeEach
     void setUpIntegrationEnvironment() throws InterruptedException {
+        if (auditLogService != null) {
+            auditLogService.awaitPendingWrites(Duration.ofSeconds(5));
+        }
         cleanSharedInfrastructure(
             jdbcTemplate,
             stringRedisTemplate,
@@ -164,6 +176,9 @@ public abstract class AbstractIntegrationTest {
 
     @AfterEach
     void tearDownIntegrationEnvironment() throws InterruptedException {
+        if (auditLogService != null) {
+            auditLogService.awaitPendingWrites(Duration.ofSeconds(5));
+        }
         cleanSharedInfrastructure(
             jdbcTemplate,
             stringRedisTemplate,

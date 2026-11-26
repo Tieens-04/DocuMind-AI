@@ -2,21 +2,31 @@ package com.documind.controller;
 
 import com.documind.controller.advice.GlobalExceptionHandler;
 import com.documind.controller.dto.PageResponse;
+import com.documind.controller.dto.admin.AdminAnalyticsSummaryResponse;
+import com.documind.controller.dto.admin.AdminAuditLogItemResponse;
+import com.documind.controller.dto.admin.AdminDailyTrendPointResponse;
+import com.documind.controller.dto.admin.AdminDailyTrendsResponse;
 import com.documind.controller.dto.admin.AdminDepartmentResponse;
+import com.documind.controller.dto.admin.AdminDepartmentTokenUsageReportResponse;
+import com.documind.controller.dto.admin.AdminDepartmentTokenUsageResponse;
 import com.documind.controller.dto.admin.AdminResetPasswordRequest;
 import com.documind.controller.dto.admin.AdminUserResponse;
 import com.documind.controller.dto.admin.CreateDepartmentRequest;
 import com.documind.controller.dto.admin.CreateUserRequest;
 import com.documind.controller.dto.admin.UpdateDepartmentRequest;
 import com.documind.controller.dto.admin.UpdateUserRequest;
+import com.documind.domain.enums.AuditActionType;
+import com.documind.domain.enums.CacheTier;
 import com.documind.domain.enums.Role;
 import com.documind.exception.AdminConflictException;
 import com.documind.exception.AuthStateStoreUnavailableException;
 import com.documind.exception.InvalidAdminRequestException;
 import com.documind.infrastructure.security.CustomUserDetails;
+import com.documind.service.admin.AdminAnalyticsService;
 import com.documind.service.admin.AdminDepartmentService;
 import com.documind.service.admin.AdminUserService;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.SerializationFeature;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -35,7 +45,9 @@ import org.springframework.web.context.request.NativeWebRequest;
 import org.springframework.web.method.support.HandlerMethodArgumentResolver;
 import org.springframework.web.method.support.ModelAndViewContainer;
 
+import java.math.BigDecimal;
 import java.time.Instant;
+import java.time.LocalDate;
 import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
 import java.util.List;
@@ -67,6 +79,7 @@ class AdminControllerTest {
 
     private AdminDepartmentService departmentService;
     private AdminUserService userService;
+    private AdminAnalyticsService analyticsService;
     private ObjectMapper objectMapper;
     private LocalValidatorFactoryBean validator;
     private CustomUserDetails currentPrincipal;
@@ -76,8 +89,10 @@ class AdminControllerTest {
     void setUp() {
         departmentService = mock(AdminDepartmentService.class);
         userService = mock(AdminUserService.class);
+        analyticsService = mock(AdminAnalyticsService.class);
         objectMapper = Jackson2ObjectMapperBuilder.json()
             .mixIn(ProblemDetail.class, ProblemDetailJacksonMixin.class)
+            .featuresToDisable(SerializationFeature.WRITE_DATES_AS_TIMESTAMPS)
             .build();
         validator = new LocalValidatorFactoryBean();
         validator.afterPropertiesSet();
@@ -113,7 +128,8 @@ class AdminControllerTest {
         mockMvc = MockMvcBuilders
             .standaloneSetup(
                 new AdminDepartmentController(departmentService),
-                new AdminUserController(userService)
+                new AdminUserController(userService),
+                new AdminAnalyticsController(analyticsService)
             )
             .setControllerAdvice(new GlobalExceptionHandler())
             .setMessageConverters(new MappingJackson2HttpMessageConverter(objectMapper))
@@ -340,7 +356,10 @@ class AdminControllerTest {
         mockMvc.perform(get("/api/v1/admin/users"))
             .andExpect(status().isUnauthorized())
             .andExpect(jsonPath("$.errorCode").value("AUTHENTICATION_REQUIRED"));
-        verifyNoInteractions(departmentService, userService);
+        mockMvc.perform(get("/api/v1/admin/analytics/summary"))
+            .andExpect(status().isUnauthorized())
+            .andExpect(jsonPath("$.errorCode").value("AUTHENTICATION_REQUIRED"));
+        verifyNoInteractions(departmentService, userService, analyticsService);
 
         currentPrincipal = new CustomUserDetails(
             ADMIN_ID, IT_DEPT_ID, "admin@documind.ai", "System Administrator",
@@ -361,8 +380,10 @@ class AdminControllerTest {
                  )) {
             AdminDepartmentController deptController = ctx.getBean(AdminDepartmentController.class);
             AdminUserController userController = ctx.getBean(AdminUserController.class);
+            AdminAnalyticsController analyticsController = ctx.getBean(AdminAnalyticsController.class);
             AdminDepartmentService deptSvc = ctx.getBean(AdminDepartmentService.class);
             AdminUserService userSvc = ctx.getBean(AdminUserService.class);
+            AdminAnalyticsService analyticsSvc = ctx.getBean(AdminAnalyticsService.class);
 
             // Non-admin principal (DEPARTMENT_MANAGER) must be rejected by @PreAuthorize AOP proxy
             CustomUserDetails manager = new CustomUserDetails(
@@ -379,9 +400,13 @@ class AdminControllerTest {
                     .isInstanceOf(org.springframework.security.access.AccessDeniedException.class);
                 org.assertj.core.api.Assertions.assertThatThrownBy(() -> userController.listUsers(null, null, null, null, 0, 20, manager))
                     .isInstanceOf(org.springframework.security.access.AccessDeniedException.class);
+                org.assertj.core.api.Assertions.assertThatThrownBy(() -> analyticsController.getSummary(null, null, manager))
+                    .isInstanceOf(org.springframework.security.access.AccessDeniedException.class);
                 org.assertj.core.api.Assertions.assertThatThrownBy(() -> deptSvc.listDepartments(null, 0, 20, USER_ID))
                     .isInstanceOf(org.springframework.security.access.AccessDeniedException.class);
                 org.assertj.core.api.Assertions.assertThatThrownBy(() -> userSvc.listUsers(null, null, null, null, 0, 20, USER_ID))
+                    .isInstanceOf(org.springframework.security.access.AccessDeniedException.class);
+                org.assertj.core.api.Assertions.assertThatThrownBy(() -> analyticsSvc.getSummary(null, null, USER_ID))
                     .isInstanceOf(org.springframework.security.access.AccessDeniedException.class);
 
                 // SYSTEM_ADMIN principal passes @PreAuthorize AOP proxy on both controllers
@@ -396,10 +421,69 @@ class AdminControllerTest {
                 org.assertj.core.api.Assertions.assertThat(
                     userController.listUsers(null, null, null, null, 0, 20, currentPrincipal).items()
                 ).isEmpty();
+                org.assertj.core.api.Assertions.assertThat(
+                    analyticsController.getSummary(null, null, currentPrincipal).successfulQueries()
+                ).isZero();
             } finally {
                 org.springframework.security.core.context.SecurityContextHolder.clearContext();
             }
         }
+    }
+
+    @Test
+    void analyticsEndpointsReturnSummaryDeptBreakdownDailyTrendsAuditLogsAndMap400() throws Exception {
+        OffsetDateTime from = OffsetDateTime.parse("2026-11-23T00:00:00Z");
+        OffsetDateTime to = OffsetDateTime.parse("2026-11-25T00:00:00Z");
+
+        when(analyticsService.getSummary(from, to, ADMIN_ID)).thenReturn(
+            new AdminAnalyticsSummaryResponse(from, to, 3L, 1L, new BigDecimal("33.33"), 1200L, 450L, 1650L)
+        );
+        mockMvc.perform(get("/api/v1/admin/analytics/summary?from=2026-11-23T00:00:00Z&to=2026-11-25T00:00:00Z"))
+            .andExpect(status().isOk())
+            .andExpect(jsonPath("$.successfulQueries").value(3))
+            .andExpect(jsonPath("$.cacheHitRatioPercent").value(33.33))
+            .andExpect(jsonPath("$.totalTokens").value(1650));
+
+        when(analyticsService.getTokenUsageByDepartment(from, to, ADMIN_ID)).thenReturn(
+            new AdminDepartmentTokenUsageReportResponse(from, to, List.of(
+                new AdminDepartmentTokenUsageResponse(FIN_DEPT_ID, "FIN", "Tài chính", 3L, 1L, new BigDecimal("33.33"), 1200L, 450L, 1650L)
+            ))
+        );
+        mockMvc.perform(get("/api/v1/admin/analytics/token-by-department?from=2026-11-23T00:00:00Z&to=2026-11-25T00:00:00Z"))
+            .andExpect(status().isOk())
+            .andExpect(jsonPath("$.items[0].departmentCode").value("FIN"))
+            .andExpect(jsonPath("$.items[0].totalTokens").value(1650));
+
+        when(analyticsService.getDailyTrends(from, to, ADMIN_ID)).thenReturn(
+            new AdminDailyTrendsResponse(from, to, List.of(
+                new AdminDailyTrendPointResponse(LocalDate.of(2026, 11, 24), 3L, 1L, new BigDecimal("33.33"), 1200L, 450L, 1650L)
+            ))
+        );
+        mockMvc.perform(get("/api/v1/admin/analytics/daily-trends?from=2026-11-23T00:00:00Z&to=2026-11-25T00:00:00Z"))
+            .andExpect(status().isOk())
+            .andExpect(jsonPath("$.items[0].date").value("2026-11-24"));
+
+        when(analyticsService.listAuditLogs(null, null, AuditActionType.RATE_LIMITED, null, null, 429, null, 0, 20, ADMIN_ID))
+            .thenReturn(new PageResponse<>(List.of(
+                new AdminAuditLogItemResponse(
+                    UUID.randomUUID(), USER_ID, "mgr@documind.ai", FIN_DEPT_ID, "FIN", "Tài chính",
+                    null, AuditActionType.RATE_LIMITED, "RATE_LIMIT:CHAT", false, false, CacheTier.NONE,
+                    0, 0, 0L, 3L, null, 429, "127.0.0.1", to
+                )
+            ), 0, 20, 1L, 1));
+        mockMvc.perform(get("/api/v1/admin/analytics/audit-logs?actionType=RATE_LIMITED&statusCode=429"))
+            .andExpect(status().isOk())
+            .andExpect(jsonPath("$.items[0].actionType").value("RATE_LIMITED"))
+            .andExpect(jsonPath("$.items[0].statusCode").value(429));
+
+        when(analyticsService.getSummary(to, from, ADMIN_ID))
+            .thenThrow(new InvalidAdminRequestException("'from' must be strictly before 'to'"));
+        mockMvc.perform(get("/api/v1/admin/analytics/summary?from=2026-11-25T00:00:00Z&to=2026-11-23T00:00:00Z"))
+            .andExpect(status().isBadRequest())
+            .andExpect(jsonPath("$.errorCode").value("INVALID_ADMIN_REQUEST"));
+
+        mockMvc.perform(get("/api/v1/admin/analytics/summary?from=not-a-date"))
+            .andExpect(status().isBadRequest());
     }
 
     @org.springframework.context.annotation.Configuration
@@ -422,6 +506,15 @@ class AdminControllerTest {
         }
 
         @org.springframework.context.annotation.Bean
+        AdminAnalyticsService adminAnalyticsService() {
+            AdminAnalyticsService mockSvc = mock(AdminAnalyticsService.class);
+            OffsetDateTime now = OffsetDateTime.now(ZoneOffset.UTC);
+            when(mockSvc.getSummary(any(), any(), any()))
+                .thenReturn(new AdminAnalyticsSummaryResponse(now.minusDays(30), now, 0L, 0L, BigDecimal.ZERO, 0L, 0L, 0L));
+            return mockSvc;
+        }
+
+        @org.springframework.context.annotation.Bean
         AdminDepartmentController adminDepartmentController(AdminDepartmentService svc) {
             return new AdminDepartmentController(svc);
         }
@@ -429,6 +522,11 @@ class AdminControllerTest {
         @org.springframework.context.annotation.Bean
         AdminUserController adminUserController(AdminUserService svc) {
             return new AdminUserController(svc);
+        }
+
+        @org.springframework.context.annotation.Bean
+        AdminAnalyticsController adminAnalyticsController(AdminAnalyticsService svc) {
+            return new AdminAnalyticsController(svc);
         }
     }
 }

@@ -21,6 +21,7 @@
 - **Stream token accounting (`streamUsage: true`)**: Stream via `chatClient.prompt()...stream().chatResponse()` (never `.stream().content()`) with `CL100K_BASE` fallback so `audit_logs` always records accurate `prompt_tokens` and `completion_tokens`.
 - **Immediate JWT revocation & fail-closed auth**: Keep `documind.security.dev-caller-fallback.enabled=false` in `application.yml`, enforce Redis blacklist revocation (`0s` cutoff on role/department change), and fail closed (`503`) if Redis auth state store is unavailable.
 - **Two-tier RBAC-scoped RAG cache & monotonic invalidation**: Pin L1 (`documind:rag:l1:{v1|ctx:v1}:`) and L2 (`semantic_cache`, cosine `>= 0.94`) to `(scope.cacheScopeKey(), authoritativeDbVersion)` with `MGET` TOCTOU reconciliation, live citation/preview re-verification, sync L1 SSE replay (`< 50ms`), and post-TX single-Lua Redis sync (carrying `retiredVersion + 1` on empty department deletion so `ADMIN:GLOBAL` never regresses).
+- **Post-RBAC Bucket4j rate limiting & bounded async FinOps audit**: Enforce Bucket4j + Lettuce quotas (`15/30/60` chat/min, `5/10` upload/min) after RBAC/session pre-checks with ABA-safe connection recovery + `AS_IS` demotion clamping, and bound fire-and-forget `429`/failure writes via non-blocking `Semaphore` + single-SQL `JdbcClient` insert on `documind-audit-vt-`.
 - **FlintFlow port coexistence**: Keep canonical host ports in `.env.example` / `docker-compose.yml` (`5432`, `6380`, `9000/9001`, `8081`, `3002`, `11434`) and never collide with `flintflow-*` containers.
 
 ---
@@ -35,6 +36,7 @@
 - **Singleton Testcontainers & Real-JWT Integration Suites**: `backend/src/test/java/com/documind/support/AbstractIntegrationTest.java`, `backend/src/test/java/com/documind/controller/VectorRbacRetrievalIntegrationTest.java`, `backend/src/test/java/com/documind/controller/TypedSseChatStreamingIntegrationTest.java`
 - **Milestone 2 Cross-Gate RBAC & Concurrent SSE Suites**: `backend/src/test/java/com/documind/support/Week2SseTestClient.java`, `backend/src/test/java/com/documind/integration/Week2CrossGateRbacIntegrationTest.java`, `backend/src/test/java/com/documind/integration/Week2SseConcurrencyAndResilienceIntegrationTest.java`
 - **RBAC-Scoped Two-Tier RAG Cache & Turn-1 CTE Persistence**: `backend/src/main/java/com/documind/service/rag/RagCacheService.java`, `backend/src/main/java/com/documind/infrastructure/vector/SemanticCacheVectorRepository.java`, `backend/src/main/java/com/documind/repository/ChatTurnPersistenceRepository.java`, `backend/src/test/java/com/documind/integration/ScopedRagCacheIntegrationTest.java`
+- **Bucket4j Rate Limiting, Async Audit Worker & Admin FinOps Analytics**: `backend/src/main/java/com/documind/infrastructure/ratelimit/RateLimitService.java`, `backend/src/main/java/com/documind/service/audit/AuditLogService.java`, `backend/src/main/java/com/documind/service/admin/AdminAnalyticsService.java`, `backend/src/test/java/com/documind/integration/RateLimitIntegrationTest.java`, `backend/src/test/java/com/documind/integration/AdminAnalyticsIntegrationTest.java`
 
 ---
 

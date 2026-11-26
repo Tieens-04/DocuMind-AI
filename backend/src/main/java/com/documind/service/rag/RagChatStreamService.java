@@ -171,6 +171,7 @@ public class RagChatStreamService {
             filterDepartmentId,
             caller
         );
+        ragChatService.enforceChatRateLimit(turn, "/api/v1/chat/stream");
 
         RagCacheService cacheService = turn.ragCacheService();
         RagCacheService.L1LookupResult l1Outcome = cacheService != null

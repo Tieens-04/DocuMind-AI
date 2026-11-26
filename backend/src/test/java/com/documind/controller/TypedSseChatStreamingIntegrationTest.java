@@ -9,6 +9,7 @@ import com.documind.infrastructure.storage.MinioStorageService;
 import com.documind.infrastructure.storage.StorageProperties;
 import com.documind.repository.DepartmentRepository;
 import com.documind.repository.DocumentRepository;
+import com.documind.service.audit.AuditLogService;
 import com.documind.service.ingestion.ChunkIdGenerator;
 import com.documind.service.ingestion.ChunkMetadataKeys;
 import com.documind.service.rag.RagConstants;
@@ -96,7 +97,12 @@ import static org.assertj.core.api.Assertions.assertThat;
         "spring.main.allow-bean-definition-overriding=true",
         "documind.ingestion.worker.enabled=false",
         "documind.security.dev-caller-fallback.enabled=false",
-        "documind.ai.gemini.api-key=test-gemini-fallback-key"
+        "documind.ai.gemini.api-key=test-gemini-fallback-key",
+        "documind.rate-limit.chat.viewer-limit=500",
+        "documind.rate-limit.chat.manager-limit=500",
+        "documind.rate-limit.chat.admin-limit=500",
+        "documind.rate-limit.upload.manager-limit=200",
+        "documind.rate-limit.upload.admin-limit=200"
     }
 )
 @ActiveProfiles("dev")
@@ -156,12 +162,18 @@ class TypedSseChatStreamingIntegrationTest {
     @Qualifier("testGeminiStreamingModel")
     private ControllableStreamingChatModel geminiModel;
 
+    @Autowired(required = false)
+    private AuditLogService auditLogService;
+
     private final HttpClient httpClient = HttpClient.newBuilder()
         .connectTimeout(Duration.ofSeconds(5))
         .build();
 
     @BeforeEach
     void setUp() throws InterruptedException {
+        if (auditLogService != null) {
+            auditLogService.awaitPendingWrites(Duration.ofSeconds(5));
+        }
         AbstractIntegrationTest.cleanSharedInfrastructure(
             jdbcTemplate,
             stringRedisTemplate,
@@ -179,6 +191,9 @@ class TypedSseChatStreamingIntegrationTest {
     void tearDown() throws InterruptedException {
         groqModel.reset();
         geminiModel.reset();
+        if (auditLogService != null) {
+            auditLogService.awaitPendingWrites(Duration.ofSeconds(5));
+        }
         AbstractIntegrationTest.cleanSharedInfrastructure(
             jdbcTemplate,
             stringRedisTemplate,

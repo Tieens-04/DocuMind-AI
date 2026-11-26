@@ -74,7 +74,7 @@ public class ChatController {
     )
     @Operation(
         summary = "Stream grounded RAG answer via Typed SSE",
-        description = "Validates auth, input, RBAC, and session ownership synchronously (returning RFC 7807 ProblemDetail for 400/401/403/404), then streams typed SSE events: citations (<500ms after pgvector retrieval), token (JSON-wrapped deltas preserving whitespace/Markdown), done (sessionId, messageId, abstained, modelProvider, cacheHit, cacheTier, tokenUsage, latencyMs), and error"
+        description = "Validates auth, input, RBAC, session ownership, and role rate limits synchronously (returning RFC 7807 ProblemDetail for 400/401/403/404/429/503), then streams typed SSE events: citations (<500ms after pgvector retrieval), token (JSON-wrapped deltas preserving whitespace/Markdown), done (sessionId, messageId, abstained, modelProvider, cacheHit, cacheTier, tokenUsage, latencyMs), and error"
     )
     public ResponseEntity<SseEmitter> stream(
         @Valid @RequestBody ChatAskRequest requestBody,

@@ -91,7 +91,8 @@ import static org.assertj.core.api.Assertions.assertThat;
         "documind.ingestion.worker.initial-backoff=15ms",
         "documind.ingestion.worker.backoff-multiplier=2.0",
         "documind.ingestion.worker.max-backoff=60ms",
-        "documind.security.dev-caller-fallback.enabled=true"
+        "documind.security.dev-caller-fallback.enabled=true",
+        "documind.rate-limit.enabled=false"
     }
 )
 @ActiveProfiles("dev")

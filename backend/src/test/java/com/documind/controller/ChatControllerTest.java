@@ -12,6 +12,8 @@ import com.documind.domain.enums.Role;
 import com.documind.exception.DocumentAccessDeniedException;
 import com.documind.exception.InvalidChatRequestException;
 import com.documind.exception.LlmProviderException;
+import com.documind.exception.RateLimitExceededException;
+import com.documind.exception.RateLimitStoreUnavailableException;
 import com.documind.exception.ResourceNotFoundException;
 import com.documind.service.document.CallerContext;
 import com.documind.service.document.CallerContextResolver;
@@ -43,6 +45,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.hamcrest.Matchers.containsString;
 import static org.hamcrest.Matchers.not;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
@@ -502,5 +505,48 @@ class ChatControllerTest {
                 .content("{\"question\":\"Câu hỏi quá hạn\"}"))
             .andExpect(status().isOk())
             .andExpect(content().string(""));
+    }
+
+    @Test
+    void askAndStreamReturn429WithRetryAfterBeforeOpeningSseAnd503WhenRedisUnavailable() throws Exception {
+        CallerContext caller = new CallerContext(USER_ID, HR_DEPT_ID, Role.STANDARD_EMPLOYEE, "127.0.0.1");
+        when(callerContextResolver.resolve(any())).thenReturn(caller);
+
+        when(ragChatService.ask("Hỏi câu 16?", null, null, caller))
+            .thenThrow(new RateLimitExceededException(17L, "Rate limit exceeded for chat. Retry after 17 seconds"));
+        when(ragChatStreamService.openStream("Stream câu 16?", null, null, caller))
+            .thenThrow(new RateLimitExceededException(17L, "Rate limit exceeded for chat. Retry after 17 seconds"));
+
+        mockMvc.perform(post("/api/v1/chat/ask")
+                .contentType(MediaType.APPLICATION_JSON)
+                .content("{\"question\":\"Hỏi câu 16?\"}"))
+            .andExpect(status().isTooManyRequests())
+            .andExpect(content().contentTypeCompatibleWith(MediaType.APPLICATION_PROBLEM_JSON))
+            .andExpect(header().string(HttpHeaders.RETRY_AFTER, "17"))
+            .andExpect(jsonPath("$.errorCode").value("RATE_LIMIT_EXCEEDED"))
+            .andExpect(jsonPath("$.retryAfterSeconds").value(17));
+
+        mockMvc.perform(post("/api/v1/chat/stream")
+                .contentType(MediaType.APPLICATION_JSON)
+                .accept(MediaType.TEXT_EVENT_STREAM)
+                .content("{\"question\":\"Stream câu 16?\"}"))
+            .andExpect(status().isTooManyRequests())
+            .andExpect(request().asyncNotStarted())
+            .andExpect(content().contentTypeCompatibleWith(MediaType.APPLICATION_PROBLEM_JSON))
+            .andExpect(header().string(HttpHeaders.RETRY_AFTER, "17"))
+            .andExpect(jsonPath("$.errorCode").value("RATE_LIMIT_EXCEEDED"));
+
+        when(ragChatStreamService.openStream("Stream khi Redis lỗi?", null, null, caller))
+            .thenThrow(new RateLimitStoreUnavailableException("Redis unreachable at 127.0.0.1:6380", new RuntimeException("localhost:6380")));
+
+        mockMvc.perform(post("/api/v1/chat/stream")
+                .contentType(MediaType.APPLICATION_JSON)
+                .accept(MediaType.TEXT_EVENT_STREAM)
+                .content("{\"question\":\"Stream khi Redis lỗi?\"}"))
+            .andExpect(status().isServiceUnavailable())
+            .andExpect(content().contentTypeCompatibleWith(MediaType.APPLICATION_PROBLEM_JSON))
+            .andExpect(jsonPath("$.errorCode").value("RATE_LIMIT_STORE_UNAVAILABLE"))
+            .andExpect(jsonPath("$.detail", not(containsString("127.0.0.1"))))
+            .andExpect(jsonPath("$.detail", not(containsString("6380"))));
     }
 }

@@ -4,13 +4,10 @@ import com.documind.controller.dto.CitationDto;
 import com.documind.controller.dto.PageResponse;
 import com.documind.controller.dto.chat.ChatMessageResponse;
 import com.documind.controller.dto.chat.ChatSessionResponse;
-import com.documind.domain.entity.AuditLogEntity;
 import com.documind.domain.entity.ChatMessageEntity;
 import com.documind.domain.entity.ChatSessionEntity;
-import com.documind.domain.entity.DepartmentEntity;
 import com.documind.domain.entity.DocumentEntity;
 import com.documind.domain.entity.UserEntity;
-import com.documind.domain.enums.AuditActionType;
 import com.documind.domain.enums.CacheTier;
 import com.documind.domain.enums.DocumentStatus;
 import com.documind.domain.enums.MessageRole;
@@ -19,6 +16,7 @@ import com.documind.domain.model.CitationPayload;
 import com.documind.exception.DocumentAccessDeniedException;
 import com.documind.exception.InvalidChatRequestException;
 import com.documind.exception.ResourceNotFoundException;
+import com.documind.infrastructure.security.ClientIpResolver;
 import com.documind.infrastructure.security.DocumentPreviewTokenService;
 import com.documind.infrastructure.storage.MinioStorageService;
 import com.documind.repository.AuditLogRepository;
@@ -28,6 +26,7 @@ import com.documind.repository.ChatTurnPersistenceRepository;
 import com.documind.repository.DepartmentRepository;
 import com.documind.repository.DocumentRepository;
 import com.documind.repository.UserRepository;
+import com.documind.service.audit.AuditLogService;
 import com.documind.service.document.CallerContext;
 import com.documind.service.rag.RagProperties;
 import com.documind.service.rag.RbacVectorFilterFactory;
@@ -36,6 +35,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.core.task.SyncTaskExecutor;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.PageRequest;
 import org.springframework.data.domain.Sort;
@@ -70,14 +70,13 @@ import java.util.stream.Collectors;
 @Service
 public class ChatSessionService {
 
-    public static final String DEFAULT_SESSION_TITLE = "Cuộc hội thoại mới";
+    public static final String DEFAULT_SESSION_TITLE = AuditLogService.DEFAULT_SESSION_TITLE;
     public static final String REDACTED_ASSISTANT_CONTENT =
         "[Nội dung câu trả lời đã được ẩn do quyền truy cập hoặc trạng thái tài liệu nguồn đã thay đổi]";
 
     private static final Logger log = LoggerFactory.getLogger(ChatSessionService.class);
     private static final int MAX_TITLE_LENGTH = 255;
     private static final int MAX_PAGE_SIZE = 100;
-    private static final int MAX_IP_LENGTH = 45;
     private static final String ELLIPSIS = "...";
     private static final Pattern WHITESPACE_COLLAPSE = Pattern.compile("[\\s\\u00A0]+");
 
@@ -91,6 +90,8 @@ public class ChatSessionService {
     private final RbacVectorFilterFactory rbacVectorFilterFactory;
     private final ObjectProvider<TransactionTemplate> transactionTemplateProvider;
     private final ObjectProvider<ChatTurnPersistenceRepository> chatTurnPersistenceRepositoryProvider;
+    private final ObjectProvider<AuditLogService> auditLogServiceProvider;
+    private final AuditLogService syncFallbackAuditLogService;
     private final RagProperties ragProperties;
 
     @Autowired
@@ -105,6 +106,7 @@ public class ChatSessionService {
         RbacVectorFilterFactory rbacVectorFilterFactory,
         ObjectProvider<TransactionTemplate> transactionTemplateProvider,
         ObjectProvider<ChatTurnPersistenceRepository> chatTurnPersistenceRepositoryProvider,
+        ObjectProvider<AuditLogService> auditLogServiceProvider,
         RagProperties ragProperties
     ) {
         this.chatSessionRepositoryProvider = Objects.requireNonNull(chatSessionRepositoryProvider, "chatSessionRepositoryProvider must not be null");
@@ -117,7 +119,47 @@ public class ChatSessionService {
         this.rbacVectorFilterFactory = Objects.requireNonNull(rbacVectorFilterFactory, "rbacVectorFilterFactory must not be null");
         this.transactionTemplateProvider = Objects.requireNonNull(transactionTemplateProvider, "transactionTemplateProvider must not be null");
         this.chatTurnPersistenceRepositoryProvider = chatTurnPersistenceRepositoryProvider;
+        this.auditLogServiceProvider = auditLogServiceProvider;
+        this.syncFallbackAuditLogService = new AuditLogService(
+            this.chatSessionRepositoryProvider,
+            this.chatMessageRepositoryProvider,
+            this.userRepositoryProvider,
+            this.departmentRepositoryProvider,
+            this.auditLogRepositoryProvider,
+            this.chatTurnPersistenceRepositoryProvider,
+            this.transactionTemplateProvider,
+            new SyncTaskExecutor()
+        );
         this.ragProperties = Objects.requireNonNull(ragProperties, "ragProperties must not be null");
+    }
+
+    public ChatSessionService(
+        ObjectProvider<ChatSessionRepository> chatSessionRepositoryProvider,
+        ObjectProvider<ChatMessageRepository> chatMessageRepositoryProvider,
+        ObjectProvider<UserRepository> userRepositoryProvider,
+        ObjectProvider<DepartmentRepository> departmentRepositoryProvider,
+        ObjectProvider<DocumentRepository> documentRepositoryProvider,
+        ObjectProvider<AuditLogRepository> auditLogRepositoryProvider,
+        DocumentPreviewTokenService previewTokenService,
+        RbacVectorFilterFactory rbacVectorFilterFactory,
+        ObjectProvider<TransactionTemplate> transactionTemplateProvider,
+        ObjectProvider<ChatTurnPersistenceRepository> chatTurnPersistenceRepositoryProvider,
+        RagProperties ragProperties
+    ) {
+        this(
+            chatSessionRepositoryProvider,
+            chatMessageRepositoryProvider,
+            userRepositoryProvider,
+            departmentRepositoryProvider,
+            documentRepositoryProvider,
+            auditLogRepositoryProvider,
+            previewTokenService,
+            rbacVectorFilterFactory,
+            transactionTemplateProvider,
+            chatTurnPersistenceRepositoryProvider,
+            null,
+            ragProperties
+        );
     }
 
     public ChatSessionService(
@@ -142,6 +184,7 @@ public class ChatSessionService {
             previewTokenService,
             rbacVectorFilterFactory,
             transactionTemplateProvider,
+            null,
             null,
             ragProperties
         );
@@ -322,147 +365,36 @@ public class ChatSessionService {
         Objects.requireNonNull(command, "command must not be null");
         Objects.requireNonNull(command.actor(), "command.actor must not be null");
 
-        if (command.sessionId() == null && chatTurnPersistenceRepositoryProvider != null) {
-            ChatTurnPersistenceRepository turnRepository = chatTurnPersistenceRepositoryProvider.getIfAvailable();
-            if (turnRepository != null) {
-                OffsetDateTime userCreatedAt = resolveMonotonicTimestamp(null);
-                OffsetDateTime assistantCreatedAt = resolveMonotonicTimestamp(userCreatedAt);
-                OffsetDateTime auditCreatedAt = OffsetDateTime.now(ZoneOffset.UTC).truncatedTo(ChronoUnit.MICROS);
-                List<CitationPayload> citationPayloads = command.citations().stream()
-                    .map(CitationDto::toCitationPayload)
-                    .toList();
-                ChatTurnPersistenceRepository.PersistedNewSessionTurn inserted =
-                    turnRepository.insertNewSessionTurnAtomically(
-                        new ChatTurnPersistenceRepository.NewSessionTurnInsert(
-                            command.actor().getId(),
-                            command.auditDepartmentId(),
-                            deriveAutoTitle(command.userQuestion()),
-                            command.userQuestion(),
-                            command.rewrittenQuery(),
-                            command.assistantAnswer(),
-                            citationPayloads,
-                            command.abstained(),
-                            command.cacheTier(),
-                            command.promptTokens(),
-                            command.completionTokens(),
-                            command.latencyMs(),
-                            command.modelProvider(),
-                            truncateIp(command.ipAddress()),
-                            userCreatedAt,
-                            assistantCreatedAt,
-                            auditCreatedAt
-                        )
-                    );
-                return new PersistedTurnResult(inserted.sessionId(), inserted.assistantMessageId());
-            }
-        }
+        List<CitationPayload> citationPayloads = command.citations().stream()
+            .map(CitationDto::toCitationPayload)
+            .toList();
+        AuditLogService.CompletedChatTurnPayload payload = new AuditLogService.CompletedChatTurnPayload(
+            command.actor().getId(),
+            command.auditDepartmentId(),
+            command.sessionId(),
+            deriveAutoTitle(command.userQuestion()),
+            command.userQuestion(),
+            command.rewrittenQuery(),
+            command.assistantAnswer(),
+            citationPayloads,
+            command.abstained(),
+            command.modelProvider(),
+            command.cacheTier(),
+            command.promptTokens(),
+            command.completionTokens(),
+            command.latencyMs(),
+            command.ipAddress(),
+            OffsetDateTime.now(ZoneOffset.UTC).truncatedTo(ChronoUnit.MICROS),
+            true
+        );
 
-        PersistedTurnResult persisted = transactionTemplateProvider.getObject().execute(status -> {
-            ChatSessionRepository sessionRepo = chatSessionRepositoryProvider.getObject();
-            ChatMessageRepository messageRepo = chatMessageRepositoryProvider.getObject();
-            DepartmentEntity department = command.auditDepartmentId() != null
-                ? departmentRepositoryProvider.getObject().getReferenceById(command.auditDepartmentId())
-                : null;
-
-            ChatSessionEntity session;
-            OffsetDateTime userCreatedAt;
-            OffsetDateTime assistantCreatedAt;
-            if (command.sessionId() == null) {
-                userCreatedAt = resolveMonotonicTimestamp(null);
-                assistantCreatedAt = resolveMonotonicTimestamp(userCreatedAt);
-                session = new ChatSessionEntity();
-                session.setUser(command.actor());
-                session.setTitle(deriveAutoTitle(command.userQuestion()));
-                session.setCreatedAt(userCreatedAt);
-                session.setUpdatedAt(assistantCreatedAt);
-                session = sessionRepo.save(session);
-            } else {
-                Optional<ChatSessionEntity> lockedOpt =
-                    sessionRepo.findByIdAndUserIdForUpdate(command.sessionId(), command.actor().getId());
-                if (lockedOpt.isEmpty()) {
-                    // Preserve FinOps token accounting even if session was deleted while LLM I/O was in flight
-                    auditLogRepositoryProvider.getObject().save(buildChatAuditLog(
-                        command.actor(),
-                        department,
-                        null,
-                        command.userQuestion(),
-                        command.abstained(),
-                        command.cacheTier(),
-                        command.promptTokens(),
-                        command.completionTokens(),
-                        command.latencyMs(),
-                        command.modelProvider(),
-                        HttpStatus.NOT_FOUND.value(),
-                        command.ipAddress()
-                    ));
-                    return null;
-                }
-                session = lockedOpt.get();
-                Optional<ChatMessageEntity> latestMsg =
-                    messageRepo.findFirstBySessionIdOrderByCreatedAtDescIdDesc(session.getId());
-                boolean isFirstTurn = latestMsg.isEmpty();
-                OffsetDateTime floor = latestMsg.map(ChatMessageEntity::getCreatedAt).orElse(session.getCreatedAt());
-                userCreatedAt = resolveMonotonicTimestamp(floor);
-                assistantCreatedAt = resolveMonotonicTimestamp(userCreatedAt);
-                if (isFirstTurn && DEFAULT_SESSION_TITLE.equals(session.getTitle())) {
-                    session.setTitle(deriveAutoTitle(command.userQuestion()));
-                }
-                session.setUpdatedAt(assistantCreatedAt);
-                session = sessionRepo.save(session);
-            }
-
-            ChatMessageEntity userMessage = new ChatMessageEntity();
-            userMessage.setSession(session);
-            userMessage.setRole(MessageRole.USER);
-            userMessage.setContent(command.userQuestion());
-            userMessage.setCitations(List.of());
-            userMessage.setAbstained(false);
-            userMessage.setCacheTier(CacheTier.NONE);
-            userMessage.setPromptTokens(0);
-            userMessage.setCompletionTokens(0);
-            userMessage.setCreatedAt(userCreatedAt);
-            messageRepo.save(userMessage);
-
-            List<CitationPayload> citationPayloads = command.citations().stream()
-                .map(CitationDto::toCitationPayload)
-                .toList();
-
-            ChatMessageEntity assistantMessage = new ChatMessageEntity();
-            assistantMessage.setSession(session);
-            assistantMessage.setRole(MessageRole.ASSISTANT);
-            assistantMessage.setContent(command.assistantAnswer());
-            assistantMessage.setRewrittenQuery(command.rewrittenQuery());
-            assistantMessage.setCitations(citationPayloads);
-            assistantMessage.setAbstained(command.abstained());
-            assistantMessage.setCacheTier(command.cacheTier());
-            assistantMessage.setPromptTokens(Math.max(0, command.promptTokens()));
-            assistantMessage.setCompletionTokens(Math.max(0, command.completionTokens()));
-            assistantMessage.setLatencyMs(Math.max(0L, command.latencyMs()));
-            assistantMessage.setModelProvider(command.modelProvider());
-            assistantMessage.setCreatedAt(assistantCreatedAt);
-            ChatMessageEntity savedAssistant = messageRepo.save(assistantMessage);
-
-            auditLogRepositoryProvider.getObject().save(buildChatAuditLog(
-                command.actor(),
-                department,
-                session,
-                command.userQuestion(),
-                command.abstained(),
-                command.cacheTier(),
-                command.promptTokens(),
-                command.completionTokens(),
-                command.latencyMs(),
-                command.modelProvider(),
-                HttpStatus.OK.value(),
-                command.ipAddress()
-            ));
-
-            return new PersistedTurnResult(session.getId(), savedAssistant.getId());
-        });
-        if (persisted == null) {
-            throw new ResourceNotFoundException("Chat session not found: " + command.sessionId());
-        }
-        return persisted;
+        AuditLogService asyncAuditService = auditLogServiceProvider != null ? auditLogServiceProvider.getIfAvailable() : null;
+        AuditLogService.PersistedTurnResult persisted = asyncAuditService != null
+            ? AuditLogService.awaitTurnPersistence(asyncAuditService.recordCompletedTurnAsync(payload))
+            : syncFallbackAuditLogService.recordCompletedTurnSync(payload);
+        return persisted != null
+            ? new PersistedTurnResult(persisted.sessionId(), persisted.assistantMessageId())
+            : null;
     }
 
     /**
@@ -545,30 +477,26 @@ public class ChatSessionService {
         CacheTier cacheTier,
         String ipAddress
     ) {
-        transactionTemplateProvider.getObject().executeWithoutResult(status -> {
-            ChatSessionEntity session = (sessionId != null && actor != null)
-                ? chatSessionRepositoryProvider.getObject()
-                    .findByIdAndUserIdForUpdate(sessionId, actor.getId())
-                    .orElse(null)
-                : null;
-            DepartmentEntity department = auditDepartmentId != null
-                ? departmentRepositoryProvider.getObject().getReferenceById(auditDepartmentId)
-                : null;
-            auditLogRepositoryProvider.getObject().save(buildChatAuditLog(
-                actor,
-                department,
-                session,
-                queryText,
-                true,
-                cacheTier != null ? cacheTier : CacheTier.NONE,
-                promptTokens,
-                completionTokens,
-                latencyMs,
-                failedProvider,
-                statusCode,
-                ipAddress
-            ));
-        });
+        AuditLogService.ChatFailureAuditPayload payload = new AuditLogService.ChatFailureAuditPayload(
+            actor != null ? actor.getId() : null,
+            auditDepartmentId,
+            sessionId,
+            queryText,
+            promptTokens,
+            completionTokens,
+            latencyMs,
+            failedProvider,
+            statusCode,
+            cacheTier,
+            ipAddress,
+            OffsetDateTime.now(ZoneOffset.UTC).truncatedTo(ChronoUnit.MICROS)
+        );
+        AuditLogService asyncAuditService = auditLogServiceProvider != null ? auditLogServiceProvider.getIfAvailable() : null;
+        if (asyncAuditService != null) {
+            asyncAuditService.recordChatFailureAsync(payload);
+        } else {
+            syncFallbackAuditLogService.recordChatFailureSync(payload);
+        }
     }
 
     /**
@@ -747,37 +675,6 @@ public class ChatSessionService {
         }
     }
 
-    private static AuditLogEntity buildChatAuditLog(
-        UserEntity user,
-        DepartmentEntity department,
-        ChatSessionEntity session,
-        String queryText,
-        boolean abstained,
-        CacheTier cacheTier,
-        int promptTokens,
-        int completionTokens,
-        long latencyMs,
-        String provider,
-        int statusCode,
-        String ipAddress
-    ) {
-        AuditLogEntity auditLog = new AuditLogEntity();
-        auditLog.setUser(user);
-        auditLog.setDepartment(department);
-        auditLog.setSession(session);
-        auditLog.setActionType(AuditActionType.CHAT_QUERY);
-        auditLog.setQueryText(queryText);
-        auditLog.setAbstained(abstained);
-        auditLog.setCacheTier(cacheTier != null ? cacheTier : CacheTier.NONE);
-        auditLog.setPromptTokens(Math.max(0, promptTokens));
-        auditLog.setCompletionTokens(Math.max(0, completionTokens));
-        auditLog.setLatencyMs(Math.max(0L, latencyMs));
-        auditLog.setProvider(provider);
-        auditLog.setStatusCode(statusCode);
-        auditLog.setIpAddress(truncateIp(ipAddress));
-        return auditLog;
-    }
-
     private static String normalizeOptionalTitle(String rawTitle) {
         if (rawTitle == null) {
             return DEFAULT_SESSION_TITLE;
@@ -826,24 +723,8 @@ public class ChatSessionService {
         }
     }
 
-    private static OffsetDateTime resolveMonotonicTimestamp(OffsetDateTime floorExclusive) {
-        OffsetDateTime now = OffsetDateTime.now(ZoneOffset.UTC).truncatedTo(ChronoUnit.MICROS);
-        if (floorExclusive == null) {
-            return now;
-        }
-        OffsetDateTime floorMicros = floorExclusive.withOffsetSameInstant(ZoneOffset.UTC).truncatedTo(ChronoUnit.MICROS);
-        return now.isAfter(floorMicros) ? now : floorMicros.plus(1, ChronoUnit.MICROS);
-    }
-
     public static String truncateIp(String ipAddress) {
-        if (ipAddress == null) {
-            return null;
-        }
-        String trimmed = ipAddress.trim();
-        if (trimmed.isEmpty()) {
-            return null;
-        }
-        return trimmed.length() > MAX_IP_LENGTH ? trimmed.substring(0, MAX_IP_LENGTH) : trimmed;
+        return ClientIpResolver.normalize(ipAddress);
     }
 
     public record CompletedTurnCommand(

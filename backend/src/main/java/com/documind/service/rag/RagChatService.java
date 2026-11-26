@@ -9,13 +9,18 @@ import com.documind.domain.entity.UserEntity;
 import com.documind.domain.enums.AuditActionType;
 import com.documind.domain.enums.CacheTier;
 import com.documind.domain.enums.MessageRole;
+import com.documind.domain.model.CitationPayload;
 import com.documind.exception.InvalidChatRequestException;
 import com.documind.exception.LlmProviderException;
 import com.documind.exception.ResourceNotFoundException;
 import com.documind.infrastructure.ai.AiProperties;
+import com.documind.infrastructure.ratelimit.RateLimitOperation;
+import com.documind.infrastructure.ratelimit.RateLimitService;
+import com.documind.infrastructure.security.ClientIpResolver;
 import com.documind.repository.AuditLogRepository;
 import com.documind.repository.DepartmentRepository;
 import com.documind.repository.UserRepository;
+import com.documind.service.audit.AuditLogService;
 import com.documind.service.chat.ChatSessionService;
 import com.documind.service.document.CallerContext;
 import com.documind.service.document.DevCallerFallbackEnabledCondition;
@@ -41,6 +46,9 @@ import org.springframework.stereotype.Service;
 import org.springframework.transaction.support.TransactionTemplate;
 import org.springframework.web.client.RestClientException;
 
+import java.time.OffsetDateTime;
+import java.time.ZoneOffset;
+import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
@@ -71,6 +79,8 @@ public class RagChatService {
     private final ObjectProvider<ChatSessionService> chatSessionServiceProvider;
     private final ObjectProvider<QueryContextualizerService> queryContextualizerServiceProvider;
     private final ObjectProvider<RagCacheService> ragCacheServiceProvider;
+    private final ObjectProvider<AuditLogService> auditLogServiceProvider;
+    private final ObjectProvider<RateLimitService> rateLimitServiceProvider;
     private final AiProperties aiProperties;
     private final RagProperties ragProperties;
     private final Environment environment;
@@ -89,6 +99,8 @@ public class RagChatService {
         ObjectProvider<ChatSessionService> chatSessionServiceProvider,
         ObjectProvider<QueryContextualizerService> queryContextualizerServiceProvider,
         ObjectProvider<RagCacheService> ragCacheServiceProvider,
+        ObjectProvider<AuditLogService> auditLogServiceProvider,
+        ObjectProvider<RateLimitService> rateLimitServiceProvider,
         AiProperties aiProperties,
         RagProperties ragProperties,
         Environment environment
@@ -105,9 +117,88 @@ public class RagChatService {
         this.chatSessionServiceProvider = Objects.requireNonNull(chatSessionServiceProvider, "chatSessionServiceProvider must not be null");
         this.queryContextualizerServiceProvider = Objects.requireNonNull(queryContextualizerServiceProvider, "queryContextualizerServiceProvider must not be null");
         this.ragCacheServiceProvider = ragCacheServiceProvider;
+        this.auditLogServiceProvider = auditLogServiceProvider;
+        this.rateLimitServiceProvider = rateLimitServiceProvider;
         this.aiProperties = aiProperties;
         this.ragProperties = Objects.requireNonNull(ragProperties, "ragProperties must not be null");
         this.environment = Objects.requireNonNull(environment, "environment must not be null");
+    }
+
+    public RagChatService(
+        VectorRetrievalService vectorRetrievalService,
+        GroundedSystemPromptService groundedSystemPromptService,
+        RbacVectorFilterFactory rbacVectorFilterFactory,
+        ChatClient groqChatClient,
+        ObjectProvider<ChatClient> geminiChatClientProvider,
+        ObjectProvider<UserRepository> userRepositoryProvider,
+        ObjectProvider<DepartmentRepository> departmentRepositoryProvider,
+        ObjectProvider<AuditLogRepository> auditLogRepositoryProvider,
+        ObjectProvider<TransactionTemplate> transactionTemplateProvider,
+        ObjectProvider<ChatSessionService> chatSessionServiceProvider,
+        ObjectProvider<QueryContextualizerService> queryContextualizerServiceProvider,
+        ObjectProvider<RagCacheService> ragCacheServiceProvider,
+        ObjectProvider<AuditLogService> auditLogServiceProvider,
+        AiProperties aiProperties,
+        RagProperties ragProperties,
+        Environment environment
+    ) {
+        this(
+            vectorRetrievalService,
+            groundedSystemPromptService,
+            rbacVectorFilterFactory,
+            groqChatClient,
+            geminiChatClientProvider,
+            userRepositoryProvider,
+            departmentRepositoryProvider,
+            auditLogRepositoryProvider,
+            transactionTemplateProvider,
+            chatSessionServiceProvider,
+            queryContextualizerServiceProvider,
+            ragCacheServiceProvider,
+            auditLogServiceProvider,
+            null,
+            aiProperties,
+            ragProperties,
+            environment
+        );
+    }
+
+    public RagChatService(
+        VectorRetrievalService vectorRetrievalService,
+        GroundedSystemPromptService groundedSystemPromptService,
+        RbacVectorFilterFactory rbacVectorFilterFactory,
+        ChatClient groqChatClient,
+        ObjectProvider<ChatClient> geminiChatClientProvider,
+        ObjectProvider<UserRepository> userRepositoryProvider,
+        ObjectProvider<DepartmentRepository> departmentRepositoryProvider,
+        ObjectProvider<AuditLogRepository> auditLogRepositoryProvider,
+        ObjectProvider<TransactionTemplate> transactionTemplateProvider,
+        ObjectProvider<ChatSessionService> chatSessionServiceProvider,
+        ObjectProvider<QueryContextualizerService> queryContextualizerServiceProvider,
+        ObjectProvider<RagCacheService> ragCacheServiceProvider,
+        AiProperties aiProperties,
+        RagProperties ragProperties,
+        Environment environment
+    ) {
+        this(
+            vectorRetrievalService,
+            groundedSystemPromptService,
+            rbacVectorFilterFactory,
+            groqChatClient,
+            geminiChatClientProvider,
+            userRepositoryProvider,
+            departmentRepositoryProvider,
+            auditLogRepositoryProvider,
+            transactionTemplateProvider,
+            chatSessionServiceProvider,
+            queryContextualizerServiceProvider,
+            ragCacheServiceProvider,
+            null,
+            null,
+            aiProperties,
+            ragProperties,
+            environment
+        );
     }
 
     public RagChatService(
@@ -138,6 +229,8 @@ public class RagChatService {
             transactionTemplateProvider,
             chatSessionServiceProvider,
             queryContextualizerServiceProvider,
+            null,
+            null,
             null,
             aiProperties,
             ragProperties,
@@ -177,6 +270,7 @@ public class RagChatService {
     ) {
         long startedAtNanos = System.nanoTime();
         PreparedChatTurn turn = prepareTurn(rawQuestion, sessionId, filterDepartmentId, caller);
+        enforceChatRateLimit(turn, "/api/v1/chat/ask");
         RbacVectorScope rbacScope = turn.rbacScope();
         CallerContext verifiedCaller = turn.verifiedCaller();
         String normalizedQuestion = turn.normalizedQuestion();
@@ -441,6 +535,20 @@ public class RagChatService {
         );
     }
 
+    void enforceChatRateLimit(PreparedChatTurn turn, String endpoint) {
+        RateLimitService rateLimitService = rateLimitServiceProvider != null
+            ? rateLimitServiceProvider.getIfAvailable()
+            : null;
+        if (rateLimitService != null) {
+            rateLimitService.consume(
+                RateLimitOperation.CHAT,
+                turn.verifiedCaller(),
+                turn.auditDepartmentId(),
+                endpoint
+            );
+        }
+    }
+
     private static Long extractPreloadedDepartmentVersion(UserEntity verifiedActor, CallerContext verifiedCaller) {
         if (verifiedActor == null || verifiedCaller == null || verifiedCaller.departmentId() == null) {
             return null;
@@ -529,6 +637,43 @@ public class RagChatService {
         String ipAddress
     ) {
         CacheTier effectiveCacheTier = cacheTier != null ? cacheTier : CacheTier.NONE;
+        AuditLogService auditLogService = auditLogServiceProvider != null ? auditLogServiceProvider.getIfAvailable() : null;
+        if (auditLogService != null) {
+            UUID userId = verifiedActor != null ? verifiedActor.getId() : null;
+            boolean persistChatTurn = chatSessionService != null && userId != null;
+            String sessionTitle = persistChatTurn
+                ? chatSessionService.deriveAutoTitle(normalizedQuestion)
+                : ChatSessionService.DEFAULT_SESSION_TITLE;
+            List<CitationPayload> citationPayloads = finalCitations != null
+                ? finalCitations.stream().map(CitationDto::toCitationPayload).toList()
+                : List.of();
+            AuditLogService.PersistedTurnResult persisted = AuditLogService.awaitTurnPersistence(
+                auditLogService.recordCompletedTurnAsync(
+                    new AuditLogService.CompletedChatTurnPayload(
+                        userId,
+                        auditDepartmentId,
+                        sessionId,
+                        sessionTitle,
+                        normalizedQuestion,
+                        rewrittenQuery,
+                        finalAnswer,
+                        citationPayloads,
+                        abstained,
+                        provider,
+                        effectiveCacheTier,
+                        totalPromptTokens,
+                        totalCompletionTokens,
+                        latencyMs,
+                        ipAddress,
+                        OffsetDateTime.now(ZoneOffset.UTC).truncatedTo(ChronoUnit.MICROS),
+                        persistChatTurn
+                    )
+                )
+            );
+            return persisted != null
+                ? new ChatSessionService.PersistedTurnResult(persisted.sessionId(), persisted.assistantMessageId())
+                : null;
+        }
         if (chatSessionService != null && verifiedActor != null) {
             return chatSessionService.recordCompletedTurn(
                 new ChatSessionService.CompletedTurnCommand(
@@ -712,6 +857,24 @@ public class RagChatService {
     ) {
         CacheTier effectiveCacheTier = cacheTier != null ? cacheTier : CacheTier.NONE;
         try {
+            AuditLogService auditLogService = auditLogServiceProvider != null ? auditLogServiceProvider.getIfAvailable() : null;
+            if (auditLogService != null) {
+                auditLogService.recordChatFailureAsync(new AuditLogService.ChatFailureAuditPayload(
+                    verifiedActor != null ? verifiedActor.getId() : null,
+                    auditDepartmentId,
+                    sessionId,
+                    queryText,
+                    promptTokens,
+                    completionTokens,
+                    latencyMs,
+                    failedProvider,
+                    statusCode,
+                    effectiveCacheTier,
+                    ipAddress,
+                    OffsetDateTime.now(ZoneOffset.UTC).truncatedTo(ChronoUnit.MICROS)
+                ));
+                return;
+            }
             if (chatSessionService != null) {
                 if (effectiveCacheTier == CacheTier.NONE) {
                     chatSessionService.recordFailureAudit(
@@ -790,7 +953,7 @@ public class RagChatService {
             auditLog.setLatencyMs(Math.max(0L, latencyMs));
             auditLog.setProvider(provider);
             auditLog.setStatusCode(statusCode);
-            auditLog.setIpAddress(ChatSessionService.truncateIp(ipAddress));
+            auditLog.setIpAddress(ClientIpResolver.normalize(ipAddress));
             auditLogRepositoryProvider.getObject().save(auditLog);
         });
     }

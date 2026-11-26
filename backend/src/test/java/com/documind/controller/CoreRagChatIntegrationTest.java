@@ -96,7 +96,8 @@ import static org.assertj.core.api.Assertions.assertThat;
     properties = {
         "spring.main.allow-bean-definition-overriding=true",
         "documind.ingestion.worker.enabled=true",
-        "documind.security.dev-caller-fallback.enabled=true"
+        "documind.security.dev-caller-fallback.enabled=true",
+        "documind.rate-limit.enabled=false"
     }
 )
 @ActiveProfiles("dev")

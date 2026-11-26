@@ -84,7 +84,12 @@ import static org.assertj.core.api.Assertions.assertThat;
     properties = {
         "spring.main.allow-bean-definition-overriding=true",
         "documind.ingestion.worker.enabled=true",
-        "documind.security.dev-caller-fallback.enabled=true"
+        "documind.security.dev-caller-fallback.enabled=true",
+        "documind.rate-limit.chat.viewer-limit=500",
+        "documind.rate-limit.chat.manager-limit=500",
+        "documind.rate-limit.chat.admin-limit=500",
+        "documind.rate-limit.upload.manager-limit=200",
+        "documind.rate-limit.upload.admin-limit=200"
     }
 )
 @ActiveProfiles("dev")

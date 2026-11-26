@@ -20,6 +20,9 @@ import com.documind.exception.DocumentStorageException;
 import com.documind.exception.DuplicateDocumentException;
 import com.documind.exception.InvalidDocumentRequestException;
 import com.documind.exception.ResourceNotFoundException;
+import com.documind.infrastructure.ratelimit.RateLimitOperation;
+import com.documind.infrastructure.ratelimit.RateLimitService;
+import com.documind.infrastructure.security.ClientIpResolver;
 import com.documind.infrastructure.security.DocumentPreviewTokenService;
 import com.documind.infrastructure.storage.HashingBoundedInputStream;
 import com.documind.infrastructure.storage.MinioStorageService;
@@ -79,7 +82,6 @@ public class DocumentService {
     private static final Logger log = LoggerFactory.getLogger(DocumentService.class);
     private static final int INITIAL_DOCUMENT_VERSION = 1;
     private static final int MAX_PAGE_SIZE = 100;
-    private static final int MAX_IP_LENGTH = 45;
     private static final int HTTP_ACCEPTED = 202;
     private static final int HTTP_NO_CONTENT = 204;
     private static final Pattern SINGLE_BYTE_RANGE_PATTERN = Pattern.compile("^bytes=(\\d*)-(\\d*)$");
@@ -94,6 +96,7 @@ public class DocumentService {
     private final Supplier<TokenBlacklistService> tokenBlacklistServiceSupplier;
     private final Supplier<TransactionTemplate> transactionTemplateSupplier;
     private final Supplier<RagCacheService> ragCacheServiceSupplier;
+    private final Supplier<RateLimitService> rateLimitServiceSupplier;
     private final ApplicationEventPublisher eventPublisher;
     private final Environment environment;
 
@@ -109,6 +112,7 @@ public class DocumentService {
         ObjectProvider<TokenBlacklistService> tokenBlacklistServiceProvider,
         ObjectProvider<TransactionTemplate> transactionTemplateProvider,
         ObjectProvider<RagCacheService> ragCacheServiceProvider,
+        ObjectProvider<RateLimitService> rateLimitServiceProvider,
         ApplicationEventPublisher eventPublisher,
         Environment environment
     ) {
@@ -123,6 +127,7 @@ public class DocumentService {
             () -> Objects.requireNonNull(tokenBlacklistServiceProvider, "tokenBlacklistServiceProvider must not be null").getObject(),
             () -> Objects.requireNonNull(transactionTemplateProvider, "transactionTemplateProvider must not be null").getObject(),
             () -> ragCacheServiceProvider != null ? ragCacheServiceProvider.getIfAvailable() : null,
+            () -> rateLimitServiceProvider != null ? rateLimitServiceProvider.getIfAvailable() : null,
             eventPublisher,
             environment
         );
@@ -149,6 +154,7 @@ public class DocumentService {
             null,
             null,
             transactionTemplate,
+            null,
             null,
             eventPublisher,
             environment
@@ -179,6 +185,7 @@ public class DocumentService {
             tokenBlacklistService,
             transactionTemplate,
             null,
+            null,
             eventPublisher,
             environment
         );
@@ -199,6 +206,38 @@ public class DocumentService {
         Environment environment
     ) {
         this(
+            documentRepository,
+            departmentRepository,
+            userRepository,
+            auditLogRepository,
+            fileValidationService,
+            minioStorageService,
+            previewTokenService,
+            tokenBlacklistService,
+            transactionTemplate,
+            ragCacheService,
+            null,
+            eventPublisher,
+            environment
+        );
+    }
+
+    public DocumentService(
+        DocumentRepository documentRepository,
+        DepartmentRepository departmentRepository,
+        UserRepository userRepository,
+        AuditLogRepository auditLogRepository,
+        FileValidationService fileValidationService,
+        MinioStorageService minioStorageService,
+        DocumentPreviewTokenService previewTokenService,
+        TokenBlacklistService tokenBlacklistService,
+        TransactionTemplate transactionTemplate,
+        RagCacheService ragCacheService,
+        RateLimitService rateLimitService,
+        ApplicationEventPublisher eventPublisher,
+        Environment environment
+    ) {
+        this(
             () -> Objects.requireNonNull(documentRepository, "documentRepository must not be null"),
             () -> Objects.requireNonNull(departmentRepository, "departmentRepository must not be null"),
             () -> Objects.requireNonNull(userRepository, "userRepository must not be null"),
@@ -209,6 +248,7 @@ public class DocumentService {
             tokenBlacklistService != null ? () -> tokenBlacklistService : null,
             () -> Objects.requireNonNull(transactionTemplate, "transactionTemplate must not be null"),
             ragCacheService != null ? () -> ragCacheService : null,
+            rateLimitService != null ? () -> rateLimitService : null,
             eventPublisher,
             environment
         );
@@ -225,6 +265,7 @@ public class DocumentService {
         Supplier<TokenBlacklistService> tokenBlacklistServiceSupplier,
         Supplier<TransactionTemplate> transactionTemplateSupplier,
         Supplier<RagCacheService> ragCacheServiceSupplier,
+        Supplier<RateLimitService> rateLimitServiceSupplier,
         ApplicationEventPublisher eventPublisher,
         Environment environment
     ) {
@@ -238,6 +279,7 @@ public class DocumentService {
         this.tokenBlacklistServiceSupplier = tokenBlacklistServiceSupplier;
         this.transactionTemplateSupplier = transactionTemplateSupplier;
         this.ragCacheServiceSupplier = ragCacheServiceSupplier;
+        this.rateLimitServiceSupplier = rateLimitServiceSupplier;
         this.eventPublisher = Objects.requireNonNull(eventPublisher, "eventPublisher must not be null");
         this.environment = Objects.requireNonNull(environment, "environment must not be null");
     }
@@ -277,6 +319,7 @@ public class DocumentService {
         DepartmentEntity department = departmentRepository().findById(effectiveDepartmentId)
             .orElseThrow(() -> new ResourceNotFoundException("Department not found: " + effectiveDepartmentId));
         UserEntity uploadedBy = resolveVerifiedActor(caller, department.getId());
+        enforceUploadRateLimit(caller, department.getId(), "/api/v1/documents/upload");
 
         // Phase 1: Validate bounded 64 KiB header and stream once through SHA-256 + 50 MiB guard into MinIO
         StagedUpload stagedUpload = streamToStorage(file, department.getId(), INITIAL_DOCUMENT_VERSION);
@@ -537,6 +580,7 @@ public class DocumentService {
             throw new DocumentAccessDeniedException("You do not have permission to update this document");
         }
         resolveVerifiedActor(caller, caller.isSystemAdmin() ? null : preCheckDoc.getDepartmentId());
+        enforceUploadRateLimit(caller, preCheckDoc.getDepartmentId(), "/api/v1/documents/" + documentId);
 
         UUID preCheckDeptId = preCheckDoc.getDepartmentId();
         int candidateStorageVersion = (preCheckDoc.getCurrentVersion() != null
@@ -1074,6 +1118,13 @@ public class DocumentService {
         return PendingCacheSync.of(false, departmentId);
     }
 
+    private void enforceUploadRateLimit(CallerContext caller, UUID auditDepartmentId, String endpoint) {
+        RateLimitService rateLimitService = rateLimitServiceSupplier != null ? rateLimitServiceSupplier.get() : null;
+        if (rateLimitService != null) {
+            rateLimitService.consume(RateLimitOperation.UPLOAD, caller, auditDepartmentId, endpoint);
+        }
+    }
+
     private void executePendingCacheSync(PendingCacheSync pendingSync) {
         if (pendingSync == null) {
             return;
@@ -1119,20 +1170,9 @@ public class DocumentService {
         auditLog.setActionType(actionType);
         auditLog.setQueryText(queryText);
         auditLog.setStatusCode(statusCode);
-        auditLog.setIpAddress(truncateIp(ipAddress));
+        auditLog.setIpAddress(ClientIpResolver.normalize(ipAddress));
         auditLog.setLatencyMs(Math.max(0L, TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startedAtNanos)));
         auditLogRepository().save(auditLog);
-    }
-
-    private static String truncateIp(String ipAddress) {
-        if (ipAddress == null) {
-            return null;
-        }
-        String trimmed = ipAddress.trim();
-        if (trimmed.isEmpty()) {
-            return null;
-        }
-        return trimmed.length() > MAX_IP_LENGTH ? trimmed.substring(0, MAX_IP_LENGTH) : trimmed;
     }
 
     private static void requireCaller(CallerContext caller) {

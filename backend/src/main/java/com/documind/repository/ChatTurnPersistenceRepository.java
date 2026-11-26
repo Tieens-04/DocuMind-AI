@@ -122,6 +122,49 @@ public class ChatTurnPersistenceRepository {
         return new PersistedNewSessionTurn(sessionId, assistantMessageId);
     }
 
+    public void insertRateLimitAuditAtomically(
+        UUID userId,
+        UUID departmentId,
+        String detailText,
+        long latencyMs,
+        String ipAddress,
+        OffsetDateTime occurredAt
+    ) {
+        jdbcClientSupplier.get().sql("""
+                INSERT INTO audit_logs (
+                    id, user_id, department_id, session_id, action_type, query_text,
+                    abstained, cache_hit, cache_tier, prompt_tokens, completion_tokens,
+                    latency_ms, provider, status_code, ip_address, created_at
+                )
+                VALUES (
+                    :auditId,
+                    (SELECT id FROM users WHERE id = :userId),
+                    (SELECT id FROM departments WHERE id = :departmentId),
+                    NULL,
+                    'RATE_LIMITED',
+                    :detailText,
+                    FALSE,
+                    FALSE,
+                    'NONE',
+                    0,
+                    0,
+                    :latencyMs,
+                    NULL,
+                    429,
+                    :ipAddress,
+                    :occurredAt
+                )
+                """)
+            .param("auditId", UUID.randomUUID())
+            .param("userId", userId, Types.OTHER)
+            .param("departmentId", departmentId, Types.OTHER)
+            .param("detailText", detailText, Types.VARCHAR)
+            .param("latencyMs", Math.max(0L, latencyMs))
+            .param("ipAddress", ipAddress, Types.VARCHAR)
+            .param("occurredAt", occurredAt)
+            .update();
+    }
+
     public record NewSessionTurnInsert(
         UUID userId,
         UUID auditDepartmentId,
