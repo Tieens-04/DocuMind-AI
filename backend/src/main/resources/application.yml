@@ -172,3 +172,15 @@ documind:
       l2-ttl: ${RAG_CACHE_L2_TTL:24h}
       semantic-similarity-threshold: ${RAG_CACHE_SEMANTIC_THRESHOLD:0.94}
       version-ttl: ${RAG_CACHE_VERSION_TTL:24h}
+  rate-limit:
+    enabled: ${RATE_LIMIT_ENABLED:true}
+    expiration-buffer: ${RATE_LIMIT_EXPIRATION_BUFFER:10s}
+    chat:
+      period: ${RATE_LIMIT_CHAT_PERIOD:1m}
+      viewer-limit: ${RATE_LIMIT_CHAT_VIEWER:15}
+      manager-limit: ${RATE_LIMIT_CHAT_MANAGER:30}
+      admin-limit: ${RATE_LIMIT_CHAT_ADMIN:60}
+    upload:
+      period: ${RATE_LIMIT_UPLOAD_PERIOD:1m}
+      manager-limit: ${RATE_LIMIT_UPLOAD_MANAGER:5}
+      admin-limit: ${RATE_LIMIT_UPLOAD_ADMIN:10}

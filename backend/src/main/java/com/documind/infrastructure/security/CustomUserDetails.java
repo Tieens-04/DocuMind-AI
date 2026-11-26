@@ -1,6 +1,7 @@
 package com.documind.infrastructure.security;
 
 import com.documind.domain.enums.Role;
+import com.documind.exception.AuthenticationRequiredException;
 import org.springframework.security.core.GrantedAuthority;
 import org.springframework.security.core.authority.SimpleGrantedAuthority;
 import org.springframework.security.core.userdetails.UserDetails;
@@ -56,6 +57,13 @@ public final class CustomUserDetails implements UserDetails {
             claims.jti(),
             claims.expiresAt()
         );
+    }
+
+    public static UUID requireUserId(CustomUserDetails principal) {
+        if (principal == null) {
+            throw new AuthenticationRequiredException("Authenticated security principal is required");
+        }
+        return principal.userId();
     }
 
     public UUID userId() {

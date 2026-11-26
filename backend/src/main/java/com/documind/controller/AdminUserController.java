@@ -6,7 +6,6 @@ import com.documind.controller.dto.admin.AdminUserResponse;
 import com.documind.controller.dto.admin.CreateUserRequest;
 import com.documind.controller.dto.admin.UpdateUserRequest;
 import com.documind.domain.enums.Role;
-import com.documind.exception.AuthenticationRequiredException;
 import com.documind.infrastructure.security.CustomUserDetails;
 import com.documind.service.admin.AdminUserService;
 import io.swagger.v3.oas.annotations.Operation;
@@ -51,7 +50,7 @@ public class AdminUserController {
         @Valid @RequestBody CreateUserRequest request,
         @AuthenticationPrincipal CustomUserDetails principal
     ) {
-        AdminUserResponse created = adminUserService.createUser(request, requirePrincipalId(principal));
+        AdminUserResponse created = adminUserService.createUser(request, CustomUserDetails.requireUserId(principal));
         return ResponseEntity.status(HttpStatus.CREATED).body(created);
     }
 
@@ -66,7 +65,7 @@ public class AdminUserController {
         @RequestParam(name = "size", defaultValue = "20") int size,
         @AuthenticationPrincipal CustomUserDetails principal
     ) {
-        return adminUserService.listUsers(departmentId, role, isActive, query, page, size, requirePrincipalId(principal));
+        return adminUserService.listUsers(departmentId, role, isActive, query, page, size, CustomUserDetails.requireUserId(principal));
     }
 
     @GetMapping("/{id}")
@@ -75,7 +74,7 @@ public class AdminUserController {
         @PathVariable("id") UUID id,
         @AuthenticationPrincipal CustomUserDetails principal
     ) {
-        return adminUserService.getUser(id, requirePrincipalId(principal));
+        return adminUserService.getUser(id, CustomUserDetails.requireUserId(principal));
     }
 
     @PatchMapping("/{id}")
@@ -88,7 +87,7 @@ public class AdminUserController {
         @Valid @RequestBody UpdateUserRequest request,
         @AuthenticationPrincipal CustomUserDetails principal
     ) {
-        return adminUserService.updateUser(id, request, requirePrincipalId(principal));
+        return adminUserService.updateUser(id, request, CustomUserDetails.requireUserId(principal));
     }
 
     @PutMapping("/{id}/password")
@@ -101,14 +100,7 @@ public class AdminUserController {
         @Valid @RequestBody AdminResetPasswordRequest request,
         @AuthenticationPrincipal CustomUserDetails principal
     ) {
-        adminUserService.resetPassword(id, request, requirePrincipalId(principal));
+        adminUserService.resetPassword(id, request, CustomUserDetails.requireUserId(principal));
         return ResponseEntity.noContent().build();
-    }
-
-    private static UUID requirePrincipalId(CustomUserDetails principal) {
-        if (principal == null) {
-            throw new AuthenticationRequiredException("Authenticated security principal is required");
-        }
-        return principal.userId();
     }
 }

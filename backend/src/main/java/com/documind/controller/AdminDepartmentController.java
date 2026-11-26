@@ -4,7 +4,6 @@ import com.documind.controller.dto.PageResponse;
 import com.documind.controller.dto.admin.AdminDepartmentResponse;
 import com.documind.controller.dto.admin.CreateDepartmentRequest;
 import com.documind.controller.dto.admin.UpdateDepartmentRequest;
-import com.documind.exception.AuthenticationRequiredException;
 import com.documind.infrastructure.security.CustomUserDetails;
 import com.documind.service.admin.AdminDepartmentService;
 import io.swagger.v3.oas.annotations.Operation;
@@ -51,7 +50,7 @@ public class AdminDepartmentController {
         @Valid @RequestBody CreateDepartmentRequest request,
         @AuthenticationPrincipal CustomUserDetails principal
     ) {
-        AdminDepartmentResponse created = adminDepartmentService.createDepartment(request, requirePrincipalId(principal));
+        AdminDepartmentResponse created = adminDepartmentService.createDepartment(request, CustomUserDetails.requireUserId(principal));
         return ResponseEntity.status(HttpStatus.CREATED).body(created);
     }
 
@@ -63,7 +62,7 @@ public class AdminDepartmentController {
         @RequestParam(name = "size", defaultValue = "20") int size,
         @AuthenticationPrincipal CustomUserDetails principal
     ) {
-        return adminDepartmentService.listDepartments(query, page, size, requirePrincipalId(principal));
+        return adminDepartmentService.listDepartments(query, page, size, CustomUserDetails.requireUserId(principal));
     }
 
     @GetMapping("/{id}")
@@ -72,7 +71,7 @@ public class AdminDepartmentController {
         @PathVariable("id") UUID id,
         @AuthenticationPrincipal CustomUserDetails principal
     ) {
-        return adminDepartmentService.getDepartment(id, requirePrincipalId(principal));
+        return adminDepartmentService.getDepartment(id, CustomUserDetails.requireUserId(principal));
     }
 
     @PatchMapping("/{id}")
@@ -82,7 +81,7 @@ public class AdminDepartmentController {
         @Valid @RequestBody UpdateDepartmentRequest request,
         @AuthenticationPrincipal CustomUserDetails principal
     ) {
-        return adminDepartmentService.updateDepartment(id, request, requirePrincipalId(principal));
+        return adminDepartmentService.updateDepartment(id, request, CustomUserDetails.requireUserId(principal));
     }
 
     @DeleteMapping("/{id}")
@@ -94,14 +93,7 @@ public class AdminDepartmentController {
         @PathVariable("id") UUID id,
         @AuthenticationPrincipal CustomUserDetails principal
     ) {
-        adminDepartmentService.deleteDepartment(id, requirePrincipalId(principal));
+        adminDepartmentService.deleteDepartment(id, CustomUserDetails.requireUserId(principal));
         return ResponseEntity.noContent().build();
-    }
-
-    private static UUID requirePrincipalId(CustomUserDetails principal) {
-        if (principal == null) {
-            throw new AuthenticationRequiredException("Authenticated security principal is required");
-        }
-        return principal.userId();
     }
 }
