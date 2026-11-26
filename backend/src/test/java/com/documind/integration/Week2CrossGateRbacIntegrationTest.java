@@ -12,6 +12,7 @@ import com.documind.domain.enums.AccessLevel;
 import com.documind.domain.enums.DocumentStatus;
 import com.documind.domain.enums.Role;
 import com.documind.infrastructure.storage.StorageProperties;
+import com.documind.service.audit.AuditLogService;
 import com.documind.service.chat.ChatSessionService;
 import com.documind.service.rag.RagConstants;
 import com.documind.support.AbstractIntegrationTest;
@@ -85,7 +86,12 @@ import static org.assertj.core.api.Assertions.assertThat;
         "DOCUMIND_ENV_FILE=.env.test-isolated",
         "spring.main.allow-bean-definition-overriding=true",
         "documind.ingestion.worker.enabled=true",
-        "documind.security.dev-caller-fallback.enabled=false"
+        "documind.security.dev-caller-fallback.enabled=false",
+        "documind.rate-limit.chat.viewer-limit=500",
+        "documind.rate-limit.chat.manager-limit=500",
+        "documind.rate-limit.chat.admin-limit=500",
+        "documind.rate-limit.upload.manager-limit=200",
+        "documind.rate-limit.upload.admin-limit=200"
     }
 )
 @ActiveProfiles("dev")
@@ -124,7 +130,13 @@ class Week2CrossGateRbacIntegrationTest {
     @Autowired
     private RecordingTestChatModel recordingChatModel;
 
+    @Autowired(required = false)
+    private AuditLogService auditLogService;
+
     private void cleanUpTestState() throws InterruptedException {
+        if (auditLogService != null) {
+            auditLogService.awaitPendingWrites(Duration.ofSeconds(5));
+        }
         AbstractIntegrationTest.cleanSharedInfrastructure(
             jdbcTemplate,
             stringRedisTemplate,

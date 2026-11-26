@@ -12,6 +12,7 @@ import com.documind.infrastructure.storage.MinioStorageService;
 import com.documind.infrastructure.storage.StorageProperties;
 import com.documind.repository.DepartmentRepository;
 import com.documind.repository.DocumentRepository;
+import com.documind.service.audit.AuditLogService;
 import com.documind.service.document.CallerContext;
 import com.documind.service.ingestion.ChunkIdGenerator;
 import com.documind.service.ingestion.ChunkMetadataKeys;
@@ -86,7 +87,12 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
         "DOCUMIND_ENV_FILE=.env.test-isolated",
         "spring.main.allow-bean-definition-overriding=true",
         "documind.ingestion.worker.enabled=false",
-        "documind.security.dev-caller-fallback.enabled=false"
+        "documind.security.dev-caller-fallback.enabled=false",
+        "documind.rate-limit.chat.viewer-limit=500",
+        "documind.rate-limit.chat.manager-limit=500",
+        "documind.rate-limit.chat.admin-limit=500",
+        "documind.rate-limit.upload.manager-limit=200",
+        "documind.rate-limit.upload.admin-limit=200"
     }
 )
 @ActiveProfiles("dev")
@@ -151,11 +157,17 @@ class VectorRbacRetrievalIntegrationTest {
     @Autowired
     private VectorRetrievalService vectorRetrievalService;
 
+    @Autowired(required = false)
+    private AuditLogService auditLogService;
+
     private final HttpClient httpClient = HttpClient.newBuilder()
         .connectTimeout(Duration.ofSeconds(10))
         .build();
 
     private void cleanUpTestState() throws InterruptedException {
+        if (auditLogService != null) {
+            auditLogService.awaitPendingWrites(Duration.ofSeconds(5));
+        }
         AbstractIntegrationTest.cleanSharedInfrastructure(
             jdbcTemplate,
             stringRedisTemplate,

@@ -1188,6 +1188,124 @@ class RagChatStreamServiceTest {
         return buildServiceWithChatService(ragChatService, props, emitterFactory);
     }
 
+    @Test
+    void auditLogServiceRecordsSingle504TimeoutAuditAndPreventsDoubleWriteOnCompetingTerminalSignals() throws Exception {
+        CallerContext caller = authenticateUser(HR_USER_ID, HR_DEPT_ID, Role.STANDARD_EMPLOYEE);
+        UserEntity actor = activeUser(HR_USER_ID, HR_DEPT_ID, Role.STANDARD_EMPLOYEE);
+        when(userRepository.findById(HR_USER_ID)).thenReturn(Optional.of(actor));
+        when(userRepository.getReferenceById(HR_USER_ID)).thenReturn(actor);
+        com.documind.domain.entity.DepartmentEntity hrDept = new com.documind.domain.entity.DepartmentEntity();
+        hrDept.setId(HR_DEPT_ID);
+        when(departmentRepository.getReferenceById(HR_DEPT_ID)).thenReturn(hrDept);
+        when(vectorRetrievalService.retrieve(any(), any(RbacVectorScope.class))).thenReturn(List.of(sampleChunk()));
+
+        com.documind.repository.ChatSessionRepository realSessionRepo = mock(com.documind.repository.ChatSessionRepository.class);
+        com.documind.repository.ChatMessageRepository realMessageRepo = mock(com.documind.repository.ChatMessageRepository.class);
+        when(realSessionRepo.save(any())).thenAnswer(inv -> {
+            com.documind.domain.entity.ChatSessionEntity s = inv.getArgument(0);
+            if (s.getId() == null) {
+                s.setId(UUID.randomUUID());
+            }
+            return s;
+        });
+        when(realMessageRepo.save(any())).thenAnswer(inv -> {
+            com.documind.domain.entity.ChatMessageEntity m = inv.getArgument(0);
+            if (m.getId() == null) {
+                m.setId(UUID.randomUUID());
+            }
+            return m;
+        });
+
+        java.util.List<com.documind.domain.entity.AuditLogEntity> savedAudits =
+            java.util.Collections.synchronizedList(new java.util.ArrayList<>());
+        java.util.concurrent.atomic.AtomicReference<String> auditWorkerThread = new java.util.concurrent.atomic.AtomicReference<>();
+        when(auditLogRepository.save(any(com.documind.domain.entity.AuditLogEntity.class))).thenAnswer(inv -> {
+            auditWorkerThread.set(Thread.currentThread().getName());
+            com.documind.domain.entity.AuditLogEntity entity = inv.getArgument(0);
+            savedAudits.add(entity);
+            return entity;
+        });
+
+        com.documind.service.audit.AuditLogService realAuditLogService = new com.documind.service.audit.AuditLogService(
+            realSessionRepo,
+            realMessageRepo,
+            userRepository,
+            departmentRepository,
+            auditLogRepository,
+            null,
+            transactionTemplate,
+            new org.springframework.core.task.VirtualThreadTaskExecutor(
+                com.documind.infrastructure.config.IngestionAsyncConfig.AUDIT_VIRTUAL_THREAD_PREFIX
+            )
+        );
+
+        RagChatService auditBackedChatService = new RagChatService(
+            vectorRetrievalService,
+            groundedSystemPromptService,
+            rbacVectorFilterFactory,
+            groqChatClient,
+            providerOf(geminiChatClient),
+            providerOf(userRepository),
+            providerOf(departmentRepository),
+            providerOf(auditLogRepository),
+            providerOf(transactionTemplate),
+            providerOf(chatSessionService),
+            providerOf(queryContextualizerService),
+            null,
+            providerOf(realAuditLogService),
+            null,
+            aiProperties,
+            ragProperties,
+            environment
+        );
+
+        // 1. SSE 504 timeout routes through real AuditLogService on documind-audit-vt- with exactly 1 row
+        when(groqChatModel.stream(any(Prompt.class))).thenReturn(Flux.never());
+        RagProperties shortTimeoutProps = new RagProperties(
+            RagProperties.RetrievalProperties.defaults(),
+            RagProperties.LlmProperties.defaults(),
+            RagProperties.MemoryProperties.defaults(),
+            new RagProperties.SseProperties(Duration.ofMillis(120))
+        );
+        RecordingSseEmitter timeoutEmitter = new RecordingSseEmitter(10_000L);
+        RagChatStreamService timeoutStreamService = buildServiceWithChatService(
+            auditBackedChatService, shortTimeoutProps, timeout -> timeoutEmitter
+        );
+
+        timeoutStreamService.openStream("Câu hỏi timeout 504 qua AuditLogService", null, null, caller);
+        assertThat(timeoutEmitter.awaitCompleted(5, TimeUnit.SECONDS)).isTrue();
+        realAuditLogService.awaitPendingWrites(Duration.ofSeconds(5));
+
+        assertThat(savedAudits).hasSize(1);
+        assertThat(auditWorkerThread.get()).startsWith(com.documind.infrastructure.config.IngestionAsyncConfig.AUDIT_VIRTUAL_THREAD_PREFIX);
+        assertThat(savedAudits.getFirst().getStatusCode()).isEqualTo(504);
+        assertThat(savedAudits.getFirst().getUserId()).isEqualTo(HR_USER_ID);
+        assertThat(savedAudits.getFirst().getDepartmentId()).isEqualTo(HR_DEPT_ID);
+        assertThat(savedAudits.getFirst().getLatencyMs()).isGreaterThanOrEqualTo(0L);
+
+        // 2. Competing terminal signals (normal completion racing with error/timeout callbacks) record strictly 1 row
+        savedAudits.clear();
+        when(chatSessionService.deriveAutoTitle(any())).thenReturn("Câu hỏi cạnh tranh");
+        when(groqChatModel.stream(any(Prompt.class)))
+            .thenReturn(Flux.just(textChunk("Câu trả lời hoàn chỉnh."), usageOnlyChunk(40, 12)));
+        RecordingSseEmitter competingEmitter = new RecordingSseEmitter(10_000L);
+        RagChatStreamService normalStreamService = buildServiceWithChatService(
+            auditBackedChatService, ragProperties, timeout -> competingEmitter
+        );
+
+        normalStreamService.openStream("Câu hỏi kiểm tra 1-write invariant", null, null, caller);
+        assertThat(competingEmitter.awaitCompleted(5, TimeUnit.SECONDS)).isTrue();
+        competingEmitter.triggerError(new java.io.IOException("Late disconnect after completion"));
+        competingEmitter.triggerTimeout();
+        competingEmitter.triggerCompletion();
+        realAuditLogService.awaitPendingWrites(Duration.ofSeconds(5));
+
+        assertThat(savedAudits).hasSize(1);
+        assertThat(savedAudits.getFirst().getStatusCode()).isEqualTo(200);
+        assertThat(savedAudits.getFirst().getPromptTokens()).isEqualTo(40);
+        assertThat(savedAudits.getFirst().getCompletionTokens()).isEqualTo(12);
+    }
+
     private RagChatStreamService buildServiceWithChatService(
         RagChatService customRagChatService,
         RagProperties props,

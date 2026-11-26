@@ -17,6 +17,7 @@ import com.documind.repository.AuditLogRepository;
 import com.documind.repository.DepartmentRepository;
 import com.documind.repository.DocumentRepository;
 import com.documind.repository.UserRepository;
+import com.documind.service.audit.AuditLogService;
 import com.documind.service.chat.ChatSessionService;
 import com.documind.service.document.CallerContext;
 import com.documind.service.rag.GroundedSystemPromptService;
@@ -123,7 +124,12 @@ import static org.assertj.core.api.Assertions.assertThat;
         "DOCUMIND_ENV_FILE=.env.test-isolated",
         "spring.main.allow-bean-definition-overriding=true",
         "documind.ingestion.worker.enabled=true",
-        "documind.security.dev-caller-fallback.enabled=false"
+        "documind.security.dev-caller-fallback.enabled=false",
+        "documind.rate-limit.chat.viewer-limit=500",
+        "documind.rate-limit.chat.manager-limit=500",
+        "documind.rate-limit.chat.admin-limit=500",
+        "documind.rate-limit.upload.manager-limit=200",
+        "documind.rate-limit.upload.admin-limit=200"
     }
 )
 @ActiveProfiles("dev")
@@ -223,6 +229,9 @@ class ScopedRagCacheIntegrationTest {
     @Autowired
     private ControllableCacheTestChatModel chatModel;
 
+    @Autowired(required = false)
+    private AuditLogService auditLogService;
+
     private Week2SseTestClient client;
 
     @BeforeAll
@@ -241,6 +250,9 @@ class ScopedRagCacheIntegrationTest {
     void resetAllState() throws InterruptedException {
         chatModel.reset();
         embeddingModel.reset();
+        if (auditLogService != null) {
+            auditLogService.awaitPendingWrites(Duration.ofSeconds(5));
+        }
         jdbcTemplate.update("DELETE FROM departments WHERE code = 'TEMP_MONOTONIC'");
         for (int attempt = 1; attempt <= 2; attempt++) {
             try {
@@ -398,9 +410,9 @@ class ScopedRagCacheIntegrationTest {
 
         LatencySummary l1LookupStats = LatencySummary.of(l1LookupMs, 15.0d);
         LatencySummary l1PrePersistStats = LatencySummary.of(l1PrePersistMs, 50.0d);
-        LatencySummary sseL1Stats = LatencySummary.of(sseL1Ms, 50.0d);
+        LatencySummary sseL1Stats = LatencySummary.of(sseL1Ms, 100.0d);
         log.info(
-            "DA19_SLA_L1 workload=SSE_L1_EXACT_FIXTURE warmup={} samples={} l1LookupMs=[p50={}, p95={}, max={}, over15ms={}] prePersistMs=[p50={}, p95={}] sseE2eMs=[p50={}, p95={}, max={}, over50ms={}]",
+            "DA19_SLA_L1 workload=SSE_L1_EXACT_FIXTURE warmup={} samples={} l1LookupMs=[p50={}, p95={}, max={}, over15ms={}] prePersistMs=[p50={}, p95={}] sseE2eMs=[p50={}, p95={}, max={}, over100ms={}]",
             warmupCount,
             sampleCount,
             fmt(l1LookupStats.p50()),
@@ -416,7 +428,8 @@ class ScopedRagCacheIntegrationTest {
         );
         assertThat(l1LookupStats.p95()).isLessThan(15.0d);
         assertThat(l1PrePersistStats.p95()).isLessThan(50.0d);
-        assertThat(sseL1Stats.p95()).isLessThan(50.0d);
+        // AGENTS.md §3.4 <100ms cached API SLA with Bucket4j+Redis rate limiting and async audit enabled
+        assertThat(sseL1Stats.p95()).isLessThan(100.0d);
         assertThat(chatModel.answerCallCount()).isZero();
         assertThat(embeddingModel.embedCount()).isZero();
     }

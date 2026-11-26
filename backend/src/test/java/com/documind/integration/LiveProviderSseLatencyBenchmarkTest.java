@@ -83,7 +83,12 @@ import static org.assertj.core.api.Assertions.assertThat;
         "documind.ingestion.worker.enabled=false",
         "documind.security.dev-caller-fallback.enabled=false",
         "spring.datasource.hikari.maximum-pool-size=5",
-        "spring.datasource.hikari.minimum-idle=1"
+        "spring.datasource.hikari.minimum-idle=1",
+        "documind.rate-limit.chat.viewer-limit=500",
+        "documind.rate-limit.chat.manager-limit=500",
+        "documind.rate-limit.chat.admin-limit=500",
+        "documind.rate-limit.upload.manager-limit=200",
+        "documind.rate-limit.upload.admin-limit=200"
     }
 )
 @ActiveProfiles("dev")

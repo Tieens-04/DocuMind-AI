@@ -104,7 +104,8 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
     webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT,
     properties = {
         "documind.ingestion.worker.enabled=false",
-        "documind.security.dev-caller-fallback.enabled=true"
+        "documind.security.dev-caller-fallback.enabled=true",
+        "documind.rate-limit.enabled=false"
     }
 )
 @ActiveProfiles("dev")

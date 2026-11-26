@@ -11,6 +11,7 @@ import com.documind.infrastructure.storage.MinioStorageService;
 import com.documind.infrastructure.storage.StorageProperties;
 import com.documind.repository.DepartmentRepository;
 import com.documind.repository.DocumentRepository;
+import com.documind.service.audit.AuditLogService;
 import com.documind.service.ingestion.ChunkIdGenerator;
 import com.documind.service.ingestion.ChunkMetadataKeys;
 import com.documind.service.rag.RagConstants;
@@ -113,7 +114,12 @@ import static org.assertj.core.api.Assertions.assertThat;
         "spring.main.allow-bean-definition-overriding=true",
         "documind.ingestion.worker.enabled=false",
         "documind.security.dev-caller-fallback.enabled=false",
-        "documind.ai.gemini.api-key=test-gemini-fallback-key"
+        "documind.ai.gemini.api-key=test-gemini-fallback-key",
+        "documind.rate-limit.chat.viewer-limit=500",
+        "documind.rate-limit.chat.manager-limit=500",
+        "documind.rate-limit.chat.admin-limit=500",
+        "documind.rate-limit.upload.manager-limit=200",
+        "documind.rate-limit.upload.admin-limit=200"
     }
 )
 @ActiveProfiles("dev")
@@ -172,6 +178,9 @@ class Week2SseConcurrencyAndResilienceIntegrationTest {
     @Qualifier("milestone2GeminiStreamingModel")
     private DirectiveStreamingChatModel geminiModel;
 
+    @Autowired(required = false)
+    private AuditLogService auditLogService;
+
     private Week2SseTestClient client;
 
     @BeforeAll
@@ -196,6 +205,9 @@ class Week2SseConcurrencyAndResilienceIntegrationTest {
     void resetPerTestChatState() {
         groqModel.reset();
         geminiModel.reset();
+        if (auditLogService != null) {
+            auditLogService.awaitPendingWrites(Duration.ofSeconds(5));
+        }
         AbstractIntegrationTest.flushRedis(stringRedisTemplate);
         jdbcTemplate.update("DELETE FROM semantic_cache");
         jdbcTemplate.update("DELETE FROM chat_messages");

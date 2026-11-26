@@ -20,8 +20,11 @@ import com.documind.exception.DocumentStorageException;
 import com.documind.exception.DocumentTooLargeException;
 import com.documind.exception.DuplicateDocumentException;
 import com.documind.exception.InvalidDocumentRequestException;
+import com.documind.exception.RateLimitExceededException;
 import com.documind.exception.ResourceNotFoundException;
 import com.documind.exception.UnsupportedDocumentTypeException;
+import com.documind.infrastructure.ratelimit.RateLimitOperation;
+import com.documind.infrastructure.ratelimit.RateLimitService;
 import com.documind.infrastructure.security.CustomUserDetails;
 import com.documind.infrastructure.security.DocumentPreviewTokenService;
 import com.documind.infrastructure.security.JwtProperties;
@@ -1775,5 +1778,66 @@ class DocumentServiceTest {
         protected void doRollback(DefaultTransactionStatus status) throws TransactionException {
             rollbackCount++;
         }
+    }
+
+    @Test
+    void uploadAndReplaceEnforceRateLimitAfterRbacAndBeforeMinioStreaming() {
+        RateLimitService rateLimitService = mock(RateLimitService.class);
+        DocumentService limitedService = new DocumentService(
+            documentRepository,
+            departmentRepository,
+            userRepository,
+            auditLogRepository,
+            fileValidationService,
+            minioStorageService,
+            previewTokenService,
+            tokenBlacklistService,
+            transactionTemplate,
+            null,
+            rateLimitService,
+            eventPublisher,
+            environment
+        );
+
+        byte[] txtBytes = "Rate limited document".getBytes(StandardCharsets.UTF_8);
+        MockMultipartFile file = new MockMultipartFile("file", "policy.txt", "text/plain", txtBytes);
+
+        // 1. Viewer rejected by RBAC before touching rate limiter or MinIO
+        CallerContext viewer = new CallerContext(HR_USER_ID, IT_DEPT_ID, Role.STANDARD_EMPLOYEE, "127.0.0.1");
+        assertThatThrownBy(() -> limitedService.uploadDocument(file, AccessLevel.DEPARTMENT, viewer))
+            .isInstanceOf(DocumentAccessDeniedException.class);
+        verifyNoInteractions(rateLimitService, minioStorageService);
+
+        // 2. Manager upload calls rateLimitService AFTER dept/actor checks and BEFORE MinIO streaming
+        DepartmentEntity itDept = department(IT_DEPT_ID, "IT");
+        UserEntity itManagerUser = user(HR_USER_ID, itDept, Role.DEPARTMENT_MANAGER, true);
+        when(departmentRepository.findById(IT_DEPT_ID)).thenReturn(Optional.of(itDept));
+        when(userRepository.findById(HR_USER_ID)).thenReturn(Optional.of(itManagerUser));
+        CallerContext itManager = new CallerContext(HR_USER_ID, IT_DEPT_ID, Role.DEPARTMENT_MANAGER, "127.0.0.1");
+
+        doThrow(new RateLimitExceededException(30L, "Rate limit exceeded for upload. Retry after 30 seconds"))
+            .when(rateLimitService).consume(RateLimitOperation.UPLOAD, itManager, IT_DEPT_ID, "/api/v1/documents/upload");
+
+        assertThatThrownBy(() -> limitedService.uploadDocument(file, AccessLevel.DEPARTMENT, itManager))
+            .isInstanceOf(RateLimitExceededException.class);
+        verify(rateLimitService).consume(RateLimitOperation.UPLOAD, itManager, IT_DEPT_ID, "/api/v1/documents/upload");
+        verifyNoInteractions(minioStorageService);
+
+        // 3. Cross-dept manager replace rejected before limiter; same-dept replace checks limiter before MinIO
+        DepartmentEntity hrDept = department(HR_DEPT_ID, "HR");
+        DocumentEntity hrDoc = document(DOC_ID, hrDept, AccessLevel.DEPARTMENT, DocumentStatus.COMPLETED);
+        when(documentRepository.findById(DOC_ID)).thenReturn(Optional.of(hrDoc));
+        assertThatThrownBy(() -> limitedService.replaceDocument(DOC_ID, file, AccessLevel.DEPARTMENT, itManager))
+            .isInstanceOf(DocumentAccessDeniedException.class);
+
+        DocumentEntity itDoc = document(DOC_ID, itDept, AccessLevel.DEPARTMENT, DocumentStatus.COMPLETED);
+        when(documentRepository.findById(DOC_ID)).thenReturn(Optional.of(itDoc));
+        doThrow(new RateLimitExceededException(15L, "Rate limit exceeded for upload. Retry after 15 seconds"))
+            .when(rateLimitService).consume(RateLimitOperation.UPLOAD, itManager, IT_DEPT_ID, "/api/v1/documents/" + DOC_ID);
+
+        assertThatThrownBy(() -> limitedService.replaceDocument(DOC_ID, file, AccessLevel.DEPARTMENT, itManager))
+            .isInstanceOf(RateLimitExceededException.class);
+        verify(rateLimitService).consume(RateLimitOperation.UPLOAD, itManager, IT_DEPT_ID, "/api/v1/documents/" + DOC_ID);
+        verifyNoInteractions(minioStorageService);
     }
 }

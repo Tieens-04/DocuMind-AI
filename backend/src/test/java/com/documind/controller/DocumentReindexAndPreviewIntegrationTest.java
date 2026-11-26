@@ -11,6 +11,7 @@ import com.documind.domain.enums.DocumentStatus;
 import com.documind.infrastructure.storage.MinioConfig;
 import com.documind.infrastructure.storage.MinioStorageService;
 import com.documind.infrastructure.storage.StorageProperties;
+import com.documind.service.audit.AuditLogService;
 import com.documind.support.AbstractIntegrationTest;
 import com.documind.support.MinioTestcontainersConfig;
 import com.documind.support.PostgresTestcontainersConfig;
@@ -80,7 +81,12 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
         "DOCUMIND_ENV_FILE=.env.test-isolated",
         "spring.main.allow-bean-definition-overriding=true",
         "documind.ingestion.worker.enabled=true",
-        "documind.security.dev-caller-fallback.enabled=false"
+        "documind.security.dev-caller-fallback.enabled=false",
+        "documind.rate-limit.chat.viewer-limit=500",
+        "documind.rate-limit.chat.manager-limit=500",
+        "documind.rate-limit.chat.admin-limit=500",
+        "documind.rate-limit.upload.manager-limit=200",
+        "documind.rate-limit.upload.admin-limit=200"
     }
 )
 @ActiveProfiles("dev")
@@ -123,6 +129,9 @@ class DocumentReindexAndPreviewIntegrationTest {
     @Autowired
     private AbstractIntegrationTest.RecordingTestChatModel recordingChatModel;
 
+    @Autowired(required = false)
+    private AuditLogService auditLogService;
+
     private static final HttpClient httpClient = HttpClient.newBuilder()
         .connectTimeout(Duration.ofSeconds(10))
         .build();
@@ -134,6 +143,9 @@ class DocumentReindexAndPreviewIntegrationTest {
 
     @BeforeEach
     void setUp() throws InterruptedException {
+        if (auditLogService != null) {
+            auditLogService.awaitPendingWrites(Duration.ofSeconds(5));
+        }
         AbstractIntegrationTest.cleanSharedInfrastructure(
             jdbcTemplate,
             stringRedisTemplate,
@@ -147,6 +159,9 @@ class DocumentReindexAndPreviewIntegrationTest {
 
     @AfterEach
     void tearDown() throws InterruptedException {
+        if (auditLogService != null) {
+            auditLogService.awaitPendingWrites(Duration.ofSeconds(5));
+        }
         AbstractIntegrationTest.cleanSharedInfrastructure(
             jdbcTemplate,
             stringRedisTemplate,

@@ -14,6 +14,7 @@ import com.documind.infrastructure.storage.MinioStorageService;
 import com.documind.infrastructure.storage.StorageProperties;
 import com.documind.repository.DepartmentRepository;
 import com.documind.repository.DocumentRepository;
+import com.documind.service.audit.AuditLogService;
 import com.documind.service.chat.ChatSessionService;
 import com.documind.service.ingestion.ChunkIdGenerator;
 import com.documind.service.ingestion.ChunkMetadataKeys;
@@ -96,7 +97,12 @@ import static org.assertj.core.api.Assertions.assertThat;
         "DOCUMIND_ENV_FILE=.env.test-isolated",
         "spring.main.allow-bean-definition-overriding=true",
         "documind.ingestion.worker.enabled=false",
-        "documind.security.dev-caller-fallback.enabled=false"
+        "documind.security.dev-caller-fallback.enabled=false",
+        "documind.rate-limit.chat.viewer-limit=500",
+        "documind.rate-limit.chat.manager-limit=500",
+        "documind.rate-limit.chat.admin-limit=500",
+        "documind.rate-limit.upload.manager-limit=200",
+        "documind.rate-limit.upload.admin-limit=200"
     }
 )
 @ActiveProfiles("dev")
@@ -154,6 +160,9 @@ class MultiTurnSessionChatIntegrationTest {
     @Autowired
     private ContextualizingRecordingTestChatModel chatModel;
 
+    @Autowired(required = false)
+    private AuditLogService auditLogService;
+
     private final HttpClient httpClient = HttpClient.newBuilder()
         .connectTimeout(Duration.ofSeconds(10))
         .build();
@@ -170,6 +179,9 @@ class MultiTurnSessionChatIntegrationTest {
     }
 
     private void cleanUp() throws InterruptedException {
+        if (auditLogService != null) {
+            auditLogService.awaitPendingWrites(Duration.ofSeconds(5));
+        }
         AbstractIntegrationTest.cleanSharedInfrastructure(
             jdbcTemplate,
             stringRedisTemplate,
@@ -572,6 +584,9 @@ class MultiTurnSessionChatIntegrationTest {
         assertThat(failureRaw.statusCode()).isEqualTo(502);
         assertThat(chatModel.lastAnswerMessages()).hasSize(4);
         assertThat(countMessagesInSession(sessionId)).isEqualTo(4);
+        if (auditLogService != null) {
+            auditLogService.awaitPendingWrites(Duration.ofSeconds(5));
+        }
 
         Integer failureAuditCount = jdbcTemplate.queryForObject(
             "SELECT COUNT(*) FROM audit_logs WHERE session_id = ? AND status_code = 502 AND prompt_tokens = 45 AND completion_tokens = 14",
