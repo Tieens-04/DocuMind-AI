@@ -16,7 +16,18 @@ public class RedisTestcontainersConfig {
     public static final String REDIS_IMAGE = "redis:7-alpine";
     private static final int REDIS_PORT = 6379;
 
-    private static final GenericContainer<?> SHARED_REDIS = new GenericContainer<>(DockerImageName.parse(REDIS_IMAGE))
+    private static final class SharedRedisContainer extends GenericContainer<SharedRedisContainer> {
+        SharedRedisContainer(DockerImageName dockerImageName) {
+            super(dockerImageName);
+        }
+
+        @Override
+        public void stop() {
+            // Keep JVM-wide singleton container alive across @DirtiesContext closes; Ryuk reaps on JVM exit.
+        }
+    }
+
+    private static final GenericContainer<?> SHARED_REDIS = new SharedRedisContainer(DockerImageName.parse(REDIS_IMAGE))
         .withExposedPorts(REDIS_PORT)
         .waitingFor(Wait.forListeningPort());
 

@@ -28,9 +28,20 @@ public class PostgresTestcontainersConfig {
     public static final String PGVECTOR_IMAGE =
         "pgvector/pgvector:pg16@sha256:484e838076e04939d27d3e176e91c86eea96236126023be8d3059761122e579f";
 
-    private static final PostgreSQLContainer<?> SHARED_POSTGRES = new PostgreSQLContainer<>(
+    private static final class SharedPostgresContainer extends PostgreSQLContainer<SharedPostgresContainer> {
+        SharedPostgresContainer(DockerImageName dockerImageName) {
+            super(dockerImageName);
+        }
+
+        @Override
+        public void stop() {
+            // Keep JVM-wide singleton container alive across @DirtiesContext closes; Ryuk reaps on JVM exit.
+        }
+    }
+
+    private static final PostgreSQLContainer<?> SHARED_POSTGRES = new SharedPostgresContainer(
         DockerImageName.parse(PGVECTOR_IMAGE).asCompatibleSubstituteFor("postgres")
-    );
+    ).withCommand("postgres", "-c", "max_connections=300");
 
     static {
         SHARED_POSTGRES.start();
