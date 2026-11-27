@@ -41,6 +41,7 @@
 - **Bucket4j Rate Limiting, Async Audit Worker & Admin FinOps Analytics**: `backend/src/main/java/com/documind/infrastructure/ratelimit/RateLimitService.java`, `backend/src/main/java/com/documind/service/audit/AuditLogService.java`, `backend/src/main/java/com/documind/service/admin/AdminAnalyticsService.java`, `backend/src/test/java/com/documind/integration/RateLimitIntegrationTest.java`, `backend/src/test/java/com/documind/integration/AdminAnalyticsIntegrationTest.java`
 - **Next.js Auth, Single-Flight Refresh & Role Guard**: `frontend/src/lib/auth/token-manager.ts`, `frontend/src/lib/auth/permissions.ts`, `frontend/src/providers/auth-provider.tsx`, `frontend/src/__tests__/api-client.test.ts`
 - **Next.js Chat Workspace, Typed SSE Client & Citation Side Drawer**: `frontend/src/lib/api/chat-stream.ts`, `frontend/src/app/(workspace)/chat/page.tsx`, `frontend/src/components/chat/citation-drawer.tsx`, `frontend/src/components/chat/markdown-content.tsx`, `frontend/src/__tests__/chat-workspace.test.tsx`
+- **Next.js Documents Upload Queue, Conditional Polling & RBAC Table**: `frontend/src/lib/api/documents.ts`, `frontend/src/app/(workspace)/documents/page.tsx`, `frontend/src/components/documents/document-upload-zone.tsx`, `frontend/src/__tests__/helpers/mock-xhr.ts`, `frontend/src/__tests__/documents-workspace.test.tsx`
 
 ---
 
