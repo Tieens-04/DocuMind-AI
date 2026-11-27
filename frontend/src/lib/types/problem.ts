@@ -65,27 +65,40 @@ export function formatApiErrorMessage(error: unknown): string {
   return 'Không thể kết nối tới máy chủ DocuMind AI.';
 }
 
-export async function parseApiErrorResponse(response: Response): Promise<ApiError> {
+export function parseProblemDetailPayload(
+  status: number,
+  bodyText: string,
+  retryAfterHeader: string | null,
+): ApiError {
   let payload: ProblemDetail | null = null;
   try {
-    const text = await response.text();
-    if (text) {
-      payload = JSON.parse(text) as ProblemDetail;
+    if (bodyText) {
+      payload = JSON.parse(bodyText) as ProblemDetail;
     }
   } catch {
     payload = null;
   }
 
-  const retryHeader = response.headers.get('Retry-After');
   const retryAfterSeconds =
     payload?.retryAfterSeconds ??
-    (retryHeader && /^\d+$/.test(retryHeader.trim()) ? Number(retryHeader.trim()) : undefined);
+    (retryAfterHeader && /^\d+$/.test(retryAfterHeader.trim())
+      ? Number(retryAfterHeader.trim())
+      : undefined);
 
   return new ApiError({
-    status: response.status,
+    status,
     errorCode: payload?.errorCode,
     title: payload?.title,
     detail: payload?.detail,
     retryAfterSeconds,
   });
+}
+
+export async function parseApiErrorResponse(response: Response): Promise<ApiError> {
+  const text = await response.text().catch(() => '');
+  return parseProblemDetailPayload(
+    response.status,
+    text,
+    response.headers.get('Retry-After'),
+  );
 }

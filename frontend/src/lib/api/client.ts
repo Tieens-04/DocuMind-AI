@@ -11,7 +11,7 @@ export interface ApiFetchOptions extends Omit<RequestInit, 'headers' | 'body'> {
   authenticated?: boolean;
 }
 
-function buildUrl(path: string): string {
+export function buildApiUrl(path: string): string {
   if (/^https?:\/\//i.test(path)) {
     return path;
   }
@@ -21,7 +21,7 @@ function buildUrl(path: string): string {
 
 export async function apiFetch<T>(path: string, options: ApiFetchOptions = {}): Promise<T> {
   const { authenticated = true, headers: extraHeaders, body, ...rest } = options;
-  const targetUrl = buildUrl(path);
+  const targetUrl = buildApiUrl(path);
 
   const execute = async (token: string | null): Promise<Response> => {
     const resolvedBody = typeof body === 'function' ? body() : body;
