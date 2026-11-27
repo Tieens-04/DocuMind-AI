@@ -14,6 +14,7 @@ public record AdminAnalyticsSummaryResponse(
     BigDecimal cacheHitRatioPercent,
     long promptTokens,
     long completionTokens,
-    long totalTokens
+    long totalTokens,
+    BigDecimal averageLatencyMs
 ) {
 }
