@@ -27,7 +27,7 @@ Mỗi lượt chỉ đóng **đúng 1 vai trò cho 1 bước**, đồng bộ đ�
 | **Bước 3: Review** | `Reviewer / Checker` (3 `research` subagents) | **`Verify / Test`** (`id: "31"`) | `review-01.md` (`FAILED/SAW/FIX`), `state.md` | Chỉ đọc & kiểm chứng độc lập; không sửa bất kỳ file code/test/SQL/docs nào |
 | **Bước 4: Fix** | `Engineer` | *(Giữ `Verify / Test`)* | `fix-report.md`, `state.md` | Vá đúng root-cause + regression tests + `verify.cjs check --verify`; không mở rộng scope |
 | **Bước 5: Final Review** | `Final Checker` + `OPS` Prevention | *(Đảm bảo `Verify / Test`)* | `final-review.md`, `state.md` | Tái xác minh độc lập + chạy thật `verify.cjs check --verify` + Prevention Audit |
-| **Bước 6: Pre-Commit** | `Deliver & Memory Keeper` | **`Done`** (`id: "41"`, khi `SAFE TO COMMIT`) | `precommit.md`, `state.md` (+ `MEMORY.md`) | Soạn PR, đăng comment Jira, chắt lọc bài học; **dừng trước `git commit` & `git push`** |
+| **Bước 6: Deliver** | `Deliver & Memory Keeper` | **`Done`** (`id: "41"`, ở bước nhỏ **6.5**, sau khi PR đã tạo) | `precommit.md`, `state.md` (+ `MEMORY.md`) | Thực thi tuần tự 5 bước nhỏ: **6.1 Pre-commit ➔ 6.2 Commit ➔ 6.3 Push ➔ 6.4 Tạo PR ➔ 6.5 Đóng Jira (`Done`)** |
 
 ---
 
@@ -92,7 +92,7 @@ Máy host Windows **không cài `mvn` toàn cục** — mọi lệnh Maven đề
    - Giữa các vòng Review ↔ Fix: mỗi lần `final-review.md` trả về `CHANGES REQUESTED` trên cùng một lỗi cũ, tăng `Strikes` trong `state.md` thêm `1`. Khi **`Strikes >= 2`**, chuyển `Status: Blocked` trong `state.md`, chạy `node .ai-workflow/scripts/verify.cjs board` và báo ngay cho Human kèm 2 phương án xử lý rõ ràng.
 2. **Gate Priced by Undo Cost**:
    - **Tự hoàn tất 100% bước khả nghịch**: khảo sát code, viết test/code local, chạy `verify.cjs`, tạo báo cáo, nháp PR description.
-   - **Dừng hỏi trước bước khó/không thể hoàn tác**: `git commit`, `git push`, xóa dữ liệu, viết thêm Flyway migration (`V<N>__*.sql`) hoặc thêm dependency vào `pom.xml`/`package.json` **ngoài** `plan.md` đã duyệt, working tree bẩn từ ticket khác ở Bước 1, hoặc khi Jira AC mâu thuẫn với `AGENTS.md`.
+   - **Kiểm soát chặt bước khó/không thể hoàn tác**: xóa dữ liệu, viết thêm Flyway migration (`V<N>__*.sql`) hoặc thêm dependency vào `pom.xml`/`package.json` **ngoài** `plan.md` đã duyệt, working tree bẩn từ ticket khác ở Bước 1, hoặc khi Jira AC mâu thuẫn với `AGENTS.md` ➔ **dừng hỏi Human**. Ở Bước 6, chỉ chạy `6.2 Commit ➔ 6.3 Push ➔ 6.4 Tạo PR ➔ 6.5 Đóng Jira ("Done")` khi `final-review.md` đạt `READY FOR PRE-COMMIT` và `6.1 Pre-commit` đạt `SAFE TO COMMIT` (cấm `--force` hay push thẳng lên `main`).
 
 ---
 

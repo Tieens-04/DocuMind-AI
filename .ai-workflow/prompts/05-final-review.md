@@ -86,14 +86,14 @@ Chọn **đúng 1 hộp** theo kết luận thực tế trong `final-review.md`,
 ```markdown
 ---
 
-### ⏩ Bước tiếp theo: Bàn Giao, PR, Jira & Lưu Trí Nhớ (Bước 6 — `Deliver & Reuse`)
+### ⏩ Bước tiếp theo: Phát Hành Trọn Gói (Bước 6 — `6.1 Pre-commit ➔ 6.2 Commit ➔ 6.3 Push ➔ 6.4 Tạo PR ➔ 6.5 Đóng Jira "Done"`)
 
-- **🤖 Model khuyến nghị trên Antigravity**: **Gemini 4 Hydrogen (Medium / High)** _(hoặc **Gemini 3.8 Flash (High)**)_ — _Thực thi siêu tốc `verify.cjs diff`, soạn PR, đồng bộ Jira (`Done`) và cập nhật `MEMORY.md` / `BOARD.md` với chi phí quota thấp nhất._
+- **🤖 Model khuyến nghị trên Antigravity**: **Gemini 4 Hydrogen (Medium / High)** _(hoặc **Gemini 3.8 Flash (High)**)_ — _Thực thi tuần tự 5 bước nhỏ: `verify.cjs diff` + `MEMORY.md`, `git commit`, `git push`, `gh pr create`, và đăng comment + chuyển Jira sang `Done` với chi phí quota thấp nhất._
 - **💡 Vệ sinh ngữ cảnh**: Đổi sang Model nhẹ ngay tại ô chat hiện tại rồi gửi câu lệnh dưới.
 
 Copy câu lệnh dưới đây và gửi vào ô chat:
 
-> `Thực hiện Bước 6 (Pre-Commit & Deliver) cho task <TICKET_ID> theo .ai-workflow/prompts/06-precommit.md.`
+> `Thực hiện Bước 6 (Deliver: Pre-commit → Commit → Push → Tạo PR → Đóng Jira Done) cho task <TICKET_ID> theo .ai-workflow/prompts/06-precommit.md.`
 ```
 
 - **Trường hợp 2 — Còn lỗi sửa được (`CHANGES REQUESTED`, `Strikes == 1`)**:

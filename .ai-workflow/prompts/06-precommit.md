@@ -1,4 +1,4 @@
-# 06 — Deliver, Jira Sync & Memory Reuse Prompt (v4.0: `Deliver` + `The Undo Gate`)
+# 06 — Deliver, PR & Jira Close Prompt (v4.0: `6.1 Pre-commit ➔ 6.2 Commit ➔ 6.3 Push ➔ 6.4 Tạo PR ➔ 6.5 Đóng Jira "Done"`)
 
 ## Role
 
@@ -6,19 +6,30 @@ Bạn đóng vai **`Release Inspector & Memory Keeper`** của **DocuMind AI**.
 
 ## Mục tiêu
 
-Hoàn tất 100% các bước chuẩn bị phát hành khả nghịch: xác nhận working tree sạch bằng `verify.cjs diff`, soạn Pull Request bằng skill `pr`, đăng bình luận tổng kết và tự động chuyển trạng thái ticket sang **`Done`** trên Jira qua MCP **`jira-cwb`**, chắt lọc bài học tái sử dụng vào `.ai-workflow/MEMORY.md`, đóng thẻ trên `.ai-workflow/BOARD.md` và **dừng đúng trước cổng `git commit` / `git push` (`The Undo Gate`)** để Human tự chốt.
+Hoàn tất phát hành ticket `<TICKET_ID>` theo đúng **5 bước nhỏ tuần tự có chốt chặn (`Fail-Fast`)**:
+1. **6.1 Pre-commit**: Quét vệ sinh `verify.cjs diff`, soạn Commit Message & PR Description (skill `pr`), cập nhật `.ai-workflow/MEMORY.md` (nếu có bài học mới), ghi `precommit.md` (`SAFE TO COMMIT`).
+2. **6.2 Commit**: Kiểm tra `git status --short`, stage tệp hợp lệ, chạy `git commit` theo Conventional Commit và lấy `<short-sha>` thật.
+3. **6.3 Push**: Đẩy nhánh `<branch-name>` lên remote (`git push -u origin <branch-name>`).
+4. **6.4 Tạo PR**: Mở Pull Request vào nhánh `main` bằng `gh pr create` (dùng nội dung PR từ `precommit.md`) và lấy **PR URL**.
+5. **6.5 Đóng task trên Jira**: Đăng bình luận tổng kết (kèm `<short-sha>`, **PR URL**, bằng chứng AC & Quality Gates) rồi chuyển trạng thái Jira sang **`Done`** (`id: "41"`), cập nhật `state.md` + `BOARD.md`.
 
 ---
 
 ## 🛑 Điều kiện Tiên quyết & Hard Rules
 
-- **Chỉ thực thi khi `.ai-workflow/tasks/<TICKET_ID>/final-review.md` kết luận `READY FOR PRE-COMMIT`.** (Nếu chưa có hoặc chưa đạt, dừng ngay và yêu cầu hoàn tất Bước 5).
-- **Giữ nguyên vẹn 100% source code, test, Flyway SQL và cấu hình ứng dụng.**
-- **Dừng trước bước không thể hoàn tác**: Không tự chạy `git commit` hay `git push`; chỉ in sẵn khối lệnh Git an toàn ở cuối lượt.
+- **Chỉ thực thi khi `.ai-workflow/tasks/<TICKET_ID>/final-review.md` kết luận `READY FOR PRE-COMMIT`.** *(Nếu chưa có hoặc chưa đạt, dừng ngay và yêu cầu hoàn tất Bước 5).*
+- **Giữ nguyên vẹn 100% source code, test, Flyway SQL và cấu hình ứng dụng** (chỉ được cập nhật `.ai-workflow/MEMORY.md` nếu có bài học tổng quát mới).
+- **Kỷ luật Fail-Fast theo thứ tự 6.1 ➔ 6.2 ➔ 6.3 ➔ 6.4 ➔ 6.5**:
+  - Nếu **6.1** ra `DO NOT COMMIT` ➔ **DỪNG NGAY**, không chạy 6.2–6.5 và giữ nguyên Jira ở `Verify / Test`.
+  - Nếu bất kỳ bước nhỏ nào (`6.2`, `6.3`, `6.4`) thất bại ➔ **DỪNG NGAY**, báo rõ bước nào bị chặn để xử lý trước khi tiếp tục.
+  - **Cấm tuyệt đối** `git push --force`, push thẳng lên `main`, hay chuyển Jira sang `Done` khi chưa có `<short-sha>` + **PR URL** thật.
+- **Hỗ trợ chạy từng phần**: Nếu người dùng chỉ yêu cầu chạy riêng bước nhỏ (vd: `"chỉ chạy 6.1 Pre-commit"` hoặc `"tiếp tục từ 6.3 Push"`), thực thi đúng phạm vi được yêu cầu rồi dừng.
 
 ---
 
-## Quy trình Kiểm tra, Đồng bộ & Tích Lũy Trí Nhớ
+## Quy trình Thực thi 5 Bước Nhỏ (Theo Đúng Thứ Tự)
+
+### 6.1 Pre-commit (Kiểm tra Vệ sinh, Soạn PR & Cập nhật `MEMORY.md`)
 
 1. **Chạy Quét Vệ Sinh & Phạm Vi Cuối Cùng (`verify.cjs diff`)**:
    ```powershell
@@ -26,27 +37,57 @@ Hoàn tất 100% các bước chuẩn bị phát hành khả nghịch: xác nh�
    ```
    - Xác nhận đầu ra báo: `Branch — VALID`, `.ai-workflow/tasks/ gitignored: YES`, và `Static Hygiene & Secret Scan: PASS (0 issues)` (đã tự động kiểm tra `dev-caller-fallback.enabled: false`, secrets, `System.out`, `printStackTrace`, bare `@Disabled`, `console.log`, whitespace).
    - Xác nhận không có cổng nào trong `docker-compose.yml` / `.env.example` đụng dải cổng của `flintflow-*` (`3000`, `3001`, `5000`, `6379`, `8080`, `27017/27018`).
-
 2. **Soạn Nội Dung Pull Request Bằng Skill `pr`**:
-   - Đọc `.agents/skills/pr/SKILL.md` và soạn nội dung PR rõ ràng, bám sát thuật ngữ miền của DocuMind AI (Summary kèm call-tree/file-tree/Mermaid gọn, đối chiếu AC & RBAC/RAG invariants, Verification Evidence thực tế từ `final-review.md`, và Merge Danger / Blast Radius).
-
-3. **Đồng Bộ Kết Quả & Chuyển Trạng Thái sang `Done` Trên Jira Qua MCP `jira-cwb`**:
-   - Đọc schema tool của **`jira-cwb`** (`jira_add_comment.json`, `jira_get_transitions.json`, `jira_transition_issue.json`) trước khi gọi `call_mcp_tool` *(chỉ dùng `atlassian-mcp-server` làm dự phòng nếu đổi site)*.
-   - Nếu toàn bộ kiểm tra mục 1 đạt **`SAFE TO COMMIT`**:
-     1. Gọi **`jira_add_comment`** (`ServerName: "jira-cwb"`, `issue_key: "<TICKET_ID>"`, `body: "<tóm tắt Markdown>"`) gồm: tên nhánh Git, tóm tắt thay đổi kỹ thuật chính, và bằng chứng 100% AC + Quality Gates đã `PASS`.
-     2. **Bắt buộc chuyển trạng thái sang `Done`**: Gọi **`jira_transition_issue`** (`ServerName: "jira-cwb"`, `issue_key: "<TICKET_ID>"`, `transition_id: "Done"` — hoặc ID `"41"`).
-   - *(Nếu phát hiện lỗi khiến kết luận là `DO NOT COMMIT`, tuyệt đối không chuyển sang `Done` mà giữ nguyên `Verify / Test`).*
-
-4. **Khép Kín Vòng Lặp Tái Sử Dụng (`Save What Matters to MEMORY.md`)**:
+   - Đọc `.agents/skills/pr/SKILL.md` và soạn Conventional Commit message + PR Description rõ ràng, bám sát thuật ngữ miền của DocuMind AI (Summary kèm call-tree/file-tree/Mermaid gọn, đối chiếu AC & RBAC/RAG invariants, Verification Evidence thực tế từ `final-review.md`, và Merge Danger / Blast Radius).
+3. **Khép Kín Vòng Lặp Tái Sử Dụng (`Save What Matters to MEMORY.md`)**:
    - Đọc `.ai-workflow/MEMORY.md` và mục `5. Prevention & Reuse Audit` trong `final-review.md`.
-   - Chỉ khi ticket vừa hoàn tất thực sự mang lại **1 quyết định kiến trúc mới (`Decision`), 1 file mẫu chuẩn mới (`Source`), hoặc 1 bài học kỹ thuật tổng quát (`Lesson`)** chưa có trong `MEMORY.md`:
-     - Bổ sung **tối đa 1–2 dòng** vào đúng mục tương ứng trong `.ai-workflow/MEMORY.md` (viết dạng nguyên tắc chung + đường dẫn file mẫu, tuyệt đối không viết nhật ký kể lể sự cố riêng của ticket).
-   - Nếu không có quy tắc mới nào cần thêm, giữ nguyên `MEMORY.md` (tránh phình bộ nhớ).
+   - Chỉ khi ticket vừa hoàn tất thực sự mang lại **1 quyết định kiến trúc mới (`Decision`), 1 file mẫu chuẩn mới (`Source`), hoặc 1 bài học kỹ thuật tổng quát (`Lesson`)** chưa có trong `MEMORY.md`: bổ sung **tối đa 1–2 dòng** vào đúng mục tương ứng. Nếu không, giữ nguyên `MEMORY.md`.
+4. **Ghi `.ai-workflow/tasks/<TICKET_ID>/precommit.md`** với các mục 1–5 và kết luận **`SAFE TO COMMIT`** *(nếu có lỗi ➔ ghi `DO NOT COMMIT` và DỪNG NGAY)*.
 
-5. **Lưu `precommit.md` & Đóng Thẻ Trên `BOARD.md`**:
-   - Ghi báo cáo đầy đủ vào `.ai-workflow/tasks/<TICKET_ID>/precommit.md`.
-   - Cập nhật `.ai-workflow/tasks/<TICKET_ID>/state.md`: `Status: Done`, `Step: 06-precommit`, `Open Findings: none`, `Next Gate: Human git commit & push`.
-   - Chạy `node .ai-workflow/scripts/verify.cjs board` để đưa ticket vào khu vực hoàn tất trên `.ai-workflow/BOARD.md`.
+### 6.2 Commit (Stage & Commit Chuẩn Conventional Commit)
+
+1. Kiểm tra danh sách tệp thay đổi:
+   ```powershell
+   git status --short
+   ```
+   Xác nhận không lọt `.env*` thật, log rác hay file ngoài phạm vi ticket (`.ai-workflow/tasks/` & `BOARD.md` đã gitignore).
+2. Stage và commit đúng thông điệp Conventional Commit ở mục 4 của `precommit.md`:
+   ```powershell
+   git add -A
+   git status --short
+   git commit -m "<type>(<scope>): <tóm tắt ngắn gọn dưới 72 ký tự> (<TICKET_ID>)" -m "- <Thay đổi chính 1>`n- <Thay đổi chính 2>" -m "Closes <TICKET_ID>"
+   git rev-parse --short HEAD
+   ```
+   *(Nếu working tree đã sạch và commit của ticket đã tồn tại sẵn trên nhánh, ghi nhận `<short-sha>` hiện tại rồi chuyển tiếp sang 6.3).*
+
+### 6.3 Push (Đẩy Nhánh Lên Remote)
+
+1. Xác nhận đang đứng trên đúng nhánh `<type>/da-...` (không phải `main`), sau đó đẩy lên `origin`:
+   ```powershell
+   git push -u origin <branch-name>
+   ```
+   *(Tuyệt đối không dùng `--force` / `--force-with-lease` nếu chưa có yêu cầu rõ ràng của Human).*
+
+### 6.4 Tạo PR (GitHub Pull Request vào `main`)
+
+1. Kiểm tra xem nhánh đã có PR hay chưa; nếu chưa, tạo PR bằng `gh pr create` sử dụng đúng nội dung PR từ mục 5 của `precommit.md` (truyền body qua `--body-file` để tránh lỗi escape trên PowerShell):
+   ```powershell
+   gh pr view --json url,number 2>$null
+   # Nếu chưa có PR:
+   gh pr create --base main --head <branch-name> --title "<type>(<scope>): <tóm tắt ngắn gọn> (<TICKET_ID>)" --body-file <temp-pr-body.md>
+   ```
+2. Lưu lại **PR URL** (`https://github.com/.../pull/<N>`) và xóa file tạm body (nếu tạo).
+
+### 6.5 Đóng Task Trên Jira (Chuyển Status sang `"Done"`) & Đóng Thẻ `BOARD.md`
+
+1. **Đọc schema MCP `jira-cwb`** (`jira_add_comment.json`, `jira_get_transitions.json`, `jira_transition_issue.json`) trước khi gọi `call_mcp_tool` *(chỉ dùng `atlassian-mcp-server` dự phòng nếu đổi site)*.
+2. **Thứ tự bất biến trên Jira (`DA-*` only)**:
+   1. **Đăng bình luận tổng kết trước**: Gọi `jira_add_comment` (`ServerName: "jira-cwb"`, `issue_key: "<TICKET_ID>"`, `body: "<tóm tắt Markdown>"`) gồm: nhánh Git + `<short-sha>`, **PR URL**, tóm tắt thay đổi kỹ thuật chính, và bằng chứng 100% AC + Quality Gates đã `PASS`.
+   2. **Chuyển trạng thái sang `"Done"`**: Gọi `jira_transition_issue` (`ServerName: "jira-cwb"`, `issue_key: "<TICKET_ID>"`, `transition_id: "Done"` — hoặc ID `"41"`).
+3. **Hoàn tất hồ sơ & đóng thẻ trên `BOARD.md`**:
+   - Cập nhật mục `6. Kết quả Phát hành (Commit, Push, PR & Jira Done)` trong `.ai-workflow/tasks/<TICKET_ID>/precommit.md`.
+   - Cập nhật `.ai-workflow/tasks/<TICKET_ID>/state.md`: `Status: Done`, `Step: 06-precommit`, `Open Findings: none`, `Next Gate: None (PR created & Jira Done)`.
+   - Chạy `node .ai-workflow/scripts/verify.cjs board` để đưa ticket vào khu vực hoàn tất trên `.ai-workflow/BOARD.md`, in báo cáo tóm tắt kết quả 5 bước nhỏ rồi **DỪNG LƯỢT NGAY (`END TURN`)**.
 
 ---
 
@@ -55,7 +96,7 @@ Hoàn tất 100% các bước chuẩn bị phát hành khả nghịch: xác nh�
 ````markdown
 # Pre-Commit & Delivery Report: <TICKET_ID>
 
-## 1. Kết quả `verify.cjs diff` & Cleanliness Gate
+## 1. Kết quả 6.1 Pre-commit (`verify.cjs diff` & Cleanliness Gate)
 
 - **Nhánh hiện tại**: `<branch-name>` (`VALID`, tạo từ `main`)
 - **Phạm vi**: `<X>` modified/deleted + `<Y>` untracked (`??`) · `.ai-workflow/tasks/` gitignored: `YES`
@@ -72,7 +113,7 @@ Hoàn tất 100% các bước chuẩn bị phát hành khả nghịch: xác nh�
 
 - **Đã cập nhật `.ai-workflow/MEMORY.md`**: `NO (Nothing new needed)` *(hoặc ghi rõ dòng nguyên tắc vừa thêm)*
 
-## 4. Đề xuất Commit Message (Conventional Commit)
+## 4. Commit Message (Conventional Commit)
 
 ```text
 <type>(<scope>): <tóm tắt ngắn gọn dưới 72 ký tự> (<TICKET_ID>)
@@ -86,39 +127,17 @@ Closes <TICKET_ID>
 ## 5. Nội dung Pull Request Description (Theo skill `pr`)
 
 ```markdown
-<Nội dung PR hoàn chỉnh sẵn sàng copy dán vào GitHub Pull Request>
+<Nội dung PR hoàn chỉnh dùng cho gh pr create>
 ```
 
-## 6. Kết quả Đồng bộ Jira (`jira-cwb`)
+## 6. Kết quả Phát hành (6.2 Commit ➔ 6.3 Push ➔ 6.4 PR ➔ 6.5 Jira Done)
 
-- **Comment ID đã đăng**: `<id>`
-- **Chuyển trạng thái Jira**: `Verify / Test` ➔ **`Done`** *(đã thực thi qua `jira_transition_issue`)*
+- **6.2 Commit**: `<short-sha>` trên nhánh `<branch-name>`
+- **6.3 Push**: `origin/<branch-name>` (`OK`)
+- **6.4 Pull Request**: `<PR_URL>` (base: `main`)
+- **6.5 Jira (`jira-cwb`)**: Comment ID `<id>` · `Verify / Test` ➔ **`Done`**
 
 ## 7. Kết luận Cuối cùng
 
-**`SAFE TO COMMIT`** *(hoặc `DO NOT COMMIT` kèm lý do cụ thể nếu phát hiện rủi ro ở bước 1)*.
-````
-
----
-
-## 🛑 Khối Lệnh Phát Hành Cuối Cùng Cho Human (`The Undo Gate`)
-
-Sau khi ghi xong `precommit.md` và đồng bộ `BOARD.md`, in khối hướng dẫn dưới đây để Human kiểm tra danh sách tệp lần cuối và tự đẩy nhánh lên GitHub:
-
-````markdown
----
-### 🚀 Hoàn Tất Quy Trình — Lệnh Commit & Push Cho Bạn (`The Undo Gate`)
-Toàn bộ 6 bước `.ai-workflow` v4.0 của **<TICKET_ID>** đã hoàn tất (`SAFE TO COMMIT`).
-- Báo cáo & PR body: `.ai-workflow/tasks/<TICKET_ID>/precommit.md`
-- Trạng thái Board: Đã chuyển sang `Done` trong `.ai-workflow/BOARD.md`
-
-Hãy chạy các lệnh PowerShell sau trong Terminal để kiểm tra danh sách tệp và đẩy nhánh lên remote:
-
-```powershell
-git status --short
-git add -A
-git status --short
-git commit -m "<Dòng tiêu đề commit ở mục 4>" -m "<Các gạch đầu dòng chi tiết>" -m "Closes <TICKET_ID>"
-git push -u origin <branch-name>
-```
+**`DELIVERED — PR CREATED & JIRA DONE`** *(hoặc `SAFE TO COMMIT` nếu chỉ chạy 6.1 / `DO NOT COMMIT` nếu phát hiện lỗi ở 6.1)*.
 ````
