@@ -49,6 +49,16 @@ export function formatApiErrorMessage(error: unknown): string {
       case 'ACCESS_DENIED':
       case 'DOCUMENT_ACCESS_DENIED':
         return 'Bạn không có quyền thực hiện thao tác này.';
+      case 'DUPLICATE_EMAIL':
+        return 'Email này đã được sử dụng cho một tài khoản khác.';
+      case 'DUPLICATE_DEPARTMENT_CODE':
+        return 'Mã phòng ban này đã tồn tại trong hệ thống.';
+      case 'DEPARTMENT_IN_USE':
+        return 'Không thể xóa phòng ban đang có nhân sự hoặc tài liệu trực thuộc.';
+      case 'ADMIN_SELF_MODIFICATION_FORBIDDEN':
+        return 'Quản trị viên không thể tự vô hiệu hóa hoặc tự hạ quyền tài khoản của chính mình.';
+      case 'LAST_ACTIVE_ADMIN':
+        return 'Không thể khóa hoặc hạ quyền tài khoản SYSTEM_ADMIN đang hoạt động cuối cùng.';
       case 'REFRESH_TOKEN_REUSED':
       case 'TOKEN_REVOKED':
       case 'TOKEN_EXPIRED':
