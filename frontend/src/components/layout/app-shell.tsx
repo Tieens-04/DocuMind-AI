@@ -4,6 +4,7 @@ import React, { Suspense, useState } from 'react';
 import { LogOut, Menu, ShieldCheck } from 'lucide-react';
 import {
   ChatSessionSidebar,
+  ChatSessionsProvider,
   useChatSessions,
   type ChatSessionsController,
 } from '@/components/layout/chat-session-sidebar';
@@ -104,47 +105,49 @@ export function AppShell({ user, onLogout, children }: AppShellProps) {
   }
 
   return (
-    <div className="flex min-h-screen bg-slate-50">
-      <aside className="hidden w-72 shrink-0 flex-col border-r border-slate-200 bg-white p-4 md:flex">
-        <SidebarContent
-          user={user}
-          sessionsController={sessionsController}
-          isLoggingOut={isLoggingOut}
-          onLogout={() => void handleLogout()}
-        />
-      </aside>
+    <ChatSessionsProvider value={sessionsController}>
+      <div className="flex min-h-screen bg-slate-50">
+        <aside className="hidden w-72 shrink-0 flex-col border-r border-slate-200 bg-white p-4 md:flex">
+          <SidebarContent
+            user={user}
+            sessionsController={sessionsController}
+            isLoggingOut={isLoggingOut}
+            onLogout={() => void handleLogout()}
+          />
+        </aside>
 
-      <div className="flex min-w-0 flex-1 flex-col">
-        <header className="flex h-14 items-center justify-between border-b border-slate-200 bg-white px-4 md:hidden">
-          <div className="flex items-center gap-2">
-            <ShieldCheck className="h-5 w-5 text-primary" aria-hidden="true" />
-            <span className="font-semibold text-slate-900">DocuMind AI</span>
-          </div>
+        <div className="flex min-w-0 flex-1 flex-col">
+          <header className="flex h-14 items-center justify-between border-b border-slate-200 bg-white px-4 md:hidden">
+            <div className="flex items-center gap-2">
+              <ShieldCheck className="h-5 w-5 text-primary" aria-hidden="true" />
+              <span className="font-semibold text-slate-900">DocuMind AI</span>
+            </div>
 
-          <Sheet open={mobileOpen} onOpenChange={setMobileOpen}>
-            <SheetTrigger asChild>
-              <Button type="button" variant="outline" size="icon" aria-label="Mở menu điều hướng">
-                <Menu className="h-5 w-5" aria-hidden="true" />
-              </Button>
-            </SheetTrigger>
-            <SheetContent side="left" className="w-80 p-4">
-              <SheetHeader className="sr-only">
-                <SheetTitle>Menu DocuMind AI</SheetTitle>
-                <SheetDescription>Điều hướng và lịch sử hội thoại theo vai trò</SheetDescription>
-              </SheetHeader>
-              <SidebarContent
-                user={user}
-                sessionsController={sessionsController}
-                isLoggingOut={isLoggingOut}
-                onLogout={() => void handleLogout()}
-                onNavigate={() => setMobileOpen(false)}
-              />
-            </SheetContent>
-          </Sheet>
-        </header>
+            <Sheet open={mobileOpen} onOpenChange={setMobileOpen}>
+              <SheetTrigger asChild>
+                <Button type="button" variant="outline" size="icon" aria-label="Mở menu điều hướng">
+                  <Menu className="h-5 w-5" aria-hidden="true" />
+                </Button>
+              </SheetTrigger>
+              <SheetContent side="left" className="w-80 p-4">
+                <SheetHeader className="sr-only">
+                  <SheetTitle>Menu DocuMind AI</SheetTitle>
+                  <SheetDescription>Điều hướng và lịch sử hội thoại theo vai trò</SheetDescription>
+                </SheetHeader>
+                <SidebarContent
+                  user={user}
+                  sessionsController={sessionsController}
+                  isLoggingOut={isLoggingOut}
+                  onLogout={() => void handleLogout()}
+                  onNavigate={() => setMobileOpen(false)}
+                />
+              </SheetContent>
+            </Sheet>
+          </header>
 
-        <main className="min-w-0 flex-1 p-4 md:p-6">{children}</main>
+          <main className="min-w-0 flex-1 p-4 md:p-6">{children}</main>
+        </div>
       </div>
-    </div>
+    </ChatSessionsProvider>
   );
 }
