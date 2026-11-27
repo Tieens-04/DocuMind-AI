@@ -1,6 +1,6 @@
 'use client';
 
-import React, { useCallback, useEffect, useRef, useState } from 'react';
+import React, { createContext, useCallback, useContext, useEffect, useRef, useState } from 'react';
 import { usePathname, useRouter, useSearchParams } from 'next/navigation';
 import { MessageSquarePlus, Pencil, RefreshCw, Trash2 } from 'lucide-react';
 import { toast } from 'sonner';
@@ -30,14 +30,26 @@ export interface ChatSessionsController {
   loading: boolean;
   loadError: string | null;
   creating: boolean;
-  loadSessions: () => Promise<void>;
+  loadSessions: (options?: { silent?: boolean }) => Promise<void>;
   createSession: () => Promise<ChatSessionResponse | null>;
   renameSession: (sessionId: string, title: string) => Promise<ChatSessionResponse | null>;
   deleteSession: (sessionId: string) => Promise<boolean>;
 }
 
-function isAbortError(error: unknown): boolean {
-  return error instanceof Error && error.name === 'AbortError';
+const ChatSessionsContext = createContext<ChatSessionsController | null>(null);
+
+export function ChatSessionsProvider({
+  value,
+  children,
+}: {
+  value: ChatSessionsController;
+  children: React.ReactNode;
+}) {
+  return <ChatSessionsContext.Provider value={value}>{children}</ChatSessionsContext.Provider>;
+}
+
+export function useOptionalChatSessions(): ChatSessionsController | null {
+  return useContext(ChatSessionsContext);
 }
 
 function shouldSuppressExpiredToast(error: unknown): boolean {
@@ -54,25 +66,31 @@ export function useChatSessions(options?: { enabled?: boolean }): ChatSessionsCo
   const requestSeqRef = useRef(0);
   const abortControllerRef = useRef<AbortController | null>(null);
 
-  const loadSessions = useCallback(async () => {
+  const loadSessions = useCallback(async (loadOptions?: { silent?: boolean }) => {
     abortControllerRef.current?.abort();
     const controller = new AbortController();
     abortControllerRef.current = controller;
     const seq = ++requestSeqRef.current;
+    const silent = loadOptions?.silent === true;
 
-    setLoading(true);
-    setLoadError(null);
+    if (!silent) {
+      setLoading(true);
+      setLoadError(null);
+    }
     try {
       const page = await listChatSessions(0, 50, controller.signal);
       if (seq !== requestSeqRef.current || controller.signal.aborted) {
         return;
       }
+      setLoadError(null);
       setSessions(page.items);
     } catch (error) {
-      if (isAbortError(error) || seq !== requestSeqRef.current) {
+      if (controller.signal.aborted || seq !== requestSeqRef.current) {
         return;
       }
-      setLoadError(formatApiErrorMessage(error));
+      if (!silent) {
+        setLoadError(formatApiErrorMessage(error));
+      }
     } finally {
       if (seq === requestSeqRef.current) {
         setLoading(false);

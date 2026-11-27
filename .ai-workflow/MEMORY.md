@@ -24,6 +24,7 @@
 - **Post-RBAC Bucket4j rate limiting & bounded async FinOps audit**: Enforce Bucket4j + Lettuce quotas (`15/30/60` chat/min, `5/10` upload/min) after RBAC/session pre-checks with ABA-safe connection recovery + `AS_IS` demotion clamping, and bound fire-and-forget `429`/failure writes via non-blocking `Semaphore` + single-SQL `JdbcClient` insert on `documind-audit-vt-`.
 - **FlintFlow port coexistence**: Keep canonical host ports in `.env.example` / `docker-compose.yml` (`5432`, `6380`, `9000/9001`, `8081`, `3002`, `11434`) and never collide with `flintflow-*` containers.
 - **Frontend RAM-only access token & single-flight refresh**: Keep `accessToken` in memory and `refreshToken` in `localStorage`; serialize 401 rotation across tabs via `navigator.locks` + macrotask yield + `sessionEpoch`, clearing session only on `401/403` (`frontend/src/lib/auth/token-manager.ts`).
+- **Frontend typed SSE streaming, XSS-safe GFM & live-verified Citation preview**: Stream `/api/v1/chat/stream` via `fetch` + `ReadableStream` (`TextDecoder({ stream: true })`, single-flight `401` retry, `reader.cancel()` in `finally`), strip ASCII control chars/backslashes before `ReactMarkdown` `urlTransform`, and gate `CitationDrawer` links behind live `/preview-url` RBAC verification keyed by citation identity (`frontend/src/lib/api/chat-stream.ts`, `frontend/src/components/chat/citation-drawer.tsx`).
 
 ---
 
@@ -39,6 +40,7 @@
 - **RBAC-Scoped Two-Tier RAG Cache & Turn-1 CTE Persistence**: `backend/src/main/java/com/documind/service/rag/RagCacheService.java`, `backend/src/main/java/com/documind/infrastructure/vector/SemanticCacheVectorRepository.java`, `backend/src/main/java/com/documind/repository/ChatTurnPersistenceRepository.java`, `backend/src/test/java/com/documind/integration/ScopedRagCacheIntegrationTest.java`
 - **Bucket4j Rate Limiting, Async Audit Worker & Admin FinOps Analytics**: `backend/src/main/java/com/documind/infrastructure/ratelimit/RateLimitService.java`, `backend/src/main/java/com/documind/service/audit/AuditLogService.java`, `backend/src/main/java/com/documind/service/admin/AdminAnalyticsService.java`, `backend/src/test/java/com/documind/integration/RateLimitIntegrationTest.java`, `backend/src/test/java/com/documind/integration/AdminAnalyticsIntegrationTest.java`
 - **Next.js Auth, Single-Flight Refresh & Role Guard**: `frontend/src/lib/auth/token-manager.ts`, `frontend/src/lib/auth/permissions.ts`, `frontend/src/providers/auth-provider.tsx`, `frontend/src/__tests__/api-client.test.ts`
+- **Next.js Chat Workspace, Typed SSE Client & Citation Side Drawer**: `frontend/src/lib/api/chat-stream.ts`, `frontend/src/app/(workspace)/chat/page.tsx`, `frontend/src/components/chat/citation-drawer.tsx`, `frontend/src/components/chat/markdown-content.tsx`, `frontend/src/__tests__/chat-workspace.test.tsx`
 
 ---
 
@@ -59,3 +61,4 @@
 - **Jira lifecycle on `jira-cwb`**: Project `DA` lives on `nguyentien191004.atlassian.net` via MCP `jira-cwb` (`To Do` -> `In Progress` in Step 1, `Verify / Test` in Step 3/5, `Done` in Step 6 only when `SAFE TO COMMIT`).
 - **HTTP/1.1 SSE Test Harness & Leak-Free Cleanup**: Force `HTTP_1_1`, wrap `HttpResponse<InputStream>` in `try-with-resources` before assertions, and close `HttpClient`/`ExecutorService` with `shutdownNow()` + sink completion in `finally` (`Week2SseTestClient.java`) so early failures never hang Surefire.
 - **TestContext cache cap on low-RAM hosts**: Bound `spring.test.context.cache.maxSize=4` (`backend/src/test/resources/spring.properties`) and keep singleton Testcontainers alive across `@DirtiesContext` so full `verify` suites stay within 8 GiB / no-swap container limits.
+- **Caller-owned `AbortSignal` check over generic `AbortError` matching**: Check `controller.signal.aborted` in frontend `catch` blocks instead of `error.name === 'AbortError'` so internal `refreshAccessToken()` 10s timeout aborts surface as errors rather than hanging UI loading states (`frontend/src/app/(workspace)/chat/page.tsx`).

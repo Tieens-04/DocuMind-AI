@@ -1,8 +1,12 @@
-import React from 'react';
+import React, { useEffect } from 'react';
 import { render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { ChatSessionSidebar } from '@/components/layout/chat-session-sidebar';
+import {
+  ChatSessionSidebar,
+  useChatSessions,
+  type ChatSessionsController,
+} from '@/components/layout/chat-session-sidebar';
 import { resetTokenManagerForTests, setSessionTokens } from '@/lib/auth/token-manager';
 
 const mockPush = vi.fn();
@@ -209,5 +213,56 @@ describe('ChatSessionSidebar', () => {
     await new Promise((resolve) => setTimeout(resolve, 20));
     expect(screen.getByText('Phiên tạo nhanh')).toBeInTheDocument();
     expect(screen.queryByText('Phiên cũ trả về trễ')).not.toBeInTheDocument();
+  });
+
+  it('preserves loaded sidebar sessions when silent background refresh fails', async () => {
+    let fetchCount = 0;
+    let capturedController: ChatSessionsController | null = null;
+
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => {
+        fetchCount += 1;
+        if (fetchCount === 1) {
+          return new Response(
+            JSON.stringify({
+              items: [
+                {
+                  id: '44444444-4444-4444-4444-444444444444',
+                  title: 'Phiên ổn định',
+                  createdAt: '2026-11-26T00:00:00Z',
+                  updatedAt: '2026-11-26T00:00:00Z',
+                },
+              ],
+              page: 0,
+              size: 50,
+              totalElements: 1,
+              totalPages: 1,
+            }),
+            { status: 200, headers: { 'Content-Type': 'application/json' } },
+          );
+        }
+        return new Response(
+          JSON.stringify({ status: 503, title: 'Unavailable', detail: 'Temporary error' }),
+          { status: 503, headers: { 'Content-Type': 'application/problem+json' } },
+        );
+      }),
+    );
+
+    function SidebarHarness() {
+      const controller = useChatSessions();
+      useEffect(() => {
+        capturedController = controller;
+      }, [controller]);
+      return <ChatSessionSidebar controller={controller} />;
+    }
+
+    render(<SidebarHarness />);
+    expect(await screen.findByText('Phiên ổn định')).toBeInTheDocument();
+
+    await capturedController!.loadSessions({ silent: true });
+
+    expect(screen.getByText('Phiên ổn định')).toBeInTheDocument();
+    expect(screen.queryByText('Temporary error')).not.toBeInTheDocument();
   });
 });
