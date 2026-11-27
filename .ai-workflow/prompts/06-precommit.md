@@ -7,8 +7,8 @@ Bạn đóng vai **`Release Inspector & Memory Keeper`** của **DocuMind AI**.
 ## Mục tiêu
 
 Hoàn tất phát hành ticket `<TICKET_ID>` theo đúng **5 bước nhỏ tuần tự có chốt chặn (`Fail-Fast`)**:
-1. **6.1 Pre-commit**: Quét vệ sinh `verify.cjs diff`, soạn Commit Message & PR Description (skill `pr`), cập nhật `.ai-workflow/MEMORY.md` (nếu có bài học mới), ghi `precommit.md` (`SAFE TO COMMIT`).
-2. **6.2 Commit**: Kiểm tra `git status --short`, stage tệp hợp lệ, chạy `git commit` theo Conventional Commit và lấy `<short-sha>` thật.
+1. **6.1 Pre-commit**: Quét vệ sinh `verify.cjs diff`, lập danh sách **Atomic Commits theo từng phần** & soạn PR Description (skill `pr`), cập nhật `.ai-workflow/MEMORY.md` (nếu có bài học mới), ghi `precommit.md` (`SAFE TO COMMIT`).
+2. **6.2 Commit (Theo từng phần — Atomic Commits)**: Kiểm tra `git status --short`, tách các file thay đổi theo nhóm logic (Flyway/Config, Backend, Frontend, Tests, Docs/Memory), stage tường minh từng nhóm (`git add <files>`) và commit riêng từng phần (không gộp hết bằng `git add -A` vào 1 commit), rồi lấy danh sách SHA & `<short-sha>` của `HEAD`.
 3. **6.3 Push**: Đẩy nhánh `<branch-name>` lên remote (`git push -u origin <branch-name>`).
 4. **6.4 Tạo PR**: Mở Pull Request vào nhánh `main` bằng `gh pr create` (dùng nội dung PR từ `precommit.md`) và lấy **PR URL**.
 5. **6.5 Đóng task trên Jira**: Đăng bình luận tổng kết (kèm `<short-sha>`, **PR URL**, bằng chứng AC & Quality Gates) rồi chuyển trạng thái Jira sang **`Done`** (`id: "41"`), cập nhật `state.md` + `BOARD.md`.
@@ -37,28 +37,42 @@ Hoàn tất phát hành ticket `<TICKET_ID>` theo đúng **5 bước nhỏ tuầ
    ```
    - Xác nhận đầu ra báo: `Branch — VALID`, `.ai-workflow/tasks/ gitignored: YES`, và `Static Hygiene & Secret Scan: PASS (0 issues)` (đã tự động kiểm tra `dev-caller-fallback.enabled: false`, secrets, `System.out`, `printStackTrace`, bare `@Disabled`, `console.log`, whitespace).
    - Xác nhận không có cổng nào trong `docker-compose.yml` / `.env.example` đụng dải cổng của `flintflow-*` (`3000`, `3001`, `5000`, `6379`, `8080`, `27017/27018`).
-2. **Soạn Nội Dung Pull Request Bằng Skill `pr`**:
-   - Đọc `.agents/skills/pr/SKILL.md` và soạn Conventional Commit message + PR Description rõ ràng, bám sát thuật ngữ miền của DocuMind AI (Summary kèm call-tree/file-tree/Mermaid gọn, đối chiếu AC & RBAC/RAG invariants, Verification Evidence thực tế từ `final-review.md`, và Merge Danger / Blast Radius).
+2. **Soạn Kế Hoạch Commit Theo Từng Phần & Nội Dung Pull Request Bằng Skill `pr`**:
+   - Đọc `.agents/skills/pr/SKILL.md` và soạn:
+     - **Danh sách Atomic Commits theo từng phần** (chia theo tầng/chức năng thay đổi thực tế, vd: `migration/config` ➔ `backend` ➔ `frontend` ➔ `tests` ➔ `docs/chore`; chỉ tạo commit cho phần có thay đổi).
+     - **PR Description** rõ ràng, bám sát thuật ngữ miền của DocuMind AI (Summary kèm call-tree/file-tree/Mermaid gọn, đối chiếu AC & RBAC/RAG invariants, Verification Evidence thực tế từ `final-review.md`, và Merge Danger / Blast Radius).
 3. **Khép Kín Vòng Lặp Tái Sử Dụng (`Save What Matters to MEMORY.md`)**:
    - Đọc `.ai-workflow/MEMORY.md` và mục `5. Prevention & Reuse Audit` trong `final-review.md`.
    - Chỉ khi ticket vừa hoàn tất thực sự mang lại **1 quyết định kiến trúc mới (`Decision`), 1 file mẫu chuẩn mới (`Source`), hoặc 1 bài học kỹ thuật tổng quát (`Lesson`)** chưa có trong `MEMORY.md`: bổ sung **tối đa 1–2 dòng** vào đúng mục tương ứng. Nếu không, giữ nguyên `MEMORY.md`.
 4. **Ghi `.ai-workflow/tasks/<TICKET_ID>/precommit.md`** với các mục 1–5 và kết luận **`SAFE TO COMMIT`** *(nếu có lỗi ➔ ghi `DO NOT COMMIT` và DỪNG NGAY)*.
 
-### 6.2 Commit (Stage & Commit Chuẩn Conventional Commit)
+### 6.2 Commit (Commit Theo Từng Phần — Atomic Commits)
 
 1. Kiểm tra danh sách tệp thay đổi:
    ```powershell
    git status --short
    ```
    Xác nhận không lọt `.env*` thật, log rác hay file ngoài phạm vi ticket (`.ai-workflow/tasks/` & `BOARD.md` đã gitignore).
-2. Stage và commit đúng thông điệp Conventional Commit ở mục 4 của `precommit.md`:
+2. **Cấm dồn toàn bộ vào 1 commit bằng `git add -A`**: Chia các tệp thay đổi thành từng nhóm logic (chỉ commit các nhóm có thay đổi thực tế) và stage tường minh theo đúng thứ tự phụ thuộc:
+   - **Phần 1 — Flyway Migration / Config** *(nếu có)*: `backend/src/main/resources/db/migration/**`, `application*.yml`, `pom.xml`, `docker-compose.yml`
+   - **Phần 2 — Backend** *(nếu có)*: `backend/src/main/java/**` (domain/repository ➔ service/rag/security ➔ controller/dto)
+   - **Phần 3 — Frontend** *(nếu có)*: `frontend/**` (api/hooks ➔ components/pages — không gồm E2E/test)
+   - **Phần 4 — Tests** *(nếu có)*: `backend/src/test/**`, unit/Testcontainers tests, Playwright E2E specs
+   - **Phần 5 — Docs / Memory** *(nếu có)*: `docs/**`, `.ai-workflow/MEMORY.md`
+3. Với **mỗi phần**, stage đúng danh sách file của phần đó, xác nhận `git diff --cached --stat`, rồi commit theo Conventional Commit (commit cuối cùng ghi thêm `Closes <TICKET_ID>`):
    ```powershell
-   git add -A
+   git add <file-nhom-1-a> <file-nhom-1-b>
+   git diff --cached --stat
+   git commit -m "<type>(<scope>): <tóm tắt ngắn gọn phần 1 dưới 72 ký tự> (<TICKET_ID>)"
+   # Lặp lại cho từng phần tiếp theo; commit cuối cùng thêm dòng: -m "Closes <TICKET_ID>"
+   ```
+4. Xác nhận working tree đã sạch và ghi lại log các commit vừa tạo cùng `<short-sha>` mới nhất:
+   ```powershell
    git status --short
-   git commit -m "<type>(<scope>): <tóm tắt ngắn gọn dưới 72 ký tự> (<TICKET_ID>)" -m "- <Thay đổi chính 1>`n- <Thay đổi chính 2>" -m "Closes <TICKET_ID>"
+   git log --oneline main..HEAD
    git rev-parse --short HEAD
    ```
-   *(Nếu working tree đã sạch và commit của ticket đã tồn tại sẵn trên nhánh, ghi nhận `<short-sha>` hiện tại rồi chuyển tiếp sang 6.3).*
+   *(Nếu toàn bộ thay đổi đã được commit theo từng phần từ trước và working tree sạch, ghi nhận danh sách commit & `<short-sha>` hiện tại rồi chuyển tiếp sang 6.3).*
 
 ### 6.3 Push (Đẩy Nhánh Lên Remote)
 
@@ -113,15 +127,13 @@ Hoàn tất phát hành ticket `<TICKET_ID>` theo đúng **5 bước nhỏ tuầ
 
 - **Đã cập nhật `.ai-workflow/MEMORY.md`**: `NO (Nothing new needed)` *(hoặc ghi rõ dòng nguyên tắc vừa thêm)*
 
-## 4. Commit Message (Conventional Commit)
+## 4. Kế hoạch Commit Theo Từng Phần (Atomic Conventional Commits)
 
 ```text
-<type>(<scope>): <tóm tắt ngắn gọn dưới 72 ký tự> (<TICKET_ID>)
-
-- <Thay đổi chính 1>
-- <Thay đổi chính 2>
-
-Closes <TICKET_ID>
+1. <type>(<scope-1>): <tóm tắt phần 1 dưới 72 ký tự> (<TICKET_ID>)   # <nhóm file 1>
+2. <type>(<scope-2>): <tóm tắt phần 2 dưới 72 ký tự> (<TICKET_ID>)   # <nhóm file 2>
+3. test(<scope>): <tóm tắt test bổ sung> (<TICKET_ID>)               # <nhóm file test>
+4. docs(<scope>): <tóm tắt tài liệu> (<TICKET_ID>) + Closes <TICKET_ID>
 ```
 
 ## 5. Nội dung Pull Request Description (Theo skill `pr`)
@@ -132,7 +144,7 @@ Closes <TICKET_ID>
 
 ## 6. Kết quả Phát hành (6.2 Commit ➔ 6.3 Push ➔ 6.4 PR ➔ 6.5 Jira Done)
 
-- **6.2 Commit**: `<short-sha>` trên nhánh `<branch-name>`
+- **6.2 Commits (`<N>` atomic commits, HEAD `<short-sha>`)**: `<sha1>, <sha2>, ...` trên nhánh `<branch-name>`
 - **6.3 Push**: `origin/<branch-name>` (`OK`)
 - **6.4 Pull Request**: `<PR_URL>` (base: `main`)
 - **6.5 Jira (`jira-cwb`)**: Comment ID `<id>` · `Verify / Test` ➔ **`Done`**

@@ -62,7 +62,7 @@ Hệ thống điều phối phát triển phần mềm 6 bước dành riêng ch
                             ▼ ──► [GATE 4]: Đổi sang Model siêu nhẹ (Hydrogen / Flash)
                     [Bước 6: Deliver & Reuse — Release & Memory Keeper (06-precommit.md)]
                       • 6.1 Pre-commit: `verify.cjs diff` + soạn PR (skill `pr`) + cập nhật `MEMORY.md` (nếu có)
-                      • 6.2 Commit: `git status` + `git add` + `git commit` (Conventional Commit) ➔ lấy `<short-sha>`
+                      • 6.2 Commit: commit theo từng phần (atomic commits theo tầng Migration/BE/FE/Tests/Docs, không `git add -A` gộp 1 lần) ➔ `<short-sha>`
                       • 6.3 Push: `git push -u origin <branch-name>`
                       • 6.4 Tạo PR: `gh pr create --base main` ➔ lấy PR URL
                       • 6.5 Đóng task trên Jira: đăng comment bằng chứng + chuyển status sang `"Done"` + `BOARD.md`
