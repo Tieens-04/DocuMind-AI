@@ -151,6 +151,7 @@ class AdminAnalyticsIntegrationTest {
         assertThat(emptySummary.successfulQueries()).isZero();
         assertThat(emptySummary.cacheHitRatioPercent()).isEqualByComparingTo(new BigDecimal("0.00"));
         assertThat(emptySummary.totalTokens()).isZero();
+        assertThat(emptySummary.averageLatencyMs()).isEqualByComparingTo(new BigDecimal("0.00"));
 
         AdminDepartmentTokenUsageReportResponse emptyByDept = objectMapper.readValue(
             client.sendJson(port, "GET", "/api/v1/admin/analytics/token-by-department?" + windowParams, null, adminJwt).body(),
@@ -186,6 +187,7 @@ class AdminAnalyticsIntegrationTest {
         assertThat(summary.promptTokens()).isEqualTo(180L);
         assertThat(summary.completionTokens()).isEqualTo(60L);
         assertThat(summary.totalTokens()).isEqualTo(240L);
+        assertThat(summary.averageLatencyMs()).isEqualByComparingTo(new BigDecimal("52.67"));
 
         AdminDepartmentTokenUsageReportResponse byDept = objectMapper.readValue(
             client.sendJson(port, "GET", "/api/v1/admin/analytics/token-by-department?" + windowParams, null, adminJwt).body(),
@@ -236,6 +238,7 @@ class AdminAnalyticsIntegrationTest {
         assertThat(bigSum.promptTokens()).isEqualTo(3_000_000_000L);
         assertThat(bigSum.completionTokens()).isEqualTo(200_000_000L);
         assertThat(bigSum.totalTokens()).isEqualTo(3_200_000_000L);
+        assertThat(bigSum.averageLatencyMs()).isEqualByComparingTo(new BigDecimal("50.00"));
     }
 
     @Test

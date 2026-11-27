@@ -436,13 +436,14 @@ class AdminControllerTest {
         OffsetDateTime to = OffsetDateTime.parse("2026-11-25T00:00:00Z");
 
         when(analyticsService.getSummary(from, to, ADMIN_ID)).thenReturn(
-            new AdminAnalyticsSummaryResponse(from, to, 3L, 1L, new BigDecimal("33.33"), 1200L, 450L, 1650L)
+            new AdminAnalyticsSummaryResponse(from, to, 3L, 1L, new BigDecimal("33.33"), 1200L, 450L, 1650L, new BigDecimal("52.67"))
         );
         mockMvc.perform(get("/api/v1/admin/analytics/summary?from=2026-11-23T00:00:00Z&to=2026-11-25T00:00:00Z"))
             .andExpect(status().isOk())
             .andExpect(jsonPath("$.successfulQueries").value(3))
             .andExpect(jsonPath("$.cacheHitRatioPercent").value(33.33))
-            .andExpect(jsonPath("$.totalTokens").value(1650));
+            .andExpect(jsonPath("$.totalTokens").value(1650))
+            .andExpect(jsonPath("$.averageLatencyMs").value(52.67));
 
         when(analyticsService.getTokenUsageByDepartment(from, to, ADMIN_ID)).thenReturn(
             new AdminDepartmentTokenUsageReportResponse(from, to, List.of(
@@ -510,7 +511,7 @@ class AdminControllerTest {
             AdminAnalyticsService mockSvc = mock(AdminAnalyticsService.class);
             OffsetDateTime now = OffsetDateTime.now(ZoneOffset.UTC);
             when(mockSvc.getSummary(any(), any(), any()))
-                .thenReturn(new AdminAnalyticsSummaryResponse(now.minusDays(30), now, 0L, 0L, BigDecimal.ZERO, 0L, 0L, 0L));
+                .thenReturn(new AdminAnalyticsSummaryResponse(now.minusDays(30), now, 0L, 0L, BigDecimal.ZERO, 0L, 0L, 0L, BigDecimal.ZERO));
             return mockSvc;
         }
 

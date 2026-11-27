@@ -75,7 +75,7 @@ class AdminAnalyticsServiceTest {
         OffsetDateTime expectedTo = OffsetDateTime.ofInstant(FIXED_NOW, ZoneOffset.UTC);
         OffsetDateTime expectedFrom = expectedTo.minusDays(30);
 
-        AuditLogRepository.SummaryProjection emptyProj = mockSummaryProjection(0L, 0L, 0L, 0L);
+        AuditLogRepository.SummaryProjection emptyProj = mockSummaryProjection(0L, 0L, 0L, 0L, 0L);
         when(auditLogRepository.aggregateSummary(expectedFrom, expectedTo)).thenReturn(emptyProj);
 
         AdminAnalyticsSummaryResponse empty = service.getSummary(null, null, ADMIN_ID);
@@ -84,12 +84,13 @@ class AdminAnalyticsServiceTest {
         assertThat(empty.successfulQueries()).isZero();
         assertThat(empty.cacheHitRatioPercent()).isEqualByComparingTo(new BigDecimal("0.00"));
         assertThat(empty.totalTokens()).isZero();
+        assertThat(empty.averageLatencyMs()).isEqualByComparingTo(new BigDecimal("0.00"));
 
         OffsetDateTime customFrom = OffsetDateTime.parse("2026-11-23T07:00:00+07:00");
         OffsetDateTime customTo = OffsetDateTime.parse("2026-11-24T07:00:00+07:00");
         OffsetDateTime utcFrom = OffsetDateTime.parse("2026-11-23T00:00:00Z");
         OffsetDateTime utcTo = OffsetDateTime.parse("2026-11-24T00:00:00Z");
-        AuditLogRepository.SummaryProjection populatedProj = mockSummaryProjection(3L, 1L, 1500L, 620L);
+        AuditLogRepository.SummaryProjection populatedProj = mockSummaryProjection(3L, 1L, 1500L, 620L, 158L);
         when(auditLogRepository.aggregateSummary(utcFrom, utcTo))
             .thenReturn(populatedProj);
 
@@ -102,6 +103,7 @@ class AdminAnalyticsServiceTest {
         assertThat(populated.promptTokens()).isEqualTo(1500L);
         assertThat(populated.completionTokens()).isEqualTo(620L);
         assertThat(populated.totalTokens()).isEqualTo(2120L);
+        assertThat(populated.averageLatencyMs()).isEqualByComparingTo(new BigDecimal("52.67"));
     }
 
     @Test
@@ -205,13 +207,15 @@ class AdminAnalyticsServiceTest {
         long successfulQueries,
         long cacheHits,
         long promptTokens,
-        long completionTokens
+        long completionTokens,
+        long totalSuccessfulLatencyMs
     ) {
         AuditLogRepository.SummaryProjection proj = mock(AuditLogRepository.SummaryProjection.class);
         when(proj.getSuccessfulQueries()).thenReturn(successfulQueries);
         when(proj.getCacheHits()).thenReturn(cacheHits);
         when(proj.getPromptTokens()).thenReturn(promptTokens);
         when(proj.getCompletionTokens()).thenReturn(completionTokens);
+        when(proj.getTotalSuccessfulLatencyMs()).thenReturn(totalSuccessfulLatencyMs);
         return proj;
     }
 
