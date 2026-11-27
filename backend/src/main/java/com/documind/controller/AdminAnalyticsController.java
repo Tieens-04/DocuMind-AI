@@ -46,7 +46,7 @@ public class AdminAnalyticsController {
     @GetMapping("/summary")
     @Operation(
         summary = "Get FinOps analytics summary",
-        description = "Returns successful query count, L1/L2 cache hit ratio (%), and total prompt/completion/overall tokens over [from, to) UTC"
+        description = "Returns successful query count, L1/L2 cache hit ratio (%), average latency (ms), and total prompt/completion/overall tokens over [from, to) UTC"
     )
     public AdminAnalyticsSummaryResponse getSummary(
         @RequestParam(name = "from", required = false) @DateTimeFormat(iso = DateTimeFormat.ISO.DATE_TIME) OffsetDateTime from,

@@ -42,6 +42,7 @@
 - **Next.js Auth, Single-Flight Refresh & Role Guard**: `frontend/src/lib/auth/token-manager.ts`, `frontend/src/lib/auth/permissions.ts`, `frontend/src/providers/auth-provider.tsx`, `frontend/src/__tests__/api-client.test.ts`
 - **Next.js Chat Workspace, Typed SSE Client & Citation Side Drawer**: `frontend/src/lib/api/chat-stream.ts`, `frontend/src/app/(workspace)/chat/page.tsx`, `frontend/src/components/chat/citation-drawer.tsx`, `frontend/src/components/chat/markdown-content.tsx`, `frontend/src/__tests__/chat-workspace.test.tsx`
 - **Next.js Documents Upload Queue, Conditional Polling & RBAC Table**: `frontend/src/lib/api/documents.ts`, `frontend/src/app/(workspace)/documents/page.tsx`, `frontend/src/components/documents/document-upload-zone.tsx`, `frontend/src/__tests__/helpers/mock-xhr.ts`, `frontend/src/__tests__/documents-workspace.test.tsx`
+- **Next.js Admin FinOps Dashboard & Users/Departments 2-Tab Governance**: `frontend/src/lib/api/admin.ts`, `frontend/src/app/(workspace)/admin/analytics/page.tsx`, `frontend/src/app/(workspace)/admin/users/page.tsx`, `frontend/src/__tests__/admin-rbac-three-roles.test.tsx`
 
 ---
 

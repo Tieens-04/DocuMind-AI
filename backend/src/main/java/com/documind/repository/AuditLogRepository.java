@@ -36,7 +36,8 @@ public interface AuditLogRepository extends JpaRepository<AuditLogEntity, UUID>,
                 COUNT(*) FILTER (WHERE a.status_code >= 200 AND a.status_code < 300) AS "successfulQueries",
                 COUNT(*) FILTER (WHERE a.status_code >= 200 AND a.status_code < 300 AND a.cache_hit = TRUE) AS "cacheHits",
                 CAST(COALESCE(SUM(CAST(a.prompt_tokens AS BIGINT)), 0) AS BIGINT) AS "promptTokens",
-                CAST(COALESCE(SUM(CAST(a.completion_tokens AS BIGINT)), 0) AS BIGINT) AS "completionTokens"
+                CAST(COALESCE(SUM(CAST(a.completion_tokens AS BIGINT)), 0) AS BIGINT) AS "completionTokens",
+                CAST(COALESCE(SUM(a.latency_ms) FILTER (WHERE a.status_code >= 200 AND a.status_code < 300), 0) AS BIGINT) AS "totalSuccessfulLatencyMs"
             FROM audit_logs a
             WHERE a.action_type = 'CHAT_QUERY'
               AND a.created_at >= :from
@@ -107,6 +108,8 @@ public interface AuditLogRepository extends JpaRepository<AuditLogEntity, UUID>,
         long getPromptTokens();
 
         long getCompletionTokens();
+
+        long getTotalSuccessfulLatencyMs();
     }
 
     interface DepartmentTokenUsageProjection {

@@ -1,3 +1,5 @@
+import type { AdminDepartmentResponse } from '@/lib/types/admin';
+
 export interface ChatSessionResponse {
   id: string;
   title: string;
@@ -97,15 +99,7 @@ export interface DocumentPreviewUrlResponse {
   expiresAt: string;
 }
 
-export interface AdminDepartmentOption {
-  id: string;
-  code: string;
-  name: string;
-  description: string | null;
-  cacheVersion: number;
-  createdAt: string;
-  updatedAt: string;
-}
+export type AdminDepartmentOption = AdminDepartmentResponse;
 
 export type ChatMessageStatus = 'searching' | 'streaming' | 'completed' | 'stopped' | 'error';
 

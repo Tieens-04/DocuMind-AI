@@ -45,7 +45,7 @@ public class AdminAnalyticsService {
     static final long MAX_WINDOW_DAYS = 366L;
     private static final Duration MAX_WINDOW_DURATION = Duration.ofDays(MAX_WINDOW_DAYS);
     private static final BigDecimal HUNDRED = BigDecimal.valueOf(100);
-    private static final BigDecimal ZERO_PERCENT = BigDecimal.ZERO.setScale(2, RoundingMode.HALF_UP);
+    private static final BigDecimal ZERO_SCALED = BigDecimal.ZERO.setScale(2, RoundingMode.HALF_UP);
     private static final int MIN_HTTP_STATUS = 100;
     private static final int MAX_HTTP_STATUS = 599;
 
@@ -84,6 +84,7 @@ public class AdminAnalyticsService {
             long cacheHits = row != null ? row.getCacheHits() : 0L;
             long promptTokens = row != null ? row.getPromptTokens() : 0L;
             long completionTokens = row != null ? row.getCompletionTokens() : 0L;
+            long totalSuccessfulLatencyMs = row != null ? row.getTotalSuccessfulLatencyMs() : 0L;
             return new AdminAnalyticsSummaryResponse(
                 window.from(),
                 window.to(),
@@ -92,7 +93,8 @@ public class AdminAnalyticsService {
                 calculateCacheHitRatioPercent(cacheHits, successfulQueries),
                 promptTokens,
                 completionTokens,
-                promptTokens + completionTokens
+                promptTokens + completionTokens,
+                calculateAverageLatencyMs(totalSuccessfulLatencyMs, successfulQueries)
             );
         });
     }
@@ -221,10 +223,18 @@ public class AdminAnalyticsService {
 
     static BigDecimal calculateCacheHitRatioPercent(long cacheHits, long successfulQueries) {
         if (successfulQueries <= 0L) {
-            return ZERO_PERCENT;
+            return ZERO_SCALED;
         }
         return BigDecimal.valueOf(cacheHits)
             .multiply(HUNDRED)
+            .divide(BigDecimal.valueOf(successfulQueries), 2, RoundingMode.HALF_UP);
+    }
+
+    static BigDecimal calculateAverageLatencyMs(long totalLatencyMs, long successfulQueries) {
+        if (successfulQueries <= 0L || totalLatencyMs <= 0L) {
+            return ZERO_SCALED;
+        }
+        return BigDecimal.valueOf(totalLatencyMs)
             .divide(BigDecimal.valueOf(successfulQueries), 2, RoundingMode.HALF_UP);
     }
 

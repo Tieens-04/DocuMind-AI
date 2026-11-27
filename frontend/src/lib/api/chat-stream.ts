@@ -1,3 +1,4 @@
+import { listAdminDepartmentsPage } from '@/lib/api/admin';
 import { apiFetch } from '@/lib/api/client';
 import { ensureValidAccessToken, refreshAccessToken } from '@/lib/auth/token-manager';
 import { getApiBaseUrl } from '@/lib/env';
@@ -114,10 +115,7 @@ export async function getDocumentPreviewUrl(
 export async function listAdminDepartments(
   signal?: AbortSignal,
 ): Promise<PageResponse<AdminDepartmentOption>> {
-  return apiFetch<PageResponse<AdminDepartmentOption>>(
-    '/api/v1/admin/departments?page=0&size=100',
-    { method: 'GET', signal },
-  );
+  return listAdminDepartmentsPage({ page: 0, size: 100 }, signal);
 }
 
 export async function streamChatAnswer(
