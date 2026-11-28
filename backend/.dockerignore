@@ -1,0 +1,14 @@
+target/
+**/*.log
+**/.env
+**/.env.*
+!**/.env.example
+.git/
+.gitignore
+.idea/
+.vscode/
+*.iml
+Dockerfile
+.dockerignore
+mvnw.cmd
+src/test/
