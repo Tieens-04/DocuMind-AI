@@ -25,6 +25,7 @@
 - **FlintFlow port coexistence**: Keep canonical host ports in `.env.example` / `docker-compose.yml` (`5432`, `6380`, `9000/9001`, `8081`, `3002`, `11434`) and never collide with `flintflow-*` containers.
 - **Frontend RAM-only access token & single-flight refresh**: Keep `accessToken` in memory and `refreshToken` in `localStorage`; serialize 401 rotation across tabs via `navigator.locks` + macrotask yield + `sessionEpoch`, clearing session only on `401/403` (`frontend/src/lib/auth/token-manager.ts`).
 - **Frontend typed SSE streaming, XSS-safe GFM & live-verified Citation preview**: Stream `/api/v1/chat/stream` via `fetch` + `ReadableStream` (`TextDecoder({ stream: true })`, single-flight `401` retry, `reader.cancel()` in `finally`), strip ASCII control chars/backslashes before `ReactMarkdown` `urlTransform`, and gate `CitationDrawer` links behind live `/preview-url` RBAC verification keyed by citation identity (`frontend/src/lib/api/chat-stream.ts`, `frontend/src/components/chat/citation-drawer.tsx`).
+- **Full-stack Docker hardening & headed E2E**: Keep `frontend/Dockerfile` fail-closed (`ARG NEXT_PUBLIC_DEMO_ACCOUNTS=false`), build backend via `./mvnw` with `MaxRAMPercentage=55.0` + `stop_grace_period: 35s`, and scope Playwright `--headed` assertions to `main ol.max-w-4xl > li` / `table tbody` (`backend/Dockerfile`, `frontend/Dockerfile`, `docker-compose.yml`, `frontend/e2e/milestone3-fullstack.spec.ts`).
 
 ---
 
@@ -43,6 +44,7 @@
 - **Next.js Chat Workspace, Typed SSE Client & Citation Side Drawer**: `frontend/src/lib/api/chat-stream.ts`, `frontend/src/app/(workspace)/chat/page.tsx`, `frontend/src/components/chat/citation-drawer.tsx`, `frontend/src/components/chat/markdown-content.tsx`, `frontend/src/__tests__/chat-workspace.test.tsx`
 - **Next.js Documents Upload Queue, Conditional Polling & RBAC Table**: `frontend/src/lib/api/documents.ts`, `frontend/src/app/(workspace)/documents/page.tsx`, `frontend/src/components/documents/document-upload-zone.tsx`, `frontend/src/__tests__/helpers/mock-xhr.ts`, `frontend/src/__tests__/documents-workspace.test.tsx`
 - **Next.js Admin FinOps Dashboard & Users/Departments 2-Tab Governance**: `frontend/src/lib/api/admin.ts`, `frontend/src/app/(workspace)/admin/analytics/page.tsx`, `frontend/src/app/(workspace)/admin/users/page.tsx`, `frontend/src/__tests__/admin-rbac-three-roles.test.tsx`
+- **Full-Stack Docker Packaging & Headed Playwright E2E**: `backend/Dockerfile`, `frontend/Dockerfile`, `docker-compose.yml`, `backend/src/test/java/com/documind/infrastructure/config/DockerComposeHardeningTest.java`, `frontend/playwright.config.ts`, `frontend/e2e/milestone3-fullstack.spec.ts`
 
 ---
 
